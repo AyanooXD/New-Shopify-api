@@ -148,6 +148,49 @@ async def make_graphql_request_with_captcha_handling(
                 json=json_data, timeout=aiohttp.ClientTimeout(total=25)
             )
             response_text = await response.text()
+            
+            # FIX: Validate response before returning.
+            # Shopify may return HTML (login page, challenge page, error page)
+            # instead of JSON when the session is invalid or the request is blocked.
+            # Detect this early so the caller gets a clear error message.
+            status_code = response.status
+            content_type = response.headers.get('Content-Type', '')
+            
+            # If we get a non-2xx status, log it clearly
+            if status_code >= 400:
+                preview = response_text[:300].replace('\n', ' ').strip()
+                if attempt < max_retries:
+                    await asyncio.sleep(1)
+                    continue
+                return response, response_text, False
+            
+            # If response is HTML instead of JSON, it's a block/redirect
+            # Common case: Shopify serves an HTML challenge/error page
+            if 'text/html' in content_type and 'application/json' not in content_type:
+                # Check if it's a redirect/challenge page
+                if '<html' in response_text.lower() or '<!doctype' in response_text.lower():
+                    # Try to extract a meaningful error from the HTML
+                    title_match = re.search(r'<title>([^<]+)</title>', response_text, re.IGNORECASE)
+                    title = title_match.group(1).strip() if title_match else "HTML page"
+                    if 'login' in title.lower() or 'sign in' in title.lower():
+                        last_error = f"BLOCKED: Checkout session redirected to login (HTTP {status_code})"
+                    elif 'challenge' in title.lower() or 'captcha' in title.lower():
+                        last_error = f"BLOCKED: Challenge page returned instead of JSON (HTTP {status_code})"
+                    else:
+                        last_error = f"BLOCKED: HTML response instead of JSON: {title} (HTTP {status_code})"
+                    if attempt < max_retries:
+                        await asyncio.sleep(1)
+                        continue
+                    return response, last_error, False
+            
+            # If response text is empty, retry or fail
+            if not response_text or not response_text.strip():
+                last_error = f"Empty response from GraphQL (HTTP {status_code})"
+                if attempt < max_retries:
+                    await asyncio.sleep(1)
+                    continue
+                return response, last_error, False
+            
             return response, response_text, False
         except asyncio.TimeoutError:
             last_error = "Request timed out"
@@ -234,6 +277,26 @@ def extract_clean_response(message):
     message = re.sub(r'<[^>]+>', '', message).strip()
     if not message:
         return "UNKNOWN_ERROR"
+    
+    # Preserve diagnostic prefixes from our improved error handling
+    # These are step-specific messages we added that should NOT be mangled by regex
+    DIAGNOSTIC_PREFIXES = [
+        'PROPOSAL_BLOCKED:',
+        'PROPOSAL_EMPTY:',
+        'PROPOSAL_JSON_ERROR:',
+        'SUBMIT_BLOCKED:',
+        'SUBMIT_JSON_ERROR:',
+        'PCI_VAULT_BLOCKED:',
+        'PCI_VAULT_ERROR:',
+        'BLOCKED:',
+        'POLL_BLOCKED:',
+        'POLL_JSON_ERROR:',
+        'POLL_EMPTY:',
+    ]
+    for prefix in DIAGNOSTIC_PREFIXES:
+        if message.startswith(prefix):
+            # Return the diagnostic message as-is (truncated only if very long)
+            return message[:120] if len(message) > 120 else message
     
     patterns = [
         r'(PAYMENTS_[A-Z_]+)',
@@ -583,12 +646,19 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             else:
                 graphql_url = f'https://{urlparse(ourl).netloc}/checkouts/{attempt_token}/graphql'
             
-            for i in range(2):
+            # FIX: Send Proposal query once (was sending TWICE with 3s sleep between,
+            # using only the 2nd response — wasteful and can cause stale sessions).
+            # Send once, if Throttled, then retry after delay.
+            response, resp_text, captcha_solved = await make_graphql_request_with_captcha_handling(
+                session, graphql_url, params, headers, json_data, checkout_url, max_retries=1
+            )
+            
+            # If Throttled, wait and retry once
+            if response and '"Throttled"' in resp_text:
+                await asyncio.sleep(3)
                 response, resp_text, captcha_solved = await make_graphql_request_with_captcha_handling(
                     session, graphql_url, params, headers, json_data, checkout_url, max_retries=1
                 )
-                if i == 0:
-                    await asyncio.sleep(3)
             
             if not response:
                 return False, f"Request failed: {resp_text}", gateway, total_price, currency
@@ -599,10 +669,22 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             try:
                 resp_json = json.loads(resp_text)
             except json.JSONDecodeError as e:
-                # Log first 200 chars of response to help debug
+                # FIX: Provide step-specific diagnostic error.
+                # Previously this just said "Invalid JSON (HTTP X): preview"
+                # which was then mangled by extract_clean_response() into
+                # something like "Invalid JSON response: Expecting value: line 1 col"
                 preview = resp_text[:200].replace('\n', ' ').strip()
                 status_code = response.status if response else 'N/A'
-                return False, f"Invalid JSON (HTTP {status_code}): {preview}", gateway, total_price, currency
+                ct = response.headers.get('Content-Type', '') if response else ''
+                is_html = '<html' in preview.lower() or '<!doctype' in preview.lower()
+                if is_html:
+                    title_match = re.search(r'<title>([^<]+)</title>', preview, re.IGNORECASE)
+                    title = title_match.group(1).strip() if title_match else "HTML page"
+                    return False, f"PROPOSAL_BLOCKED: HTML instead of JSON - {title} (HTTP {status_code})", gateway, total_price, currency
+                elif not preview:
+                    return False, f"PROPOSAL_EMPTY: Empty response (HTTP {status_code})", gateway, total_price, currency
+                else:
+                    return False, f"PROPOSAL_JSON_ERROR: {str(e)} (HTTP {status_code}, CT={ct})", gateway, total_price, currency
 
             if 'errors' in resp_json:
                 errors = resp_json.get('errors', [])
@@ -778,10 +860,31 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             
             response = await session.post('https://checkout.pci.shopifyinc.com/sessions', json=payload, headers=vault_headers, proxy=proxy, timeout=aiohttp.ClientTimeout(total=12))
             try:
-                token_data = await response.json()
+                # FIX: Read text first, check for HTML, then parse JSON.
+                # Previously response.json() could throw JSONDecodeError with the raw
+                # Python exception message "Expecting value: line 1 column 1 (char 0)"
+                # which leaked into the API response confusingly.
+                vault_text = await response.text()
+                vault_status = response.status
+                vault_ct = response.headers.get('Content-Type', '')
+                
+                # Detect HTML responses from PCI vault (stale build hash, block, etc.)
+                if vault_status >= 400 or ('text/html' in vault_ct and not vault_text.strip().startswith('{')):
+                    if '<html' in vault_text.lower() or '<!doctype' in vault_text.lower():
+                        title_match = re.search(r'<title>([^<]+)</title>', vault_text, re.IGNORECASE)
+                        title = title_match.group(1).strip() if title_match else "HTML error"
+                        return False, f'PCI_VAULT_BLOCKED: {title} (HTTP {vault_status}, hash={pci_build_hash})', gateway, total_price, currency
+                    return False, f'PCI_VAULT_ERROR: HTTP {vault_status}, non-JSON response (hash={pci_build_hash})', gateway, total_price, currency
+                
+                if not vault_text or not vault_text.strip():
+                    return False, f'PCI_VAULT_ERROR: Empty response (HTTP {vault_status}, hash={pci_build_hash})', gateway, total_price, currency
+                
+                token_data = json.loads(vault_text)
                 token = token_data.get('id')
                 if not token:
                     return False, 'Unable to get payment token', gateway, total_price, currency
+            except json.JSONDecodeError as e:
+                return False, f'PCI_VAULT_JSON_ERROR: {str(e)} (HTTP {response.status}, hash={pci_build_hash}, body={vault_text[:100]})', gateway, total_price, currency
             except Exception as e:
                 return False, f'Unable to get payment token: {str(e)}', gateway, total_price, currency
 
@@ -985,7 +1088,13 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     return False, "No receipt ID", gateway, total_price, currency
                 
             except json.JSONDecodeError:
-                return False, f"Invalid JSON in submit response: {text[:100]}", gateway, total_price, currency
+                # FIX: Step-specific error for submit JSON parse failure
+                is_html = '<html' in text[:200].lower() or '<!doctype' in text[:200].lower()
+                if is_html:
+                    title_match = re.search(r'<title>([^<]+)</title>', text[:500], re.IGNORECASE)
+                    title = title_match.group(1).strip() if title_match else "HTML page"
+                    return False, f"SUBMIT_BLOCKED: HTML instead of JSON - {title} (HTTP {response.status if response else 'N/A'})", gateway, total_price, currency
+                return False, f"SUBMIT_JSON_ERROR: {text[:150]}", gateway, total_price, currency
             except Exception as e:
                 return False, f"Error parsing submit: {str(e)}", gateway, total_price, currency
 
