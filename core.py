@@ -1006,5 +1006,5 @@ def parse_cc_string(cc_string):
 async def process_card_async(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=None):
     return await process_card(cc, mes, ano, cvv, site_url, variant_id, proxy_str)
 
-app = Flask(__name__)
+# Flask app removed — using Robyn in api.py
 
