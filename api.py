@@ -10,6 +10,7 @@ import time
 import asyncio
 import aiohttp
 from functools import lru_cache
+from urllib.parse import unquote
 from robyn import Robyn, Request, Response, Headers
 
 import core
@@ -134,10 +135,11 @@ async def shopify_checker(request: Request):
     try:
         params = request.query_params
 
-        site       = params.get("site", None)
-        cc_string  = params.get("cc", None)
-        proxy_str  = params.get("proxy", None)
-        variant_id = params.get("variant", None)
+        # FIX: unquote params defensively — handles any double-encoding edge cases
+        site       = unquote(params.get("site", "") or "").strip() or None
+        cc_string  = unquote(params.get("cc", "") or "").strip() or None
+        proxy_str  = unquote(params.get("proxy", "") or "").strip() or None
+        variant_id = unquote(params.get("variant", "") or "").strip() or None
 
         if not site:
             return json_response(
