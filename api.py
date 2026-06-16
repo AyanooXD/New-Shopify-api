@@ -130,10 +130,10 @@ async def shopify_checker(request: Request):
     try:
         params = request.query_params
 
-        site       = params.get("site")
-        cc_string  = params.get("cc")
-        proxy_str  = params.get("proxy")
-        variant_id = params.get("variant")
+        site       = params.get("site", None)
+        cc_string  = params.get("cc", None)
+        proxy_str  = params.get("proxy", None)
+        variant_id = params.get("variant", None)
 
         if not site:
             return json_response(
