@@ -380,8 +380,16 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             response = await session.post(url=checkout, allow_redirects=True, headers=checkout_headers, proxy=proxy, timeout=aiohttp.ClientTimeout(total=15))
             checkout_url = str(response.url)
 
+            # Detect checkout URL format: /checkouts/cn/TOKEN or /checkouts/TOKEN
             attempt_token_match = re.search(r'/checkouts/cn/([^/?]+)', checkout_url)
-            attempt_token = attempt_token_match.group(1) if attempt_token_match else checkout_url.split('/')[-1].split('?')[0]
+            checkout_uses_cn = bool(attempt_token_match)
+            if attempt_token_match:
+                attempt_token = attempt_token_match.group(1)
+            else:
+                # Fallback: try /checkouts/TOKEN format
+                plain_match = re.search(r'/checkouts/([^/?]+)', checkout_url)
+                attempt_token = plain_match.group(1) if plain_match else checkout_url.split('/')[-1].split('?')[0]
+                checkout_uses_cn = False
 
             sst = response.headers.get('X-Checkout-One-Session-Token') or response.headers.get('x-checkout-one-session-token')
             
@@ -552,7 +560,11 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 'operationName': 'Proposal'
             }
 
-            graphql_url = f'https://{urlparse(ourl).netloc}/checkouts/cn/{attempt_token}/graphql'
+            # Build graphql URL based on actual checkout URL format
+            if checkout_uses_cn:
+                graphql_url = f'https://{urlparse(ourl).netloc}/checkouts/cn/{attempt_token}/graphql'
+            else:
+                graphql_url = f'https://{urlparse(ourl).netloc}/checkouts/{attempt_token}/graphql'
             
             for i in range(2):
                 response, resp_text, captcha_solved = await make_graphql_request_with_captcha_handling(
