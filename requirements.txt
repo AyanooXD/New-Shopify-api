@@ -1,0 +1,4 @@
+flask
+aiohttp
+gunicorn
+uvicorn[standard]
