@@ -1,3 +1,2 @@
-flask
-aiohttp
-gunicorn
+robyn>=0.84.0
+aiohttp>=3.9.0
