@@ -137,23 +137,29 @@ def is_captcha_required(response_text):
     return False
 
 async def make_graphql_request_with_captcha_handling(
-    session, graphql_url, params, headers, json_data, 
+    session, graphql_url, params, headers, json_data,
     checkout_url, max_retries=1, solve_captcha=True
 ):
-    original_variables = json_data.get('variables', {}).copy()
-    
+    last_error = "Request failed"
     for attempt in range(max_retries + 1):
         try:
-            response = await session.post(graphql_url, params=params, headers=headers, json=json_data)
+            response = await session.post(
+                graphql_url, params=params, headers=headers,
+                json=json_data, timeout=aiohttp.ClientTimeout(total=25)
+            )
             response_text = await response.text()
             return response, response_text, False
-            
-        except Exception as e:
+        except asyncio.TimeoutError:
+            last_error = "Request timed out"
             if attempt == max_retries:
-                return None, str(e), False
+                return None, last_error, False
             await asyncio.sleep(1)
-    
-    return response, response_text, False
+        except Exception as e:
+            last_error = str(e)
+            if attempt == max_retries:
+                return None, last_error, False
+            await asyncio.sleep(1)
+    return None, last_error, False
 
 async def fetch_products(domain, proxy_str=None):
     try:
@@ -168,14 +174,17 @@ async def fetch_products(domain, proxy_str=None):
         async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
             async with session.get(f"{domain}/products.json", proxy=proxy, timeout=10) as resp:
                 if resp.status != 200:
-                    return False, f"<b>Site Error! Status: {resp.status}</b>"
+                    return False, f"Site Error: HTTP {resp.status}"
                 text = await resp.text()
                 if "shopify" not in text.lower():
-                    return False, "<b>Not Shopify!</b>"
-
-                result = (await resp.json())['products']
+                    return False, "Not a Shopify store"
+                try:
+                    data = json.loads(text)
+                    result = data.get('products', [])
+                except (json.JSONDecodeError, Exception):
+                    return False, "Invalid products response"
                 if not result:
-                    return False, "<b>No Products!</b>"
+                    return False, "No products found"
 
         min_price = float('inf')
         min_product = None
@@ -209,10 +218,10 @@ async def fetch_products(domain, proxy_str=None):
         if isinstance(min_product, dict) and min_product.get('variant_id'):
             return min_product
         else:
-            return False, "<b>No Valid Products</b>"
+            return False, "No valid products available"
 
     except aiohttp.ClientError as e:
-        return False, f"<b>Proxy Error: {str(e)}</b>"
+        return False, f"Proxy Error: {str(e)}"
     except Exception as e:
         return False, f"error: {str(e)}"
 
@@ -221,6 +230,10 @@ def extract_clean_response(message):
         return "UNKNOWN_ERROR"
     
     message = str(message)
+    # Strip HTML tags if any leaked through
+    message = re.sub(r'<[^>]+>', '', message).strip()
+    if not message:
+        return "UNKNOWN_ERROR"
     
     patterns = [
         r'(PAYMENTS_[A-Z_]+)',
@@ -293,32 +306,68 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 return False, info[1], gateway, total_price, currency
             variant_id = info['variant_id']
 
-        connector = aiohttp.TCPConnector(ssl=False)
-        timeout = aiohttp.ClientTimeout(total=30)
+        connector = aiohttp.TCPConnector(ssl=False, limit=50, limit_per_host=10)
+        timeout = aiohttp.ClientTimeout(total=30, connect=8)
         
-        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout, cookie_jar=aiohttp.CookieJar(unsafe=True)) as session:
             url = ourl
             cart = url + '/cart/add.js'
             checkout = url + '/checkout/'
 
+            # Step 0: Visit homepage first to get session cookies (prevents 400 on cart)
+            try:
+                home_headers = {
+                    **headers,
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                    'sec-fetch-dest': 'document',
+                    'sec-fetch-mode': 'navigate',
+                    'sec-fetch-site': 'none',
+                }
+                await session.get(url, headers=home_headers, proxy=proxy, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=8))
+            except Exception:
+                pass  # Non-fatal — continue even if homepage fails
+
+            # Attempt 1: form-encoded with X-Requested-With (standard Shopify AJAX)
             cart_headers = {
                 **headers,
                 'Content-Type': 'application/x-www-form-urlencoded',
-                'Accept': 'application/json, text/javascript'
+                'Accept': 'application/json, text/javascript, */*; q=0.01',
+                'X-Requested-With': 'XMLHttpRequest',
             }
-            cart_resp = await session.post(cart, data=f'id={variant_id}&quantity=1', headers=cart_headers, proxy=proxy)
-            
+            cart_resp = await session.post(cart, data=f'id={variant_id}&quantity=1', headers=cart_headers, proxy=proxy, timeout=aiohttp.ClientTimeout(total=10))
+
+            # Attempt 2: JSON body
             if cart_resp.status != 200:
                 cart_headers_alt = {
                     **headers,
                     'Content-Type': 'application/json',
-                    'Accept': 'application/json'
+                    'Accept': 'application/json',
+                    'X-Requested-With': 'XMLHttpRequest',
                 }
                 cart_data = {'items': [{'id': int(variant_id), 'quantity': 1}]}
-                cart_resp = await session.post(cart, json=cart_data, headers=cart_headers_alt, proxy=proxy)
-            
+                cart_resp = await session.post(cart, json=cart_data, headers=cart_headers_alt, proxy=proxy, timeout=aiohttp.ClientTimeout(total=10))
+
+            # Attempt 3: Clear cart then retry form-encoded
             if cart_resp.status != 200:
-                return False, f"Cart failed with status {cart_resp.status}", gateway, total_price, currency
+                try:
+                    await session.post(url + '/cart/clear.js', headers=cart_headers, proxy=proxy)
+                    await asyncio.sleep(0.3)
+                    cart_resp = await session.post(cart, data=f'id={variant_id}&quantity=1', headers=cart_headers, proxy=proxy)
+                except Exception:
+                    pass
+
+            if cart_resp.status != 200:
+                try:
+                    cart_error_text = await cart_resp.text()
+                    try:
+                        cart_err_json = json.loads(cart_error_text)
+                        err_desc = cart_err_json.get('description') or cart_err_json.get('message') or cart_err_json.get('error', '')
+                        err_msg = f"Cart Error: {err_desc}" if err_desc else f"Cart failed: HTTP {cart_resp.status}"
+                    except Exception:
+                        err_msg = f"Cart failed: HTTP {cart_resp.status}"
+                except Exception:
+                    err_msg = f"Cart failed: HTTP {cart_resp.status}"
+                return False, err_msg, gateway, total_price, currency
 
             checkout_headers = {
                 **headers,
@@ -328,7 +377,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 'sec-fetch-site': 'same-origin',
                 'sec-fetch-user': '?1'
             }
-            response = await session.post(url=checkout, allow_redirects=True, headers=checkout_headers, proxy=proxy)
+            response = await session.post(url=checkout, allow_redirects=True, headers=checkout_headers, proxy=proxy, timeout=aiohttp.ClientTimeout(total=15))
             checkout_url = str(response.url)
 
             attempt_token_match = re.search(r'/checkouts/cn/([^/?]+)', checkout_url)
@@ -693,7 +742,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             if ident_sig:
                 vault_headers['shopify-identification-signature'] = ident_sig
             
-            response = await session.post('https://checkout.pci.shopifyinc.com/sessions', json=payload, headers=vault_headers, proxy=proxy)
+            response = await session.post('https://checkout.pci.shopifyinc.com/sessions', json=payload, headers=vault_headers, proxy=proxy, timeout=aiohttp.ClientTimeout(total=12))
             try:
                 token_data = await response.json()
                 token = token_data.get('id')

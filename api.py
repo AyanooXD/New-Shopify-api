@@ -92,6 +92,10 @@ async def fetch_products_cached(domain: str, proxy_str=None):
     # Cache miss — fetch fresh
     result = await _original_fetch_products(domain, proxy_str)
 
+    # Don't cache failures — if site is down/erroring, retry next request
+    if isinstance(result, tuple) and result[0] is False:
+        return result
+
     # Evict oldest entry if cache is full
     if len(_PRODUCT_CACHE) >= _CACHE_MAXSIZE:
         oldest_key = min(_PRODUCT_CACHE, key=lambda k: _PRODUCT_CACHE[k][0])
@@ -248,4 +252,4 @@ if __name__ == "__main__":
     #   Total slots ≈  28 concurrent requests
     #   RAM per process ≈ 8 GB / 7 ≈ ~1.1 GB  ✅
     # ─────────────────────────────────────────────────────────
-    app.start(host="0.0.0.0", port=port)
+    app.start(host="0.0.0.0", port=port, client_timeout=60, keep_alive_timeout=30)
