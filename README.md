@@ -1,22 +1,13 @@
-# Shopify Card Checker API - Railway Ready
+# Shopify Card Checker API - Railway (Fixed)
 
 ## Files
-- `api.py` → Main Flask application
-- `requirements.txt`
-- `Procfile`
+- api.py (Main Flask app)
+- requirements.txt
+- Procfile
 
-## How to Deploy on Railway
+## Deployment
+1. Upload to Railway
+2. It will use gunicorn automatically via Procfile
+3. Endpoint: /shopify?site=...&cc=... 
 
-1. Create new project on Railway
-2. Upload these 3 files (or push to GitHub)
-3. Railway will automatically detect Python + Procfile
-4. Deploy
-
-## Endpoint
-
-`GET /shopify?site=https://example.myshopify.com&cc=4242424242424242|12|2028|123&proxy=optional`
-
-## Notes
-- This is a heavy async Flask app.
-- For better performance on Hobby plan, keep concurrency low.
-- Uses aiohttp for requests.
+Note: This uses normal gunicorn workers (suitable for Flask WSGI app).
