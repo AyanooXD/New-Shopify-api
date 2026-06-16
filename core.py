@@ -552,7 +552,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 'operationName': 'Proposal'
             }
 
-            graphql_url = f'https://{urlparse(ourl).netloc}/checkouts/unstable/graphql'
+            graphql_url = f'https://{urlparse(ourl).netloc}/checkouts/cn/{attempt_token}/graphql'
             
             for i in range(2):
                 response, resp_text, captcha_solved = await make_graphql_request_with_captcha_handling(
@@ -570,7 +570,10 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             try:
                 resp_json = json.loads(resp_text)
             except json.JSONDecodeError as e:
-                return False, f"Invalid JSON response: {str(e)}", gateway, total_price, currency
+                # Log first 200 chars of response to help debug
+                preview = resp_text[:200].replace('\n', ' ').strip()
+                status_code = response.status if response else 'N/A'
+                return False, f"Invalid JSON (HTTP {status_code}): {preview}", gateway, total_price, currency
 
             if 'errors' in resp_json:
                 errors = resp_json.get('errors', [])
