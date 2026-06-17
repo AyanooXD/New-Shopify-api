@@ -1,1 +1,1 @@
-web: python api.py --processes 4 --workers 2
+web: python api.py --processes 2 --workers 2
