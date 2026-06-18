@@ -164,9 +164,9 @@ def _build_headers(identifier, base_headers=None, extra_headers=None):
 
 # --- Human-Like Delays (technique #2) ---
 # Delay multiplier: 1.0 = full human simulation, 0.0 = no delays.
-# Set via DELAY_SCALE env var. Default 0.4 (40% of original delays)
+# Set via DELAY_SCALE env var. Default 0.25 (25% of original delays)
 # balances speed vs bot-detection avoidance.
-DELAY_SCALE = float(os.environ.get('DELAY_SCALE', '0.4'))
+DELAY_SCALE = float(os.environ.get('DELAY_SCALE', '0.25'))
 
 
 async def human_delay(min_sec=0.8, max_sec=2.5, step_name="", idle=False):

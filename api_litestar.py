@@ -35,7 +35,7 @@ from core import (
 # CONFIGURATION (all tunable via env vars)
 # ══════════════════════════════════════════════════════════════════════
 _SINGLE_SLOTS = int(os.environ.get('SINGLE_SLOTS', '5'))     # reserved for /cc
-_MASS_SLOTS = int(os.environ.get('MASS_SLOTS', '20'))         # for /chk mass
+_MASS_SLOTS = int(os.environ.get('MASS_SLOTS', '30'))         # for /chk mass
 _MAX_QUEUE = int(os.environ.get('MAX_QUEUE', '50'))           # backpressure threshold
 _USER_RATE_LIMIT = float(os.environ.get('USER_RATE', '5.0'))  # requests/sec per user
 _USER_BURST = int(os.environ.get('USER_BURST', '8'))          # burst allowance
