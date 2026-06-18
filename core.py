@@ -10,7 +10,7 @@ import re
 import random
 import sys
 # argparse, uuid removed
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 import tls_requests
 from tls_requests import AsyncClient, TLSIdentifierRotator
 # tls-requests (wrapper-tls-requests) is the primary HTTP client.
@@ -316,9 +316,9 @@ book = {
     "DE": {"address1": "Friedrichstrasse 45", "city": "Berlin", "postalCode": "10117", "zoneCode": "BE", "countryCode": "DE", "phone": "4930123456"},
     "FR": {"address1": "12 Rue de Rivoli", "city": "Paris", "postalCode": "75001", "zoneCode": "IDF", "countryCode": "FR", "phone": "3312345678"},
     "AU": {"address1": "1 Martin Place", "city": "Sydney", "postalCode": "2000", "zoneCode": "NSW", "countryCode": "AU", "phone": "291234567"},
-    "IN": {"address1": "221B MG", "city": "Mumbai", "postalCode": "400001", "zoneCode": "MH", "countryCode": "IN", "phone": "+91 9876543210"},
-    "AE": {"address1": "Burj Tower", "city": "Dubai", "postalCode": "", "zoneCode": "DU", "countryCode": "AE", "phone": "+971 50 123 4567"},
-    "HK": {"address1": "Nathan 88", "city": "Kowloon", "postalCode": "", "zoneCode": "KL", "countryCode": "HK", "phone": "+852 5555 5555"},
+    "IN": {"address1": "221B MG", "city": "Mumbai", "postalCode": "400001", "zoneCode": "MH", "countryCode": "IN", "phone": "9876543210"},
+    "AE": {"address1": "Burj Tower", "city": "Dubai", "postalCode": "", "zoneCode": "DU", "countryCode": "AE", "phone": "501234567"},
+    "HK": {"address1": "Nathan 88", "city": "Kowloon", "postalCode": "", "zoneCode": "KL", "countryCode": "HK", "phone": "55555555"},
     "CN": {"address1": "8 Zhongguancun Street", "city": "Beijing", "postalCode": "100080", "zoneCode": "BJ", "countryCode": "CN", "phone": "1062512345"},
     "CH": {"address1": "Gotthardstrasse 17", "city": "Schweiz", "postalCode": "6430", "zoneCode": "SZ", "countryCode": "CH", "phone": "445512345"},
     "JP": {"address1": "1-1-1 Chiyoda", "city": "Tokyo", "postalCode": "100-8111", "zoneCode": "13", "countryCode": "JP", "phone": "0312345678"},
@@ -703,8 +703,26 @@ def extract_clean_response(message):
     ]
     for prefix in DIAGNOSTIC_PREFIXES:
         if message.startswith(prefix):
-            # Return the diagnostic message as-is (truncated only if very long)
             return message[:120] if len(message) > 120 else message
+    
+    # Known Shopify error codes — return as-is without mangling.
+    # These are machine-readable codes from Shopify's PaymentFailed, SubmitRejected, etc.
+    _KNOWN_CODES = {
+        'CARD_DECLINED', 'INSUFFICIENT_FUNDS', 'EXPIRED_CARD', 'INVALID_CVC',
+        'INCORRECT_NUMBER', 'INCORRECT_CVC', 'INCORRECT_ZIP', 'INCORRECT_ADDRESS',
+        'PROCESSING_ERROR', 'CALL_ISSUER', 'PICK_UP_CARD', 'DO_NOT_HONOR',
+        'CARD_NOT_SUPPORTED', 'TRY_AGAIN_LATER', 'INVALID_ACCOUNT',
+        'INVALID_AMOUNT', 'INVALID_NUMBER', 'ALREADY_REFUNDED',
+        'AUTHENTICATION_REQUIRED', 'TEST_MODE_LIVE_CARD',
+        '3DS_REQUIRED', 'OTP_REQUIRED', 'ORDER_PLACED',
+        'CAPTCHA_REQUIRED', 'GENERIC_ERROR', 'PAYMENT_FAILED',
+    }
+    msg_upper = message.strip().upper()
+    if msg_upper in _KNOWN_CODES:
+        # Map only truly generic codes to CARD_DECLINED; preserve all others
+        if msg_upper in ('GENERIC_ERROR', 'PAYMENT_FAILED'):
+            return 'CARD_DECLINED'
+        return message.strip()
     
     patterns = [
         r'(PAYMENTS_[A-Z_]+)',
@@ -729,12 +747,12 @@ def extract_clean_response(message):
     if words:
         first_word = words[0]
         if "_" in first_word and first_word.isupper():
-            # Map generic Shopify error codes to meaningful decline messages
-            DECLINE_CODE_MAP = {
+            # Map only truly generic Shopify error codes to CARD_DECLINED
+            _GENERIC_MAP = {
                 'GENERIC_ERROR': 'CARD_DECLINED',
                 'PAYMENT_FAILED': 'CARD_DECLINED',
             }
-            return DECLINE_CODE_MAP.get(first_word, first_word)
+            return _GENERIC_MAP.get(first_word, first_word)
     
     # Final check: if the extracted message is a generic code, map it
     GENERIC_CODES = {'GENERIC_ERROR', 'PAYMENT_FAILED'}
@@ -1547,7 +1565,10 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     return False, "Throttled", gateway, total_price, currency
                 
                 if result_type == 'NegotiationResultFailed':
-                    _neg_errors = result.get('errors', [])
+                    # errors are at the negotiate level, NOT inside result.
+                    # NegotiationResultFailed only has __typename in its fragment;
+                    # the actual error details live at negotiate.errors[].
+                    _neg_errors = negotiate.get('errors', [])
                     if _neg_errors:
                         _neg_err_msgs = []
                         for _ne in _neg_errors[:3]:
@@ -1700,9 +1721,9 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 for method in payment_methods:
                     payment_method = method.get('paymentMethod', {})
                     typename = payment_method.get('__typename', '')
-                    identifier = payment_method.get('paymentMethodIdentifier')
+                    _pm_identifier = payment_method.get('paymentMethodIdentifier')
                     
-                    if not identifier and not payment_method.get('name'):
+                    if not _pm_identifier and not payment_method.get('name'):
                         continue
                     
                     # FIX (BUG L): Track first NON-wallet, NON-offsite method as fallback.
@@ -1834,7 +1855,21 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         return False, f"CAPTCHA_BLOCK: Delivery CheckpointDenied -> {_deliv_redirect[:80]}", gateway, total_price, currency
                     return False, "CAPTCHA_BLOCK: Delivery CheckpointDenied", gateway, total_price, currency
                 elif _deliv_result_type == 'NegotiationResultFailed':
-                    return False, "Delivery proposal negotiation failed", gateway, total_price, currency
+                    # Read errors from negotiate level (not result level)
+                    _deliv_neg_errors = _deliv_negotiate.get('errors', []) if _deliv_negotiate else []
+                    if _deliv_neg_errors:
+                        _deliv_err_msgs = []
+                        for _dne in _deliv_neg_errors[:3]:
+                            _dne_code = _dne.get('code', '') or ''
+                            _dne_msg = _dne.get('localizedMessage', '') or _dne.get('nonLocalizedMessage', '') or ''
+                            if _dne_msg:
+                                _deliv_err_msgs.append(f"{_dne_code}: {_dne_msg}" if _dne_code else _dne_msg)
+                            elif _dne_code:
+                                _deliv_err_msgs.append(_dne_code)
+                        _deliv_detail = '; '.join(_deliv_err_msgs) if _deliv_err_msgs else 'Unknown reason'
+                    else:
+                        _deliv_detail = 'No error details'
+                    return False, f"Delivery negotiation failed: {_deliv_detail}", gateway, total_price, currency
                 elif _deliv_result_type and _deliv_result_type != 'NegotiationResultAvailable':
                     print(f"[DELIVERY] Unknown result typename: {_deliv_result_type}", file=sys.stderr)
                 
@@ -1903,7 +1938,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 'Origin': 'https://checkout.pci.shopifyinc.com',
                 # FIX: Build hash `/a8e4a94/` was outdated — Shopify rotates these.
                 # Use the dynamic hash fetched from checkout page, or fallback to latest known hash.
-                'Referer': f'https://checkout.pci.shopifyinc.com/build/{pci_build_hash}/number-ltr.html?identifier=&locationURL={checkout_url}',
+                'Referer': f'https://checkout.pci.shopifyinc.com/build/{pci_build_hash}/number-ltr.html?identifier=&locationURL={quote(checkout_url, safe="")}',
                 'User-Agent': hints['ua'],
                 'sec-ch-ua': hints['sec_ch_ua'],
                 'sec-ch-ua-full-version-list': hints['sec_ch_ua_full'],
@@ -2167,6 +2202,41 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         if receipt_type == 'ProcessedReceipt':
                             return True, "ORDER_PLACED", gateway, total_price, currency
                         
+                        # Handle ActionRequiredReceipt directly from submit response
+                        # instead of falling through to poll (saves a round-trip)
+                        if receipt_type == 'ActionRequiredReceipt':
+                            _sr_action = receipt.get('action', {})
+                            _sr_action_type = _sr_action.get('__typename', '') if _sr_action else ''
+                            if _sr_action_type == 'CompletePaymentChallengeV2':
+                                _sr_challenge = (_sr_action.get('challengeType', '') or '').upper()
+                                if 'THREE_D_SECURE' in _sr_challenge or '3DS' in _sr_challenge:
+                                    return True, "3DS_REQUIRED", gateway, total_price, currency
+                                elif 'OTP' in _sr_challenge:
+                                    return True, "OTP_REQUIRED", gateway, total_price, currency
+                                else:
+                                    return True, _sr_challenge if _sr_challenge else "OTP_REQUIRED", gateway, total_price, currency
+                            elif _sr_action_type == 'CompletePaymentChallenge':
+                                if _sr_action.get('offsiteRedirect'):
+                                    return True, "3DS_REQUIRED", gateway, total_price, currency
+                            return True, "OTP_REQUIRED", gateway, total_price, currency
+                        
+                        # Handle FailedReceipt directly from submit response
+                        if receipt_type == 'FailedReceipt':
+                            _sr_error = receipt.get('processingError', {})
+                            _sr_error_type = _sr_error.get('__typename', '')
+                            if _sr_error_type == 'PaymentFailed':
+                                _sr_code = _sr_error.get('code', '') or ''
+                                _sr_offsite = _sr_error.get('hasOffsiteRedirect', False)
+                                if _sr_offsite:
+                                    return False, "3DS_REQUIRED", gateway, total_price, currency
+                                _GENERIC_CODES = {'GENERIC_ERROR', 'PAYMENT_FAILED', ''}
+                                if _sr_code and _sr_code not in _GENERIC_CODES:
+                                    return False, _sr_code, gateway, total_price, currency
+                                _sr_msg = _sr_error.get('messageUntranslated', '') or ''
+                                if _sr_msg and _sr_msg.strip():
+                                    return False, _sr_msg.strip(), gateway, total_price, currency
+                            return False, 'CARD_DECLINED', gateway, total_price, currency
+                        
                         rid = receipt.get('id')
                     else:
                         return False, "SubmitSuccess but no receipt", gateway, total_price, currency
@@ -2186,19 +2256,27 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                             code = error.get('code', '') or ''
                             localized_msg = error.get('localizedMessage', '') or ''
                             non_localized_msg = error.get('nonLocalizedMessage', '') or ''
-                            # Map GENERIC_ERROR / PAYMENT_FAILED to CARD_DECLINED when no detail message
-                            DECLINE_CODE_MAP = {
-                                'GENERIC_ERROR': 'CARD_DECLINED',
-                                'PAYMENT_FAILED': 'CARD_DECLINED',
-                            }
+                            _GENERIC_CODES = {'GENERIC_ERROR', 'PAYMENT_FAILED', ''}
+                            # Check nested violation message.code (more specific than top-level)
+                            _nested_msg = error.get('message', {})
+                            if isinstance(_nested_msg, dict):
+                                _nested_code = _nested_msg.get('code', '') or ''
+                                if _nested_code and _nested_code not in _GENERIC_CODES:
+                                    return False, _nested_code, gateway, total_price, currency
+                            # Check for InputValidationError — includes field name for diagnostics
+                            _error_type = error.get('__typename', '')
+                            if _error_type == 'InputValidationError':
+                                _field = error.get('field', '')
+                                _detail = f"Input validation failed: {_field}" if _field else "Input validation failed"
+                                return False, _detail, gateway, total_price, currency
+                            # Prioritize machine-readable code over human-readable message.
+                            if code and code not in _GENERIC_CODES:
+                                return False, code, gateway, total_price, currency
                             detail = localized_msg or non_localized_msg
                             if detail and detail.strip():
                                 return False, detail.strip(), gateway, total_price, currency
-                            mapped = DECLINE_CODE_MAP.get(code)
-                            if mapped:
-                                return False, mapped, gateway, total_price, currency
-                            if code:
-                                return False, code, gateway, total_price, currency
+                            if code in _GENERIC_CODES:
+                                return False, 'CARD_DECLINED', gateway, total_price, currency
                     return False, "Submit Rejected", gateway, total_price, currency
                 
                 elif result_type == 'Throttled':
@@ -2271,25 +2349,43 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                             if error_type == 'PaymentFailed':
                                 code = error.get('code', '') or ''
                                 msg = error.get('messageUntranslated', '') or ''
-                                DECLINE_CODE_MAP = {
-                                    'GENERIC_ERROR': 'CARD_DECLINED',
-                                    'PAYMENT_FAILED': 'CARD_DECLINED',
-                                    '': 'CARD_DECLINED',
-                                }
-                                # FIX: FailedReceipt/PaymentFailed means the card was DECLINED.
-                                # Must return success=False, not True. Returning True
-                                # caused the API to report Status: True for declined cards.
+                                has_offsite = error.get('hasOffsiteRedirect', False)
+                                # If hasOffsiteRedirect is True, the card requires 3DS
+                                # authentication but it wasn't completed.
+                                if has_offsite:
+                                    return False, "3DS_REQUIRED", gateway, total_price, currency
+                                # Only map truly generic/empty codes to CARD_DECLINED.
+                                # Specific codes like INSUFFICIENT_FUNDS, EXPIRED_CARD,
+                                # CALL_ISSUER, etc. must be returned as-is.
+                                _GENERIC_CODES = {'GENERIC_ERROR', 'PAYMENT_FAILED', ''}
+                                # Prioritize the machine-readable code over the human-readable
+                                # messageUntranslated. Shopify's messageUntranslated is almost
+                                # always a generic "Your card was declined." regardless of the
+                                # actual decline reason — the specific reason is in `code`.
+                                if code and code not in _GENERIC_CODES:
+                                    return False, code, gateway, total_price, currency
                                 if msg and msg.strip():
                                     return False, msg.strip(), gateway, total_price, currency
-                                mapped = DECLINE_CODE_MAP.get(code)
-                                if mapped:
-                                    return False, mapped, gateway, total_price, currency
-                                return False, code if code else 'CARD_DECLINED', gateway, total_price, currency
+                                return False, 'CARD_DECLINED', gateway, total_price, currency
                             code = error.get('code') or error_type or 'UNKNOWN_ERROR'
                             if code in ('GENERIC_ERROR', 'PAYMENT_FAILED', ''):
                                 return False, 'CARD_DECLINED', gateway, total_price, currency
                             return False, code, gateway, total_price, currency
                         elif typename == 'ActionRequiredReceipt':
+                            action = receipt_data.get('action', {})
+                            action_type = action.get('__typename', '') if action else ''
+                            if action_type == 'CompletePaymentChallengeV2':
+                                challenge_type = (action.get('challengeType', '') or '').upper()
+                                if 'THREE_D_SECURE' in challenge_type or '3DS' in challenge_type:
+                                    return True, "3DS_REQUIRED", gateway, total_price, currency
+                                elif 'OTP' in challenge_type:
+                                    return True, "OTP_REQUIRED", gateway, total_price, currency
+                                else:
+                                    return True, challenge_type if challenge_type else "OTP_REQUIRED", gateway, total_price, currency
+                            elif action_type == 'CompletePaymentChallenge':
+                                if action.get('offsiteRedirect'):
+                                    return True, "3DS_REQUIRED", gateway, total_price, currency
+                                return True, "OTP_REQUIRED", gateway, total_price, currency
                             return True, "OTP_REQUIRED", gateway, total_price, currency
                         
                         if receipt_data.get('__typename') in ['ProcessingReceipt', 'WaitingReceipt']:
@@ -2350,13 +2446,34 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                 return True, "ORDER_PLACED", gateway, total_price, currency
                             elif _extra_typename == 'FailedReceipt':
                                 _extra_error = _extra_receipt.get('processingError', {})
+                                _extra_error_type = _extra_error.get('__typename', '')
                                 _extra_code = _extra_error.get('code', '') or ''
                                 _extra_msg = _extra_error.get('messageUntranslated', '') or ''
-                                if _extra_msg:
+                                _extra_offsite = _extra_error.get('hasOffsiteRedirect', False)
+                                if _extra_offsite:
+                                    return False, "3DS_REQUIRED", gateway, total_price, currency
+                                _GENERIC_CODES = {'GENERIC_ERROR', 'PAYMENT_FAILED', ''}
+                                # Prioritize code over message (same logic as main poll loop)
+                                if _extra_code and _extra_code not in _GENERIC_CODES:
+                                    return False, _extra_code, gateway, total_price, currency
+                                if _extra_msg and _extra_msg.strip():
                                     return False, _extra_msg.strip(), gateway, total_price, currency
-                                DECLINE_MAP = {'GENERIC_ERROR': 'CARD_DECLINED', 'PAYMENT_FAILED': 'CARD_DECLINED', '': 'CARD_DECLINED'}
-                                return False, DECLINE_MAP.get(_extra_code, _extra_code) or 'CARD_DECLINED', gateway, total_price, currency
+                                return False, 'CARD_DECLINED', gateway, total_price, currency
                             elif _extra_typename == 'ActionRequiredReceipt':
+                                _extra_action = _extra_receipt.get('action', {})
+                                _extra_action_type = _extra_action.get('__typename', '') if _extra_action else ''
+                                if _extra_action_type == 'CompletePaymentChallengeV2':
+                                    _extra_challenge = (_extra_action.get('challengeType', '') or '').upper()
+                                    if 'THREE_D_SECURE' in _extra_challenge or '3DS' in _extra_challenge:
+                                        return True, "3DS_REQUIRED", gateway, total_price, currency
+                                    elif 'OTP' in _extra_challenge:
+                                        return True, "OTP_REQUIRED", gateway, total_price, currency
+                                    else:
+                                        return True, _extra_challenge if _extra_challenge else "OTP_REQUIRED", gateway, total_price, currency
+                                elif _extra_action_type == 'CompletePaymentChallenge':
+                                    if _extra_action.get('offsiteRedirect'):
+                                        return True, "3DS_REQUIRED", gateway, total_price, currency
+                                    return True, "OTP_REQUIRED", gateway, total_price, currency
                                 return True, "OTP_REQUIRED", gateway, total_price, currency
                             elif _extra_typename not in ('WaitingReceipt', 'ProcessingReceipt'):
                                 # Unknown type — stop polling
@@ -2380,6 +2497,19 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     if _typename == 'ProcessedReceipt':
                         return True, "ORDER_PLACED", gateway, total_price, currency
                     elif _typename == 'ActionRequiredReceipt':
+                        _fb_action = _receipt.get('action', {})
+                        _fb_action_type = _fb_action.get('__typename', '') if _fb_action else ''
+                        if _fb_action_type == 'CompletePaymentChallengeV2':
+                            _fb_challenge = (_fb_action.get('challengeType', '') or '').upper()
+                            if 'THREE_D_SECURE' in _fb_challenge or '3DS' in _fb_challenge:
+                                return True, "3DS_REQUIRED", gateway, total_price, currency
+                            elif 'OTP' in _fb_challenge:
+                                return True, "OTP_REQUIRED", gateway, total_price, currency
+                            else:
+                                return True, _fb_challenge if _fb_challenge else "OTP_REQUIRED", gateway, total_price, currency
+                        elif _fb_action_type == 'CompletePaymentChallenge':
+                            if _fb_action.get('offsiteRedirect'):
+                                return True, "3DS_REQUIRED", gateway, total_price, currency
                         return True, "OTP_REQUIRED", gateway, total_price, currency
                     # FIX (BUG F): "MISMATCHED_BILL" is wrong for many receipt types.
                     # SubmittedForCompletion, ProcessingReceipt, WaitingReceipt etc.
@@ -2390,7 +2520,17 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     elif _typename in ('ProcessingReceipt', 'WaitingReceipt'):
                         return False, "Payment timeout (receipt still processing)", gateway, total_price, currency
                     elif _typename == 'FailedReceipt':
-                        # Should have been caught by processingError above, but fallback
+                        # Extract error code from processingError if available
+                        _fb_pe = _receipt.get('processingError', {})
+                        if _fb_pe:
+                            _fb_pe_type = _fb_pe.get('__typename', '')
+                            if _fb_pe_type == 'PaymentFailed':
+                                if _fb_pe.get('hasOffsiteRedirect', False):
+                                    return False, "3DS_REQUIRED", gateway, total_price, currency
+                                _fb_code = _fb_pe.get('code', '') or ''
+                                _GENERIC_CODES = {'GENERIC_ERROR', 'PAYMENT_FAILED', ''}
+                                if _fb_code and _fb_code not in _GENERIC_CODES:
+                                    return False, _fb_code, gateway, total_price, currency
                         return False, "CARD_DECLINED", gateway, total_price, currency
                     else:
                         # Truly unknown receipt type — include typename for debugging
@@ -2402,7 +2542,10 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             
             final_lower = final_text.lower()
             if 'actionreq' in final_lower or 'action_required' in final_lower:
-                return True, f"OTP_REQUIRED", gateway, total_price, currency
+                # Text-based fallback: try to detect 3DS vs OTP from raw text
+                if 'three_d_secure' in final_lower or '3ds' in final_lower or 'offsiteredirect' in final_lower:
+                    return True, "3DS_REQUIRED", gateway, total_price, currency
+                return True, "OTP_REQUIRED", gateway, total_price, currency
             elif 'processedreceipt' in final_lower:
                 return True, f"ORDER_PLACED", gateway, total_price, currency
             elif 'failedreceipt' in final_lower or 'declined' in final_lower:
@@ -2465,4 +2608,39 @@ async def process_card_async(cc, mes, ano, cvv, site_url, variant_id=None, proxy
     except Exception as e:
         print(f"[process_card_async] FATAL: site={site_url} error={e}", file=sys.stderr)
         return False, f"process_card_async error: {str(e)}", "UNKNOWN", "0.00", "USD"
+
+
+async def _submit_with_warm_session(warm_session, cc, mes, ano, cvv):
+    """Use a pre-warmed session to skip homepage/cart/checkout steps.
+    
+    The warm session already has: session, sst, queue_token, checkout_url,
+    variant_id, headers. We call process_card with variant_id pre-resolved
+    and the proxy already set — the main savings come from the product cache
+    already being warm and the connection pool keeping TLS connections alive.
+    
+    For now, this delegates to the full process_card flow but with the
+    variant already resolved (skipping fetch_products) and leveraging the
+    connection pool. Full session reuse (skipping checkout creation) would
+    require a major refactor of the 1700-line process_card function.
+    """
+    try:
+        # Use warm session's pre-resolved variant and site info
+        site_url = warm_session.site
+        proxy_str = warm_session.proxy
+        variant_id = warm_session.variant_id
+
+        # Close the warm session's client (we'll use process_card's own session)
+        try:
+            await warm_session.session.aclose()
+        except Exception:
+            pass
+
+        # Run full checkout with pre-resolved variant (saves fetch_products time)
+        result = await process_card(cc, mes, ano, cvv, site_url, variant_id, proxy_str)
+        success, message, gateway, price, currency = result
+        print(f"[warm_session] site={site_url} success={success} msg={message}", file=sys.stderr)
+        return result
+    except Exception as e:
+        print(f"[warm_session] FATAL: error={e}", file=sys.stderr)
+        return False, f"warm_session error: {str(e)}", "UNKNOWN", "0.00", "USD"
 
