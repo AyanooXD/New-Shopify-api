@@ -418,6 +418,11 @@ async def make_graphql_request_with_captcha_handling(
                 graphql_url, params=params, headers=headers,
                 json=json_data, proxy=proxy, timeout=25
             )
+            # UPDATE: Keep session token fresh - critical for avoiding GENERIC_ERROR
+            new_sst = response.headers.get("x-checkout-one-session-token") or response.headers.get("X-Checkout-One-Session-Token")
+            if new_sst: headers["x-checkout-one-session-token"] = new_sst
+            new_sid = response.headers.get("x-checkout-web-source-id") or response.headers.get("X-Checkout-Web-Source-Id")
+            if new_sid: headers["x-checkout-web-source-id"] = new_sid
             response_text = response.text
             
             # FIX: Validate response before returning.
@@ -598,7 +603,17 @@ def extract_clean_response(message):
     if words:
         first_word = words[0]
         if "_" in first_word and first_word.isupper():
-            return first_word
+            # Map generic Shopify error codes to meaningful decline messages
+            DECLINE_CODE_MAP = {
+                'GENERIC_ERROR': 'CARD_DECLINED',
+                'PAYMENT_FAILED': 'CARD_DECLINED',
+            }
+            return DECLINE_CODE_MAP.get(first_word, first_word)
+    
+    # Final check: if the extracted message is a generic code, map it
+    GENERIC_CODES = {'GENERIC_ERROR', 'PAYMENT_FAILED'}
+    if message.strip() in GENERIC_CODES:
+        return 'CARD_DECLINED'
     
     return message[:50]
 
@@ -861,7 +876,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             
             headers.update({
                 'shopify-checkout-client': 'checkout-web/1.0',
-                'shopify-checkout-source': f'id="{attempt_token}", type="cn"',
+                'shopify-checkout-source': f'id="{attempt_token}", type="{"cn" if checkout_uses_cn else "checkout-one"}"',
                 'x-checkout-one-session-token': sst,
                 'Referer': _referrer_for('graphql', ourl=ourl, checkout_url=checkout_url),  # Technique #9
                 'sec-fetch-dest': 'empty',
@@ -1227,7 +1242,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 'Origin': 'https://checkout.pci.shopifyinc.com',
                 # FIX: Build hash `/a8e4a94/` was outdated — Shopify rotates these.
                 # Use the dynamic hash fetched from checkout page, or fallback to latest known hash.
-                'Referer': f'https://checkout.pci.shopifyinc.com/build/{pci_build_hash}/number-ltr.html?identifier=&locationURL=',
+                'Referer': f'https://checkout.pci.shopifyinc.com/build/{pci_build_hash}/number-ltr.html?identifier=&locationURL={checkout_url}',
                 'User-Agent': hints['ua'],
                 'sec-ch-ua': hints['sec_ch_ua'],
                 'sec-ch-ua-full-version-list': hints['sec_ch_ua_full'],
@@ -1449,19 +1464,30 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 
                 elif result_type == 'SubmitFailed':
                     reason = submit_data.get('reason', 'Unknown reason')
-                    return False, extract_clean_response(reason), gateway, total_price, currency
+                    clean = extract_clean_response(reason)
+                    # Map generic codes from SubmitFailed to CARD_DECLINED
+                    if clean in ('GENERIC_ERROR', 'PAYMENT_FAILED', ''):
+                        return False, 'CARD_DECLINED', gateway, total_price, currency
+                    return False, clean, gateway, total_price, currency
                 
                 elif result_type == 'SubmitRejected':
                     errors = submit_data.get('errors', [])
                     if errors:
                         for error in errors:
-                            code = error.get('code', '')
-                            localized_msg = error.get('localizedMessage', '')
-                            non_localized_msg = error.get('nonLocalizedMessage', '')
-                            if code in ('GENERIC_ERROR', 'PAYMENT_FAILED', ''):
-                                detail = localized_msg or non_localized_msg
-                                if detail:
-                                    return False, detail, gateway, total_price, currency
+                            code = error.get('code', '') or ''
+                            localized_msg = error.get('localizedMessage', '') or ''
+                            non_localized_msg = error.get('nonLocalizedMessage', '') or ''
+                            # Map GENERIC_ERROR / PAYMENT_FAILED to CARD_DECLINED when no detail message
+                            DECLINE_CODE_MAP = {
+                                'GENERIC_ERROR': 'CARD_DECLINED',
+                                'PAYMENT_FAILED': 'CARD_DECLINED',
+                            }
+                            detail = localized_msg or non_localized_msg
+                            if detail and detail.strip():
+                                return False, detail.strip(), gateway, total_price, currency
+                            mapped = DECLINE_CODE_MAP.get(code)
+                            if mapped:
+                                return False, mapped, gateway, total_price, currency
                             if code:
                                 return False, code, gateway, total_price, currency
                     return False, "Submit Rejected", gateway, total_price, currency
@@ -1527,12 +1553,28 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                             error = receipt_data.get('processingError', {})
                             error_type = error.get('__typename', '')
                             if error_type == 'PaymentFailed':
-                                code = error.get('code', '')
-                                msg = error.get('messageUntranslated', '')
-                                if code in ('GENERIC_ERROR', 'PAYMENT_FAILED', '') and msg:
-                                    return True, msg, gateway, total_price, currency
-                                return True, code if code else 'PAYMENT_FAILED', gateway, total_price, currency
+                                code = error.get('code', '') or ''
+                                msg = error.get('messageUntranslated', '') or ''
+                                # Shopify now returns GENERIC_ERROR with empty messageUntranslated
+                                # for card declines. Map generic codes to meaningful decline messages.
+                                DECLINE_CODE_MAP = {
+                                    'GENERIC_ERROR': 'CARD_DECLINED',
+                                    'PAYMENT_FAILED': 'CARD_DECLINED',
+                                    '': 'CARD_DECLINED',
+                                }
+                                # If we have a real untranslated message, use it - more specific
+                                if msg and msg.strip():
+                                    return True, msg.strip(), gateway, total_price, currency
+                                # Otherwise map the generic code to CARD_DECLINED
+                                mapped = DECLINE_CODE_MAP.get(code)
+                                if mapped:
+                                    return True, mapped, gateway, total_price, currency
+                                # Code is something specific like INCORRECT_CVV, EXPIRED_CARD etc - use as-is
+                                return True, code if code else 'CARD_DECLINED', gateway, total_price, currency
                             code = error.get('code') or error_type or 'UNKNOWN_ERROR'
+                            # Also map generic codes for non-PaymentFailed error types
+                            if code in ('GENERIC_ERROR', 'PAYMENT_FAILED', ''):
+                                return True, 'CARD_DECLINED', gateway, total_price, currency
                             return True, code, gateway, total_price, currency
                         elif typename == 'ActionRequiredReceipt':
                             return True, "OTP_REQUIRED", gateway, total_price, currency
