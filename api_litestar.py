@@ -13,11 +13,7 @@
 #   - Built-in OpenAPI docs at /schema/swagger
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-import os
-import json
 import time
-import asyncio
-from urllib.parse import unquote
 from typing import Optional, Dict, Any
 
 from litestar import Litestar, get, post, MediaType
@@ -45,6 +41,8 @@ async def fetch_products_cached(domain: str, proxy_str: Optional[str] = None):
 
     Caches product lookups per domain+proxy for _CACHE_TTL seconds.
     Prevents redundant product.json fetches when mass-checking the same store.
+    
+    Returns: (success: bool, data_or_error: dict|str) — consistent tuple format.
     """
     cache_key = f"{domain}||{proxy_str or ''}"
     now = time.monotonic()
@@ -53,12 +51,14 @@ async def fetch_products_cached(domain: str, proxy_str: Optional[str] = None):
         if now - cached_at < _CACHE_TTL:
             return cached_result
     result = await _original_fetch_products(domain, proxy_str)
-    if isinstance(result, tuple) and result[0] is False:
-        return result
-    if len(_PRODUCT_CACHE) >= _CACHE_MAXSIZE:
-        oldest_key = min(_PRODUCT_CACHE, key=lambda k: _PRODUCT_CACHE[k][0])
-        del _PRODUCT_CACHE[oldest_key]
-    _PRODUCT_CACHE[cache_key] = (now, result)
+    # FIX: fetch_products now always returns (success, data_or_error) tuple.
+    # Only cache successful results to avoid caching errors.
+    success, data = result
+    if success:
+        if len(_PRODUCT_CACHE) >= _CACHE_MAXSIZE:
+            oldest_key = min(_PRODUCT_CACHE, key=lambda k: _PRODUCT_CACHE[k][0])
+            del _PRODUCT_CACHE[oldest_key]
+        _PRODUCT_CACHE[cache_key] = (now, result)
     return result
 
 
@@ -131,11 +131,15 @@ async def shopify_checker(
       - Lower memory per request (coroutine vs OS thread)
     """
     try:
-        # Decode URL-encoded parameters
-        site = unquote(site).strip() if site else None
-        cc_string = unquote(cc).strip() if cc else None
-        proxy_str = unquote(proxy).strip() if proxy else None
-        variant_id = unquote(variant).strip() if variant else None
+        # Initialize cc_string early so it's always available in the exception handler
+        cc_string = ""
+        # FIX: Litestar already URL-decodes query parameters automatically.
+        # Calling unquote() again would double-decode (e.g. %252F → %2F → /).
+        # Just strip whitespace instead.
+        site = site.strip() if site else None
+        cc_string = cc.strip() if cc else ""
+        proxy_str = proxy.strip() if proxy else None
+        variant_id = variant.strip() if variant else None
 
         if not site:
             return Response(
@@ -202,7 +206,7 @@ async def shopify_checker(
                 "Gateway": "UNKNOWN",
                 "Price": 0.0,
                 "Response": f"ERROR: {str(e)}",
-                "cc": cc_string if "cc_string" in dir() else "",
+                "cc": cc_string if cc_string else "",
             },
             status_code=500,
             media_type=MediaType.JSON,
