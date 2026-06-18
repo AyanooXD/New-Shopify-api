@@ -185,6 +185,45 @@ async def human_delay(min_sec=0.8, max_sec=2.5, step_name=""):
         delay += random.uniform(1.0, 3.0)
     await asyncio.sleep(delay)
 
+# --- Rate-Limit Retry with Exponential Backoff + Jitter ---
+async def retry_on_429(request_func, step_name="request", max_retries=3, base_delay=3.0, max_delay=15.0):
+    """Execute an HTTP request function with automatic 429 rate-limit retry.
+    
+    Uses exponential backoff with jitter to avoid thundering herd when
+    multiple concurrent users hit the same Shopify store.
+    
+    Args:
+        request_func: Async callable that returns a response object with .status_code and .text
+        step_name: Name of the checkout step (for logging)
+        max_retries: Maximum number of 429 retries before giving up
+        base_delay: Initial delay in seconds (doubled on each retry)
+        max_delay: Maximum delay cap in seconds
+    
+    Returns:
+        (response, was_retried): tuple of response object and bool indicating if retries occurred
+    """
+    was_retried = False
+    for attempt in range(max_retries + 1):
+        response = await request_func()
+        
+        # Not a 429 — return immediately
+        if response.status_code != 429:
+            return response, was_retried
+        
+        # Last attempt — return the 429 response, caller decides what to do
+        if attempt == max_retries:
+            return response, was_retried
+        
+        # Exponential backoff with jitter
+        backoff = min(base_delay * (2 ** attempt), max_delay)
+        jitter = random.uniform(0.5, 1.5)  # ±50% jitter to avoid thundering herd
+        delay = backoff * jitter
+        print(f"[rate-limit] {step_name} got HTTP 429, retry {attempt+1}/{max_retries} in {delay:.1f}s", file=sys.stderr)
+        await asyncio.sleep(delay)
+        was_retried = True
+    
+    return response, was_retried
+
 # --- Referrer Chain Consistency (technique #9) ---
 def _referrer_for(step, ourl=None, checkout_url=None):
     """Return the correct Referer header for each checkout step.
@@ -435,6 +474,16 @@ async def make_graphql_request_with_captcha_handling(
             # If we get a non-2xx status, log it clearly
             if status_code >= 400:
                 preview = response_text[:300].replace('\n', ' ').strip()
+                # RATE-LIMIT FIX: For HTTP 429, use exponential backoff instead of fixed 1s
+                if status_code == 429:
+                    _429_backoff = 2.0 * (2 ** attempt)  # 2s, 4s, 8s...
+                    _429_jitter = random.uniform(0.7, 1.3)
+                    _429_delay = min(_429_backoff * _429_jitter, 15.0)
+                    print(f"[rate-limit] GraphQL got HTTP 429, attempt {attempt+1}/{max_retries+1} in {_429_delay:.1f}s", file=sys.stderr)
+                    if attempt < max_retries:
+                        await asyncio.sleep(_429_delay)
+                        continue
+                    return response, response_text, False
                 if attempt < max_retries:
                     await asyncio.sleep(1)
                     continue
@@ -712,11 +761,15 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 'X-Requested-With': 'XMLHttpRequest',
                 'Referer': _referrer_for('cart', ourl=ourl),  # Technique #9: Referrer chain
             }
-            cart_resp = await session.post(cart, data=f'id={variant_id}&quantity=1', headers=cart_headers, proxy=proxy, timeout=10)
+            # RATE-LIMIT FIX: Retry on HTTP 429 with exponential backoff + jitter
+            cart_resp, _ = await retry_on_429(
+                lambda: session.post(cart, data=f'id={variant_id}&quantity=1', headers=cart_headers, proxy=proxy, timeout=10),
+                step_name="cart_attempt1", max_retries=2, base_delay=3.0, max_delay=12.0
+            )
 
             await human_delay(step_name="cart")  # Technique #2: Human-like delay
             
-            # Attempt 2: JSON body
+            # Attempt 2: JSON body (also with 429 retry)
             if cart_resp.status_code != 200:
                 cart_headers_alt = {
                     **headers,
@@ -725,14 +778,20 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     'X-Requested-With': 'XMLHttpRequest',
                 }
                 cart_data = {'items': [{'id': int(re.sub(r'[^0-9]', '', str(variant_id)) or '0'), 'quantity': 1}]}
-                cart_resp = await session.post(cart, json=cart_data, headers=cart_headers_alt, proxy=proxy, timeout=10)
+                cart_resp, _ = await retry_on_429(
+                    lambda: session.post(cart, json=cart_data, headers=cart_headers_alt, proxy=proxy, timeout=10),
+                    step_name="cart_attempt2", max_retries=2, base_delay=3.0, max_delay=12.0
+                )
 
-            # Attempt 3: Clear cart then retry form-encoded
+            # Attempt 3: Clear cart then retry form-encoded (also with 429 retry)
             if cart_resp.status_code != 200:
                 try:
                     await session.post(url + '/cart/clear.js', headers=cart_headers, proxy=proxy)
                     await asyncio.sleep(0.3)
-                    cart_resp = await session.post(cart, data=f'id={variant_id}&quantity=1', headers=cart_headers, proxy=proxy)
+                    cart_resp, _ = await retry_on_429(
+                        lambda: session.post(cart, data=f'id={variant_id}&quantity=1', headers=cart_headers, proxy=proxy),
+                        step_name="cart_attempt3", max_retries=2, base_delay=3.0, max_delay=12.0
+                    )
                 except Exception:
                     pass
 
@@ -742,9 +801,18 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     try:
                         cart_err_json = json.loads(cart_error_text)
                         err_desc = cart_err_json.get('description') or cart_err_json.get('message') or cart_err_json.get('error', '')
-                        err_msg = f"Cart Error: {err_desc}" if err_desc else f"Cart failed: HTTP {cart_resp.status_code}"
+                        # RATE-LIMIT FIX: Distinguish 429 from other cart errors
+                        if cart_resp.status_code == 429:
+                            err_msg = f"Cart Rate-Limited: HTTP 429 (retries exhausted)"
+                        elif err_desc:
+                            err_msg = f"Cart Error: {err_desc}"
+                        else:
+                            err_msg = f"Cart failed: HTTP {cart_resp.status_code}"
                     except Exception:
-                        err_msg = f"Cart failed: HTTP {cart_resp.status_code}"
+                        if cart_resp.status_code == 429:
+                            err_msg = "Cart Rate-Limited: HTTP 429 (retries exhausted)"
+                        else:
+                            err_msg = f"Cart failed: HTTP {cart_resp.status_code}"
                 except Exception:
                     err_msg = f"Cart failed: HTTP {cart_resp.status_code}"
                 return False, err_msg, gateway, total_price, currency
@@ -758,7 +826,14 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 'sec-fetch-site': 'same-origin',
                 'sec-fetch-user': '?1'
             }
-            response = await session.post(url=checkout, allow_redirects=True, headers=checkout_headers, proxy=proxy, timeout=15)
+            # RATE-LIMIT FIX: Retry on HTTP 429 for checkout step
+            response, _ = await retry_on_429(
+                lambda: session.post(url=checkout, allow_redirects=True, headers=checkout_headers, proxy=proxy, timeout=15),
+                step_name="checkout", max_retries=2, base_delay=3.0, max_delay=12.0
+            )
+            # If still 429 after retries, return rate-limit error
+            if response.status_code == 429:
+                return False, "Checkout Rate-Limited: HTTP 429 (retries exhausted)", gateway, total_price, currency
             await human_delay(step_name="checkout")  # Technique #2: Human-like delay
             checkout_url = str(response.url)
 
@@ -991,6 +1066,11 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             # Token-specific paths (/checkouts/cn/{token}/graphql) return 404 on most stores.
             graphql_url = f'https://{urlparse(ourl).netloc}/checkouts/unstable/graphql'
             
+            # RATE-LIMIT FIX: Extra delay before first GraphQL request to avoid hitting
+            # rate limits right after checkout step. Mass checking causes rapid sequential
+            # GraphQL hits on the same store, so a longer delay here helps significantly.
+            await human_delay(min_sec=1.5, max_sec=3.0, step_name="pre_graphql")
+            
             # FIX: Send Proposal query once (was sending TWICE with 3s sleep between,
             # using only the 2nd response — wasteful and can cause stale sessions).
             # Send once, if Throttled, then retry after delay.
@@ -1000,9 +1080,17 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 session, graphql_url, params, headers, json_data, checkout_url, max_retries=1, proxy=proxy
             )
             
-            # If Throttled, wait and retry once
-            if response and '"Throttled"' in resp_text:
-                await asyncio.sleep(3)
+            # RATE-LIMIT FIX: If Throttled, retry with exponential backoff (3s→6s→9s) + jitter
+            # Old code: single retry with fixed 3s delay — insufficient for mass checking
+            _throttle_retries = 3
+            for _t_attempt in range(_throttle_retries):
+                if not response or '"Throttled"' not in resp_text:
+                    break
+                _t_backoff = 3.0 * (_t_attempt + 1)  # 3s, 6s, 9s
+                _t_jitter = random.uniform(0.8, 1.2)  # ±20% jitter
+                _t_delay = _t_backoff * _t_jitter
+                print(f"[rate-limit] Proposal GraphQL Throttled, retry {_t_attempt+1}/{_throttle_retries} in {_t_delay:.1f}s", file=sys.stderr)
+                await asyncio.sleep(_t_delay)
                 response, resp_text, _ = await make_graphql_request_with_captcha_handling(
                     session, graphql_url, params, headers, json_data, checkout_url, max_retries=1, proxy=proxy
                 )
@@ -1261,7 +1349,13 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 vault_headers['shopify-identification-signature'] = ident_sig
             
             await human_delay(min_sec=1.0, max_sec=2.0, step_name="pci_vault")  # Technique #2: Human-like delay
-            response = await session.post('https://checkout.pci.shopifyinc.com/sessions', json=payload, headers=vault_headers, proxy=proxy, timeout=12)
+            # RATE-LIMIT FIX: Retry on HTTP 429 for PCI Vault step
+            response, _ = await retry_on_429(
+                lambda: session.post('https://checkout.pci.shopifyinc.com/sessions', json=payload, headers=vault_headers, proxy=proxy, timeout=12),
+                step_name="pci_vault", max_retries=2, base_delay=3.0, max_delay=12.0
+            )
+            if response.status_code == 429:
+                return False, "PCI_VAULT Rate-Limited: HTTP 429 (retries exhausted)", gateway, total_price, currency
             try:
                 # FIX: Read text first, check for HTML, then parse JSON.
                 # Previously response.json() could throw JSONDecodeError with the raw
@@ -1423,9 +1517,23 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
 
             await human_delay(min_sec=0.5, max_sec=1.5, step_name="submit")  # Technique #2: Human-like delay
             # FIX: Pass proxy=proxy for submit GraphQL request
+            # RATE-LIMIT FIX: Retry Submit on Throttled response with exponential backoff
             response, text, _ = await make_graphql_request_with_captcha_handling(
                 session, graphql_url, params, headers, submit_json_data, checkout_url, max_retries=1, proxy=proxy
             )
+            # Retry on Throttled for submit (same pattern as proposal)
+            _submit_throttle_retries = 3
+            for _st_attempt in range(_submit_throttle_retries):
+                if not response or '"Throttled"' not in text:
+                    break
+                _st_backoff = 3.0 * (_st_attempt + 1)
+                _st_jitter = random.uniform(0.8, 1.2)
+                _st_delay = _st_backoff * _st_jitter
+                print(f"[rate-limit] Submit GraphQL Throttled, retry {_st_attempt+1}/{_submit_throttle_retries} in {_st_delay:.1f}s", file=sys.stderr)
+                await asyncio.sleep(_st_delay)
+                response, text, _ = await make_graphql_request_with_captcha_handling(
+                    session, graphql_url, params, headers, submit_json_data, checkout_url, max_retries=1, proxy=proxy
+                )
             
             if is_captcha_required(text):
                 return False, "CAPTCHA_REQUIRED on submit", gateway, total_price, currency
