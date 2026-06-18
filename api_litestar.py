@@ -190,6 +190,7 @@ async def shopify_checker(
             content={
                 "Gateway": gateway,
                 "Price": price_float,
+                "Currency": currency,
                 "Response": clean_response,
                 "Status": success,
                 "cc": cc_string,
