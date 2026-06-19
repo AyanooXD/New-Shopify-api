@@ -26,6 +26,10 @@ def test_extract_payment_error_preserves_bare_generic_code():
     error = {"__typename": "PaymentFailed", "code": "GENERIC_ERROR"}
 
     assert _extract_payment_error_response(error) == "GENERIC_ERROR"
+def test_extract_payment_error_maps_bare_generic_to_card_declined():
+    error = {"__typename": "PaymentFailed", "code": "GENERIC_ERROR"}
+
+    assert _extract_payment_error_response(error) == "CARD_DECLINED"
 
 
 def test_payment_requires_offsite_action_supports_shopify_field_name():
