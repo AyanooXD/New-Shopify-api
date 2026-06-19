@@ -761,6 +761,64 @@ def extract_clean_response(message):
     
     return message[:50]
 
+
+_GENERIC_PAYMENT_CODES = {'GENERIC_ERROR', 'PAYMENT_FAILED', ''}
+
+def _first_non_empty_string(*values):
+    for value in values:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return ''
+
+def _extract_payment_error_response(error):
+    """Return the most specific Shopify payment error available.
+
+    Shopify often returns a generic top-level PaymentFailed.code while the
+    actionable decline details live in nested/message fields. Avoid surfacing
+    GENERIC_ERROR when a more useful response is present in the payload.
+    """
+    if not isinstance(error, dict):
+        return 'CARD_DECLINED'
+
+    candidate_keys = (
+        'declineCode', 'decline_code', 'gatewayCode', 'gateway_code',
+        'processorCode', 'processor_code', 'networkResponseCode',
+        'network_response_code', 'reasonCode', 'reason_code',
+        'errorCode', 'error_code', 'code',
+    )
+    for key in candidate_keys:
+        value = _first_non_empty_string(error.get(key))
+        if value and value.upper() not in _GENERIC_PAYMENT_CODES:
+            return value
+
+    nested_containers = (
+        error.get('message'), error.get('paymentError'), error.get('gatewayResponse'),
+        error.get('networkResponse'), error.get('processorResponse'), error.get('details'),
+    )
+    for nested in nested_containers:
+        if isinstance(nested, dict):
+            nested_response = _extract_payment_error_response(nested)
+            if nested_response != 'CARD_DECLINED':
+                return nested_response
+
+    message = _first_non_empty_string(
+        error.get('localizedMessage'), error.get('nonLocalizedMessage'),
+        error.get('messageUntranslated'), error.get('message'),
+        error.get('description'), error.get('reason'), error.get('detail'),
+    )
+    if message and message.upper() not in _GENERIC_PAYMENT_CODES:
+        return message
+
+    return 'CARD_DECLINED'
+
+def _payment_requires_offsite_action(error):
+    if not isinstance(error, dict):
+        return False
+    return bool(error.get('hasOffsiteRedirect') or error.get('hasOffsitePaymentMethod'))
+
 async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=None, shared_session=None):
     gateway = "UNKNOWN"
     total_price = "0.00"
@@ -2226,15 +2284,10 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                             _sr_error_type = _sr_error.get('__typename', '')
                             if _sr_error_type == 'PaymentFailed':
                                 _sr_code = _sr_error.get('code', '') or ''
-                                _sr_offsite = _sr_error.get('hasOffsiteRedirect', False)
+                                _sr_offsite = _payment_requires_offsite_action(_sr_error)
                                 if _sr_offsite:
                                     return False, "3DS_REQUIRED", gateway, total_price, currency
-                                _GENERIC_CODES = {'GENERIC_ERROR', 'PAYMENT_FAILED', ''}
-                                if _sr_code and _sr_code not in _GENERIC_CODES:
-                                    return False, _sr_code, gateway, total_price, currency
-                                _sr_msg = _sr_error.get('messageUntranslated', '') or ''
-                                if _sr_msg and _sr_msg.strip():
-                                    return False, _sr_msg.strip(), gateway, total_price, currency
+                                return False, _extract_payment_error_response(_sr_error), gateway, total_price, currency
                             return False, 'CARD_DECLINED', gateway, total_price, currency
                         
                         rid = receipt.get('id')
@@ -2349,7 +2402,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                             if error_type == 'PaymentFailed':
                                 code = error.get('code', '') or ''
                                 msg = error.get('messageUntranslated', '') or ''
-                                has_offsite = error.get('hasOffsiteRedirect', False)
+                                has_offsite = _payment_requires_offsite_action(error)
                                 # If hasOffsiteRedirect is True, the card requires 3DS
                                 # authentication but it wasn't completed.
                                 if has_offsite:
@@ -2357,16 +2410,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                 # Only map truly generic/empty codes to CARD_DECLINED.
                                 # Specific codes like INSUFFICIENT_FUNDS, EXPIRED_CARD,
                                 # CALL_ISSUER, etc. must be returned as-is.
-                                _GENERIC_CODES = {'GENERIC_ERROR', 'PAYMENT_FAILED', ''}
-                                # Prioritize the machine-readable code over the human-readable
-                                # messageUntranslated. Shopify's messageUntranslated is almost
-                                # always a generic "Your card was declined." regardless of the
-                                # actual decline reason — the specific reason is in `code`.
-                                if code and code not in _GENERIC_CODES:
-                                    return False, code, gateway, total_price, currency
-                                if msg and msg.strip():
-                                    return False, msg.strip(), gateway, total_price, currency
-                                return False, 'CARD_DECLINED', gateway, total_price, currency
+                                return False, _extract_payment_error_response(error), gateway, total_price, currency
                             code = error.get('code') or error_type or 'UNKNOWN_ERROR'
                             if code in ('GENERIC_ERROR', 'PAYMENT_FAILED', ''):
                                 return False, 'CARD_DECLINED', gateway, total_price, currency
@@ -2449,16 +2493,10 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                 _extra_error_type = _extra_error.get('__typename', '')
                                 _extra_code = _extra_error.get('code', '') or ''
                                 _extra_msg = _extra_error.get('messageUntranslated', '') or ''
-                                _extra_offsite = _extra_error.get('hasOffsiteRedirect', False)
+                                _extra_offsite = _payment_requires_offsite_action(_extra_error)
                                 if _extra_offsite:
                                     return False, "3DS_REQUIRED", gateway, total_price, currency
-                                _GENERIC_CODES = {'GENERIC_ERROR', 'PAYMENT_FAILED', ''}
-                                # Prioritize code over message (same logic as main poll loop)
-                                if _extra_code and _extra_code not in _GENERIC_CODES:
-                                    return False, _extra_code, gateway, total_price, currency
-                                if _extra_msg and _extra_msg.strip():
-                                    return False, _extra_msg.strip(), gateway, total_price, currency
-                                return False, 'CARD_DECLINED', gateway, total_price, currency
+                                return False, _extract_payment_error_response(_extra_error), gateway, total_price, currency
                             elif _extra_typename == 'ActionRequiredReceipt':
                                 _extra_action = _extra_receipt.get('action', {})
                                 _extra_action_type = _extra_action.get('__typename', '') if _extra_action else ''
@@ -2485,11 +2523,13 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             
             try:
                 res_json = json.loads(final_text)
-                result = res_json.get('data', {}).get('receipt', {}).get('processingError', {}).get('code')
+                _fallback_error = res_json.get('data', {}).get('receipt', {}).get('processingError', {})
+                result = _fallback_error.get('code') if isinstance(_fallback_error, dict) else None
                 
                 if result:
-                    # FIX: processingError in fallback means card was declined
-                    return False, result, gateway, total_price, currency
+                    # FIX: processingError in fallback means card was declined; prefer
+                    # richer nested/message fields over a generic Shopify code.
+                    return False, _extract_payment_error_response(_fallback_error), gateway, total_price, currency
                 else:
                     # No processingError — check receipt type
                     _receipt = res_json.get('data', {}).get('receipt', {})
@@ -2525,12 +2565,12 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         if _fb_pe:
                             _fb_pe_type = _fb_pe.get('__typename', '')
                             if _fb_pe_type == 'PaymentFailed':
-                                if _fb_pe.get('hasOffsiteRedirect', False):
+                                if _payment_requires_offsite_action(_fb_pe):
                                     return False, "3DS_REQUIRED", gateway, total_price, currency
                                 _fb_code = _fb_pe.get('code', '') or ''
-                                _GENERIC_CODES = {'GENERIC_ERROR', 'PAYMENT_FAILED', ''}
-                                if _fb_code and _fb_code not in _GENERIC_CODES:
-                                    return False, _fb_code, gateway, total_price, currency
+                                _fb_response = _extract_payment_error_response(_fb_pe)
+                                if _fb_response != 'CARD_DECLINED':
+                                    return False, _fb_response, gateway, total_price, currency
                         return False, "CARD_DECLINED", gateway, total_price, currency
                     else:
                         # Truly unknown receipt type — include typename for debugging
