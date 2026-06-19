@@ -676,6 +676,11 @@ async def fetch_products(domain, proxy_str=None):
     except Exception as e:
         return False, f"error: {str(e)}"
 
+_GENERIC_PAYMENT_CODES = {'GENERIC_ERROR', 'PAYMENT_FAILED', ''}
+
+def _is_generic_payment_code(value):
+    return str(value or '').strip().upper() in _GENERIC_PAYMENT_CODES
+
 def extract_clean_response(message):
     if not message:
         return "UNKNOWN_ERROR"
@@ -719,9 +724,6 @@ def extract_clean_response(message):
     }
     msg_upper = message.strip().upper()
     if msg_upper in _KNOWN_CODES:
-        # Map only truly generic codes to CARD_DECLINED; preserve all others
-        if msg_upper in ('GENERIC_ERROR', 'PAYMENT_FAILED'):
-            return 'CARD_DECLINED'
         return message.strip()
     
     patterns = [
@@ -741,25 +743,83 @@ def extract_clean_response(message):
                 match = match[0]
             if match and "_" in match and len(match) < 50:
                 match = match.strip("{}:'\" ")
+                if match.upper() in _GENERIC_PAYMENT_CODES:
+                    continue
                 return match
     
     words = message.split()
     if words:
         first_word = words[0]
         if "_" in first_word and first_word.isupper():
-            # Map only truly generic Shopify error codes to CARD_DECLINED
-            _GENERIC_MAP = {
-                'GENERIC_ERROR': 'CARD_DECLINED',
-                'PAYMENT_FAILED': 'CARD_DECLINED',
-            }
-            return _GENERIC_MAP.get(first_word, first_word)
+            # If Shopify prefixes a human-readable detail with a generic code,
+            # keep scanning/fall through so the detail is not lost.
+            if _is_generic_payment_code(first_word) and len(words) > 1:
+                pass
+            else:
+                return first_word
     
-    # Final check: if the extracted message is a generic code, map it
-    GENERIC_CODES = {'GENERIC_ERROR', 'PAYMENT_FAILED'}
-    if message.strip() in GENERIC_CODES:
-        return 'CARD_DECLINED'
-    
-    return message[:50]
+    return message[:120]
+
+
+def _first_non_empty_string(*values):
+    for value in values:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return ''
+
+def _extract_payment_error_response(error):
+    """Return the most specific Shopify payment error available.
+
+    Shopify often returns a generic top-level PaymentFailed.code while the
+    actionable decline details live in nested/message fields. Prefer those
+    details, but keep Shopify's actual generic code when it is all we received.
+    """
+    if not isinstance(error, dict):
+        return 'UNKNOWN_PAYMENT_ERROR'
+
+    generic_code = ''
+    candidate_keys = (
+        'declineCode', 'decline_code', 'gatewayCode', 'gateway_code',
+        'processorCode', 'processor_code', 'networkResponseCode',
+        'network_response_code', 'reasonCode', 'reason_code',
+        'errorCode', 'error_code', 'code',
+    )
+    for key in candidate_keys:
+        value = _first_non_empty_string(error.get(key))
+        if value and not _is_generic_payment_code(value):
+            return value
+        if value and _is_generic_payment_code(value) and not generic_code:
+            generic_code = value
+
+    nested_containers = (
+        error.get('message'), error.get('paymentError'), error.get('gatewayResponse'),
+        error.get('networkResponse'), error.get('processorResponse'), error.get('details'),
+    )
+    for nested in nested_containers:
+        if isinstance(nested, dict):
+            nested_response = _extract_payment_error_response(nested)
+            if nested_response != 'UNKNOWN_PAYMENT_ERROR' and not _is_generic_payment_code(nested_response):
+                return nested_response
+            if _is_generic_payment_code(nested_response) and not generic_code:
+                generic_code = nested_response
+
+    message = _first_non_empty_string(
+        error.get('localizedMessage'), error.get('nonLocalizedMessage'),
+        error.get('messageUntranslated'), error.get('message'),
+        error.get('description'), error.get('reason'), error.get('detail'),
+    )
+    if message and not _is_generic_payment_code(message):
+        return message
+
+    return generic_code or message or 'UNKNOWN_PAYMENT_ERROR'
+
+def _payment_requires_offsite_action(error):
+    if not isinstance(error, dict):
+        return False
+    return bool(error.get('hasOffsiteRedirect') or error.get('hasOffsitePaymentMethod'))
 
 
 _GENERIC_PAYMENT_CODES = {'GENERIC_ERROR', 'PAYMENT_FAILED', ''}
@@ -2234,16 +2294,21 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 if not submit_data:
                     errors = resp_json.get('errors', [])
                     if errors:
+                        generic_error_code = ''
                         error_messages = []
                         for error in errors:
                             code = error.get('code')
-                            msg = error.get('message', '') or error.get('localizedMessage', '') or ''
-                            if code:
+                            msg = error.get('message', '') or error.get('localizedMessage', '') or error.get('nonLocalizedMessage', '') or ''
+                            if code and not _is_generic_payment_code(code):
                                 return False, code, gateway, total_price, currency
-                            if msg:
+                            if code:
+                                generic_error_code = code
+                            if msg and not _is_generic_payment_code(msg):
                                 error_messages.append(msg)
                         if error_messages:
                             return False, error_messages[0], gateway, total_price, currency
+                        if generic_error_code:
+                            return False, generic_error_code, gateway, total_price, currency
                     
                     if resp_json.get('data') is None and not errors:
                         return False, "SERVER_ERROR: null data in submit response", gateway, total_price, currency
@@ -2288,6 +2353,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                 if _sr_offsite:
                                     return False, "3DS_REQUIRED", gateway, total_price, currency
                                 return False, _extract_payment_error_response(_sr_error), gateway, total_price, currency
+                            return False, _sr_error_type or receipt_type, gateway, total_price, currency
                             return False, 'CARD_DECLINED', gateway, total_price, currency
                         
                         rid = receipt.get('id')
@@ -2297,9 +2363,6 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 elif result_type == 'SubmitFailed':
                     reason = submit_data.get('reason', 'Unknown reason')
                     clean = extract_clean_response(reason)
-                    # Map generic codes from SubmitFailed to CARD_DECLINED
-                    if clean in ('GENERIC_ERROR', 'PAYMENT_FAILED', ''):
-                        return False, 'CARD_DECLINED', gateway, total_price, currency
                     return False, clean, gateway, total_price, currency
                 
                 elif result_type == 'SubmitRejected':
@@ -2329,7 +2392,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                             if detail and detail.strip():
                                 return False, detail.strip(), gateway, total_price, currency
                             if code in _GENERIC_CODES:
-                                return False, 'CARD_DECLINED', gateway, total_price, currency
+                                return False, code, gateway, total_price, currency
                     return False, "Submit Rejected", gateway, total_price, currency
                 
                 elif result_type == 'Throttled':
@@ -2381,9 +2444,8 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         sst = _new_sst_poll
                         poll_json_data['variables']['sessionToken'] = sst
                 
-                # BUG #20 FIX: CAPTCHA in poll = CAPTCHA block, NOT card declined.
-                # Returning True (charged=True) with "CARD_DECLINED" was masking the
-                # real problem — the payment was NEVER submitted, CAPTCHA blocked it.
+                # BUG #20 FIX: CAPTCHA in poll = CAPTCHA block, not a payment failure.
+                # The payment was never submitted because CAPTCHA blocked it.
                 if is_captcha_required(final_text):
                     return False, "CAPTCHA_REQUIRED on poll", gateway, total_price, currency
                 
@@ -2407,13 +2469,17 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                 # authentication but it wasn't completed.
                                 if has_offsite:
                                     return False, "3DS_REQUIRED", gateway, total_price, currency
+                                # Return the most specific Shopify payment response available;
+                                # if Shopify only supplied a generic code, keep that actual code.
                                 # Only map truly generic/empty codes to CARD_DECLINED.
                                 # Specific codes like INSUFFICIENT_FUNDS, EXPIRED_CARD,
                                 # CALL_ISSUER, etc. must be returned as-is.
                                 return False, _extract_payment_error_response(error), gateway, total_price, currency
                             code = error.get('code') or error_type or 'UNKNOWN_ERROR'
-                            if code in ('GENERIC_ERROR', 'PAYMENT_FAILED', ''):
-                                return False, 'CARD_DECLINED', gateway, total_price, currency
+                            if code in ('GENERIC_ERROR', 'PAYMENT_FAILED'):
+                                return False, code, gateway, total_price, currency
+                            if not code:
+                                return False, error_type or 'UNKNOWN_PAYMENT_ERROR', gateway, total_price, currency
                             return False, code, gateway, total_price, currency
                         elif typename == 'ActionRequiredReceipt':
                             action = receipt_data.get('action', {})
@@ -2452,8 +2518,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     break
             
             # BUG #20 FIX: Fallback CAPTCHA check after poll loop exits — same fix.
-            # This was returning True,"CARD_DECLINED" which is WRONG: CAPTCHA means
-            # the payment was blocked, the card was never actually tried/declined.
+            # CAPTCHA means the payment was blocked before the card was actually tried.
             if 'CAPTCHA_REQUIRED' in final_text:
                 return False, "CAPTCHA_REQUIRED on poll", gateway, total_price, currency
             
@@ -2567,11 +2632,8 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                             if _fb_pe_type == 'PaymentFailed':
                                 if _payment_requires_offsite_action(_fb_pe):
                                     return False, "3DS_REQUIRED", gateway, total_price, currency
-                                _fb_code = _fb_pe.get('code', '') or ''
-                                _fb_response = _extract_payment_error_response(_fb_pe)
-                                if _fb_response != 'CARD_DECLINED':
-                                    return False, _fb_response, gateway, total_price, currency
-                        return False, "CARD_DECLINED", gateway, total_price, currency
+                                return False, _extract_payment_error_response(_fb_pe), gateway, total_price, currency
+                        return False, (_fb_pe.get('__typename') or 'FAILED_RECEIPT') if isinstance(_fb_pe, dict) else 'FAILED_RECEIPT', gateway, total_price, currency
                     else:
                         # Truly unknown receipt type — include typename for debugging
                         return False, f"Unexpected receipt type: {_typename or 'None'}", gateway, total_price, currency
@@ -2589,8 +2651,8 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             elif 'processedreceipt' in final_lower:
                 return True, f"ORDER_PLACED", gateway, total_price, currency
             elif 'failedreceipt' in final_lower or 'declined' in final_lower:
-                # FIX: Failed/declined in fallback poll = card declined, not success
-                return False, code if code else "CARD_DECLINED", gateway, total_price, currency
+                # Failed/declined in fallback poll means the payment failed; do not invent a decline reason
+                return False, code if code else "FAILED_RECEIPT", gateway, total_price, currency
             else:
                 # FIX (BUG G): Include diagnostic info instead of bare "Unknown Result".
                 # User needs to know what the poll response actually contained.

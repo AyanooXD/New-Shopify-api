@@ -22,6 +22,10 @@ def test_extract_payment_error_uses_message_when_code_is_generic():
     assert _extract_payment_error_response(error) == "Card issuer declined the transaction."
 
 
+def test_extract_payment_error_preserves_bare_generic_code():
+    error = {"__typename": "PaymentFailed", "code": "GENERIC_ERROR"}
+
+    assert _extract_payment_error_response(error) == "GENERIC_ERROR"
 def test_extract_payment_error_maps_bare_generic_to_card_declined():
     error = {"__typename": "PaymentFailed", "code": "GENERIC_ERROR"}
 
@@ -30,3 +34,18 @@ def test_extract_payment_error_maps_bare_generic_to_card_declined():
 
 def test_payment_requires_offsite_action_supports_shopify_field_name():
     assert _payment_requires_offsite_action({"hasOffsitePaymentMethod": True}) is True
+
+
+def test_extract_clean_response_does_not_drop_detail_after_generic_prefix():
+    from core import extract_clean_response
+
+    assert (
+        extract_clean_response("GENERIC_ERROR Card issuer declined the transaction.")
+        == "GENERIC_ERROR Card issuer declined the transaction."
+    )
+
+
+def test_extract_clean_response_preserves_bare_generic_code():
+    from core import extract_clean_response
+
+    assert extract_clean_response("GENERIC_ERROR") == "GENERIC_ERROR"
