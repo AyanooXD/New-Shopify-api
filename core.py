@@ -770,7 +770,7 @@ def _first_non_empty_string(*values):
             return text
     return ''
 
-def _extract_payment_error_response(error):
+def _extract_payment_error_response(error, _depth=0):
     """Return the most specific Shopify payment error available.
 
     Shopify often returns a generic top-level PaymentFailed.code while the
@@ -784,6 +784,10 @@ def _extract_payment_error_response(error):
         4. code="INSUFFICIENT_FUNDS" → "INSUFFICIENT_FUNDS"
         5. declineCode="DO_NOT_HONOR" → "DO_NOT_HONOR"
     """
+    # FIX Bug #15: Prevent stack overflow from deeply nested error responses
+    if _depth > 5:
+        return 'UNKNOWN_PAYMENT_ERROR'
+
     if not isinstance(error, dict):
         return 'UNKNOWN_PAYMENT_ERROR'
 
@@ -821,7 +825,7 @@ def _extract_payment_error_response(error):
             if isinstance(_nested_code, str) and _nested_code.strip() and not _is_generic_payment_code(_nested_code):
                 return _nested_code.strip()
 
-            nested_response = _extract_payment_error_response(nested)
+            nested_response = _extract_payment_error_response(nested, _depth=_depth+1)
             if nested_response != 'UNKNOWN_PAYMENT_ERROR' and not _is_generic_payment_code(nested_response):
                 return nested_response
             if _is_generic_payment_code(nested_response) and not generic_code:
@@ -982,11 +986,17 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     'Accept': 'application/json',
                     'X-Requested-With': 'XMLHttpRequest',
                 }
-                cart_data = {'items': [{'id': int(re.sub(r'[^0-9]', '', str(variant_id)) or '0'), 'quantity': 1}]}
-                cart_resp, _ = await retry_on_429(
-                    lambda: session.post(cart, json=cart_data, headers=cart_headers_alt, proxy=proxy, timeout=10),
-                    step_name="cart_attempt2", max_retries=2, base_delay=3.0, max_delay=12.0
-                )
+                # FIX Bug #11/#28: Validate that parsed variant ID is > 0 before sending
+                _cart_vid = int(re.sub(r'[^0-9]', '', str(variant_id)) or '0')
+                if _cart_vid <= 0:
+                    # Non-numeric variant_id — skip JSON cart attempt entirely
+                    pass  # cart_resp already has the failed attempt 1 result
+                else:
+                    cart_data = {'items': [{'id': _cart_vid, 'quantity': 1}]}
+                    cart_resp, _ = await retry_on_429(
+                        lambda cart_data=cart_data: session.post(cart, json=cart_data, headers=cart_headers_alt, proxy=proxy, timeout=10),
+                        step_name="cart_attempt2", max_retries=2, base_delay=3.0, max_delay=12.0
+                    )
 
             # Attempt 3: Clear cart then retry form-encoded (also with 429 retry)
             if cart_resp.status_code != 200:
@@ -1417,6 +1427,14 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                 _retry_sid = _rsid_m.group(1)
                         if _retry_sid:
                             stableId = _retry_sid
+                        # FIX Bug #30: Re-extract attempt_token and checkout_uses_cn from the new checkout_url
+                        attempt_token_match = re.search(r'/checkouts/cn/([^/?]+)', checkout_url)
+                        checkout_uses_cn = bool(attempt_token_match)
+                        if attempt_token_match:
+                            attempt_token = attempt_token_match.group(1)
+                        else:
+                            plain_match = re.search(r'/checkouts/([^/?]+)', checkout_url)
+                            attempt_token = plain_match.group(1) if plain_match else checkout_url.split('/')[-1].split('?')[0]
                         print(f"[SESSION_TOKEN] Retry succeeded: {sst[:8]}...", file=sys.stderr)
                 except Exception as _retry_err:
                     _sst_methods_tried.append(f"retry_error:{str(_retry_err)[:40]}")
@@ -1599,6 +1617,10 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 if _new_sst and _new_sst != sst:
                     print(f"[SESSION_TOKEN] Refreshed sst from proposal response headers: {sst[:8]}... -> {_new_sst[:8]}...", file=sys.stderr)
                     sst = _new_sst
+                    # FIX Bug #29: Keep json_data body in sync with the refreshed sst.
+                    # Without this, the delivery proposal sends the old sst in the body
+                    # while headers have the new one, causing "Session is null" errors.
+                    json_data['variables']['sessionInput']['sessionToken'] = sst
             
             if not response:
                 return False, f"Request failed: {resp_text}", gateway, total_price, currency
@@ -2266,7 +2288,9 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 return False, "Payment method not available", gateway, total_price, currency
             
             # If GraphQL request itself failed (HTML block, timeout, error), return early
-            if not _graphql_ok and not response:
+            # FIX Bug #32: Check should match delivery proposal pattern —
+            # return early if EITHER response is None OR graphql is not OK
+            if not response or not _graphql_ok:
                 return False, f"Submit request failed: {text}", gateway, total_price, currency
             
             rid = None  # Initialize before try block to prevent NameError if no branch assigns it
@@ -2526,7 +2550,8 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                             print(f"[POLL] Unknown receipt typename: {typename}, data keys: {list(receipt_data.keys())}", file=sys.stderr)
                         
                 except Exception as e:
-                    pass
+                    # FIX Bug #35: Log poll parse errors instead of silently swallowing them
+                    print(f"[POLL] Parse error on poll {poll_idx+1}: {e}", file=sys.stderr)
                 
                 if 'WaitingReceipt' in final_text:
                     await asyncio.sleep(delay)
@@ -2717,6 +2742,10 @@ def parse_cc_string(cc_string):
         raise ValueError(f"Invalid month: {mes} (must be 01-12)")
     if len(ano) == 2:
         ano = '20' + ano
+    # FIX Bug #14: Reject expired cards (year 2000 or earlier)
+    ano_int = int(ano)
+    if ano_int < 2020:
+        raise ValueError(f"Invalid year: {ano} (card is expired)")
     return {
         'cc': cc_num,
         'mes': mes,
@@ -2738,25 +2767,29 @@ async def process_card_async(cc, mes, ano, cvv, site_url, variant_id=None, proxy
 
 
 async def _submit_with_warm_session(warm_session, cc, mes, ano, cvv):
-    """Use a pre-warmed session to skip homepage/cart/checkout steps.
-    
-    The warm session already has: session, sst, queue_token, checkout_url,
-    variant_id, headers. We call process_card with variant_id pre-resolved
-    and the proxy already set — the main savings come from the product cache
-    already being warm and the connection pool keeping TLS connections alive.
-    
-    For now, this delegates to the full process_card flow but with the
-    variant already resolved (skipping fetch_products) and leveraging the
-    connection pool. Full session reuse (skipping checkout creation) would
-    require a major refactor of the 1700-line process_card function.
+    """Use a pre-warmed session to skip homepage/cart/checkout HTML steps.
+
+    FIX Bug #27/#33/#34: The previous attempt to reuse the warm session's
+    GraphQL state directly had critical bugs:
+    - Referenced undefined _NEGOTIATE_QUERY, _SUBMIT_QUERY, _POLL_QUERY
+    - Used wrong GraphQL URL pattern (checkout_url/api/graphql instead of /checkouts/unstable/graphql)
+    - Wrong payment method key structure (pm.__typename vs pm.paymentMethod.__typename)
+
+    The safest approach: use warm session's pre-resolved variant_id to skip
+    fetch_products (which is already cached), and pass the proxy through.
+    The real time savings come from the product cache + connection pool.
+
+    Future optimization: a proper warm session reuse would need to replicate
+    the exact QUERY_PROPOSAL_SHIPPING + MUTATION_SUBMIT + QUERY_POLL structure
+    from process_card, which is fragile and couples the two tightly.
     """
     try:
-        # Use warm session's pre-resolved variant and site info
         site_url = warm_session.site
         proxy_str = warm_session.proxy
         variant_id = warm_session.variant_id
 
-        # Close the warm session's client (we'll use process_card's own session)
+        # Close the warm session's client — we'll use process_card's own session
+        # (process_card creates a fresh session per checkout to avoid cookie contamination)
         try:
             await warm_session.session.aclose()
         except Exception:
