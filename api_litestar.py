@@ -84,7 +84,7 @@ async def _dedup_or_run(dedup_key: str, coro_factory):
         expired_keys = [k for k, f in _inflight.items() if f.done()]
         for k in expired_keys:
             _inflight.pop(k, None)
-        # If still over cap after evicting done entries, evict oldest (LIFO)
+        # If still over cap after evicting done entries, evict oldest (FIFO)
         if len(_inflight) > _DEDUP_MAX_ENTRIES:
             keys_to_remove = list(_inflight.keys())[:len(_inflight) - _DEDUP_MAX_ENTRIES]
             for k in keys_to_remove:
@@ -166,8 +166,8 @@ class _DynamicSemaphore:
     """Semaphore that supports dynamic capacity resizing in-place.
 
     When capacity increases, we release extra permits to wake waiting coroutines.
-    When capacity decreases, we let natural acquire/release cycle drain the excess
-    rather than forcibly revoking permits (which would break in-flight requests).
+    When capacity decreases, we try to acquire excess permits non-blockingly.
+    Any we can't acquire immediately will drain naturally as in-flight requests finish.
     """
 
     def __init__(self, initial_capacity: int):
@@ -193,8 +193,26 @@ class _DynamicSemaphore:
                 # Capacity increased — release extra permits
                 for _ in range(diff):
                     self._sem.release()
-            # If capacity decreased, we don't revoke permits. The next natural
-            # release cycle will bring the count down as waiters drain.
+            elif diff < 0:
+                # FIX Bug #41: Capacity decrease — drain excess permits.
+                # We acquire permits (non-blocking) to reduce available count.
+                # Permits we can't grab are held by in-flight requests and will
+                # be drained naturally as they complete and we don't release them
+                # back beyond the new capacity (enforced by acquire/release tracking).
+                drained = 0
+                for _ in range(-diff):
+                    # Try to drain a permit — if someone is waiting, wake them
+                    # by releasing and immediately re-acquiring (net zero change
+                    # for waiters, but reduces available count by 1)
+                    if self._sem._value > 0:
+                        # There's a free permit — grab it to reduce the count
+                        try:
+                            self._sem.acquire_nowait()
+                            drained += 1
+                        except Exception:
+                            break
+                    else:
+                        break
 
     @property
     def capacity(self) -> int:
@@ -287,11 +305,28 @@ class _CircuitBreaker:
             self.tripped_at = now
 
     def record_success(self):
-        self.fail_count = max(0, self.fail_count - 1)
-        if self.fail_count < _CB_FAIL_THRESHOLD:
-            self.tripped_at = 0.0
+        # FIX Bug #51: When breaker is tripped, require multiple successes
+        # before fully closing the circuit. A single lucky success shouldn't
+        # un-trip it — that could cause a cascade of failures.
+        if self.tripped_at > 0:
+            # Still in tripped state — decrement but don't close yet
+            self.fail_count = max(0, self.fail_count - 1)
+            if self.fail_count <= 0:
+                # Multiple successes have worn down the count — safe to close
+                self.tripped_at = 0.0
+        else:
+            self.fail_count = max(0, self.fail_count - 1)
+            if self.fail_count < _CB_FAIL_THRESHOLD:
+                self.tripped_at = 0.0
+
+    def is_currently_open(self) -> bool:
+        """Read-only check — does NOT mutate state. Safe for status endpoints."""
+        if self.tripped_at == 0.0:
+            return False
+        return time.monotonic() - self.tripped_at <= _CB_COOLDOWN
 
     def is_open(self) -> bool:
+        """Mutating check — transitions half-open state. Use in request path only."""
         if self.tripped_at == 0.0:
             return False
         if time.monotonic() - self.tripped_at > _CB_COOLDOWN:
@@ -304,9 +339,17 @@ class _CircuitBreaker:
 
 _circuit_breakers: Dict[str, _CircuitBreaker] = {}
 _cb_rejected = 0
+_CB_MAX_ENTRIES = 2000  # FIX Bug #47: Cap circuit breaker dict to prevent memory leak
 
 
 def _get_cb(site_domain: str) -> _CircuitBreaker:
+    # FIX Bug #47: Evict stale entries when dict exceeds cap
+    if len(_circuit_breakers) > _CB_MAX_ENTRIES:
+        now = time.monotonic()
+        stale = [d for d, cb in _circuit_breakers.items()
+                 if cb.tripped_at == 0.0 and now - cb.last_fail > 3600]
+        for d in stale:
+            del _circuit_breakers[d]
     if site_domain not in _circuit_breakers:
         _circuit_breakers[site_domain] = _CircuitBreaker()
     return _circuit_breakers[site_domain]
@@ -444,6 +487,7 @@ async def fetch_products_pooled(domain: str, proxy_str: Optional[str] = None):
 
     identifier = _pick_identifier()
     client = await _client_pool.acquire(proxy_str, identifier)
+    client_ok = True  # FIX Bug #46: Track whether client is healthy
     try:
         if not domain.startswith('http'):
             domain = "https://" + domain
@@ -497,9 +541,16 @@ async def fetch_products_pooled(domain: str, proxy_str: Optional[str] = None):
             return True, min_product
         return False, "No available variants with price > 0"
     except Exception as e:
+        client_ok = False  # Client may be broken — don't return to pool
         return False, f"Fetch error: {str(e)}"
     finally:
-        await _client_pool.release(client, proxy_str)
+        if client_ok:
+            await _client_pool.release(client, proxy_str)
+        else:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
 
 
 # Override the cached fetch_products to use pooled connections
@@ -705,7 +756,8 @@ async def _create_warm_session(site_url: str, proxy_str: Optional[str], variant_
                         jwt_str = m.group(1)
                         parts = jwt_str.split('.')
                         if len(parts) >= 2:
-                            payload = parts[1] + '=' * (4 - len(parts[1]) % 4)
+                            # FIX Bug #45: Correct base64 padding — when len%4==0, add 0 padding chars (was adding 4)
+                            payload = parts[1] + '=' * ((4 - len(parts[1]) % 4) % 4)
                             try:
                                 decoded = _json.loads(_b64.urlsafe_b64decode(payload))
                                 sst = decoded.get('session_token') or decoded.get('checkout_session_token') or decoded.get('sst')
@@ -798,9 +850,9 @@ async def get_warm_session(site_url: str, proxy_str: Optional[str] = None) -> Op
                 continue
             # Check proxy match
             if ws.proxy != proxy_str:
-                # Put it back
+                # FIX Bug #42: Don't return None — put it back and continue searching
                 pool.appendleft(ws)
-                return None
+                continue
             _warm_pool_stats['used'] += 1
             return ws
     return None
@@ -942,7 +994,7 @@ async def api_status() -> Dict[str, Any]:
     # Circuit breaker summary
     now = time.monotonic()
     tripped_sites = [
-        domain for domain, cb in _circuit_breakers.items() if cb.is_open()
+        domain for domain, cb in _circuit_breakers.items() if cb.is_currently_open()
     ]
     # Warm pool stats
     warm_pool_summary = {}
@@ -981,7 +1033,7 @@ async def circuit_breaker_status() -> Dict[str, Any]:
     for domain, cb in _circuit_breakers.items():
         sites[domain] = {
             "fail_count": cb.fail_count,
-            "is_open": cb.is_open(),
+            "is_open": cb.is_currently_open(),  # FIX Bug #43: Read-only check
             "cooldown_remaining": max(0, _CB_COOLDOWN - (now - cb.tripped_at)) if cb.tripped_at else 0,
         }
     return {"sites": sites, "threshold": _CB_FAIL_THRESHOLD, "cooldown_seconds": _CB_COOLDOWN}
@@ -1099,7 +1151,9 @@ async def shopify_checker(
             await asyncio.sleep(wait_time)
 
         # ── LAYER 1: DEDUPLICATION ──
-        dedup_key = f"{card_number}|{site_domain}"
+        # FIX Bug #50: Include variant_id and proxy_str in dedup key.
+        # Without these, different variants/proxies for the same card+site share results.
+        dedup_key = f"{card_number}|{site_domain}|{variant_id or ''}|{proxy_str or ''}"
 
         async def _run_checkout():
             # ── LAYER 3: DEDICATED LANES ──
@@ -1205,6 +1259,11 @@ async def shopify_checker(
         )
 
     except Exception as e:
+        # FIX Bug #44: Record site-level failures even for exceptions that bypass
+        # the normal circuit breaker recording path (connection errors, SSL errors, etc.)
+        err_lower = str(e).lower()
+        if any(kw in err_lower for kw in ('connection', 'ssl', 'timeout', 'network', 'dns')):
+            cb.record_failure()
         return Response(
             content={
                 "error": str(e), "status": False,
