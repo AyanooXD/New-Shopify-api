@@ -1219,12 +1219,13 @@ async def _shopify_core(
 
         # ── LAYER 6: CIRCUIT BREAKER (record result) ──
         # FIX Bug #5: Only record_success when message is clearly a card-level success
-        # (ORDER_PLACED, 3DS_REQUIRED, OTP_REQUIRED). Other non-site-failure messages
-        # (like CARD_DECLINED) should NOT decrement fail_count — the card was declined,
-        # but the site itself worked fine. Only clear trip on actual successful orders.
+        # (ORDER_PLACED, 3DS_REQUIRED, OTP_REQUIRED, INSUFFICIENT_FUNDS).
+        # INSUFFICIENT_FUNDS means card is valid (passed Luhn/auth) — just no balance.
+        # Other non-site-failure messages (like CARD_DECLINED) should NOT decrement
+        # fail_count — the card was declined, but the site itself worked fine.
         if _is_site_failure(message):
             cb.record_failure()
-        elif message in ('ORDER_PLACED', '3DS_REQUIRED', 'OTP_REQUIRED'):
+        elif message in ('ORDER_PLACED', '3DS_REQUIRED', 'OTP_REQUIRED', 'INSUFFICIENT_FUNDS'):
             cb.record_success()
         # else: card-level failure (declined, expired, etc.) — don't touch CB counters
 
