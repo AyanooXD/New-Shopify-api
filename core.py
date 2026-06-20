@@ -1127,7 +1127,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         _jwt_parts = _jwt_str.split('.')
                         if len(_jwt_parts) >= 2:
                             _jwt_payload = _jwt_parts[1]
-                            _jwt_payload += '=' * (4 - len(_jwt_payload) % 4)
+                            _jwt_payload += '=' * ((4 - len(_jwt_payload) % 4) % 4)
                             try:
                                 _jwt_decoded = json.loads(base64.urlsafe_b64decode(_jwt_payload))
                                 # Try multiple possible key names in JWT payload
@@ -1336,7 +1336,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                     _rr_jwt = _rr_match.group(1)
                                     _rr_parts = _rr_jwt.split('.')
                                     if len(_rr_parts) >= 2:
-                                        _rr_payload = _rr_parts[1] + '=' * (4 - len(_rr_parts[1]) % 4)
+                                        _rr_payload = _rr_parts[1] + '=' * ((4 - len(_rr_parts[1]) % 4) % 4)
                                         try:
                                             _rr_decoded = json.loads(base64.urlsafe_b64decode(_rr_payload))
                                             _retry_sst = (_rr_decoded.get('session_token') or
@@ -2551,7 +2551,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         
                 except Exception as e:
                     # FIX Bug #35: Log poll parse errors instead of silently swallowing them
-                    print(f"[POLL] Parse error on poll {poll_idx+1}: {e}", file=sys.stderr)
+                    print(f"[POLL] Parse error on poll {i+1}: {e}", file=sys.stderr)
                 
                 if 'WaitingReceipt' in final_text:
                     await asyncio.sleep(delay)
@@ -2715,7 +2715,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             # Always close the session — every checkout creates its own AsyncClient
             try:
                 await asyncio.wait_for(session.aclose(), timeout=5.0)
-            except (asyncio.TimeoutError, Exception):
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
                 pass
 
     except Exception as e:

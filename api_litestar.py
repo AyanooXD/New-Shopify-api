@@ -20,6 +20,7 @@ import sys
 import time
 import random
 from collections import defaultdict, deque, OrderedDict
+from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, Tuple, List
 from urllib.parse import urlparse
 
@@ -1039,44 +1040,41 @@ async def circuit_breaker_status() -> Dict[str, Any]:
     return {"sites": sites, "threshold": _CB_FAIL_THRESHOLD, "cooldown_seconds": _CB_COOLDOWN}
 
 
-@get("/shopify", media_type=MediaType.JSON, sync=False)
-async def shopify_checker(
-    site: Optional[str] = Parameter(
-        query="site", required=False, default=None,
-        description="Shopify store URL",
-    ),
-    cc: Optional[str] = Parameter(
-        query="cc", required=False, default=None,
-        description="Card in CC|MM|YYYY|CVV format",
-    ),
-    proxy: Optional[str] = Parameter(
-        query="proxy", required=False, default=None,
-        description="Proxy in ip:port:user:pass format",
-    ),
-    variant: Optional[str] = Parameter(
-        query="variant", required=False, default=None,
-        description="Product variant ID (auto-detected if omitted)",
-    ),
-    lane: Optional[str] = Parameter(
-        query="lane", required=False, default="mass",
-        description="'single' for /cc priority lane, 'mass' for /chk mass lane",
-    ),
-    user_id: Optional[str] = Parameter(
-        query="user_id", required=False, default="anonymous",
-        description="User identifier for rate limiting",
-    ),
-) -> Response:
-    """Main Shopify checkout endpoint with all traffic management layers."""
+@dataclass
+class ShopifyRequest:
+    """Request body for the Shopify checkout endpoint."""
+    site: str
+    cc: str
+    proxy: Optional[str] = None
+    variant: Optional[str] = None
+    lane: Optional[str] = "mass"
+    user_id: Optional[str] = "anonymous"
+
+
+@post("/shopify", media_type=MediaType.JSON, sync=False)
+async def shopify_checker(data: ShopifyRequest) -> Response:
+    """Main Shopify checkout endpoint with all traffic management layers.
+
+    Accepts POST with JSON body containing:
+    - site: Shopify store URL (required)
+    - cc: Card in CC|MM|YYYY|CVV format (required)
+    - proxy: Proxy in ip:port:user:pass format (optional)
+    - variant: Product variant ID, auto-detected if omitted (optional)
+    - lane: 'single' for priority lane, 'mass' for mass lane (default: mass)
+    - user_id: User identifier for rate limiting (default: anonymous)
+    """
     global _cb_rejected, _rate_limited_count
 
+    # Pre-initialize to prevent NameError in outer except if early exception occurs
+    cc_string = data.cc.strip() if data.cc else ""
+    cb = None
+
     try:
-        cc_string = ""
-        site = site.strip() if site else None
-        cc_string = cc.strip() if cc else ""
-        proxy_str = proxy.strip() if proxy else None
-        variant_id = variant.strip() if variant else None
-        is_single = (lane or "mass").lower() == "single"
-        uid = (user_id or "anonymous").strip()
+        site = data.site.strip() if data.site else None
+        proxy_str = data.proxy.strip() if data.proxy else None
+        variant_id = data.variant.strip() if data.variant else None
+        is_single = (data.lane or "mass").lower() == "single"
+        uid = (data.user_id or "anonymous").strip()
 
         if not site:
             return Response(
@@ -1166,11 +1164,8 @@ async def shopify_checker(
             await _counters.inc(queued_attr)
 
             try:
-                # FIX Bug #2: _DynamicSemaphore supports manual acquire/release
-                if isinstance(sem, _DynamicSemaphore):
-                    await sem.acquire()
-                else:
-                    await sem.__aenter__()
+                # Both _DynamicSemaphore and asyncio.Semaphore support acquire()/release()
+                await sem.acquire()
                 try:
                     await _counters.dec(queued_attr)
                     await _counters.inc(active_attr)
@@ -1216,10 +1211,7 @@ async def shopify_checker(
                         await _counters.dec(active_attr)
                 finally:
                     # Release semaphore permit
-                    if isinstance(sem, _DynamicSemaphore):
-                        sem.release()
-                    else:
-                        sem.__aexit__(None, None, None)
+                    sem.release()
             except Exception:
                 await _counters.dec(queued_attr)
                 raise
@@ -1262,7 +1254,7 @@ async def shopify_checker(
         # FIX Bug #44: Record site-level failures even for exceptions that bypass
         # the normal circuit breaker recording path (connection errors, SSL errors, etc.)
         err_lower = str(e).lower()
-        if any(kw in err_lower for kw in ('connection', 'ssl', 'timeout', 'network', 'dns')):
+        if cb and any(kw in err_lower for kw in ('connection', 'ssl', 'timeout', 'network', 'dns')):
             cb.record_failure()
         return Response(
             content={
