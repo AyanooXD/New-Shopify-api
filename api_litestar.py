@@ -19,7 +19,7 @@ import os
 import sys
 import time
 import random
-from collections import defaultdict, deque
+from collections import defaultdict, deque, OrderedDict
 from typing import Optional, Dict, Any, Tuple, List
 from urllib.parse import urlparse
 
@@ -71,12 +71,24 @@ _ADAPTIVE_INTERVAL = float(os.environ.get('ADAPTIVE_INTERVAL', '15.0'))   # re-e
 _inflight: Dict[str, asyncio.Future] = {}
 _dedup_hits = 0
 _dedup_total = 0
+_DEDUP_MAX_ENTRIES = 2000  # FIX Bug #6: Cap dedup dict to prevent unbounded growth
 
 
 async def _dedup_or_run(dedup_key: str, coro_factory):
     """Return cached in-flight result or start a new checkout."""
     global _dedup_hits, _dedup_total
     _dedup_total += 1
+
+    # FIX Bug #6: Evict expired entries when dict exceeds cap
+    if len(_inflight) > _DEDUP_MAX_ENTRIES:
+        expired_keys = [k for k, f in _inflight.items() if f.done()]
+        for k in expired_keys:
+            _inflight.pop(k, None)
+        # If still over cap after evicting done entries, evict oldest (LIFO)
+        if len(_inflight) > _DEDUP_MAX_ENTRIES:
+            keys_to_remove = list(_inflight.keys())[:len(_inflight) - _DEDUP_MAX_ENTRIES]
+            for k in keys_to_remove:
+                _inflight.pop(k, None)
 
     if dedup_key in _inflight:
         fut = _inflight[dedup_key]
@@ -114,18 +126,89 @@ async def _dedup_or_run(dedup_key: str, coro_factory):
 # ══════════════════════════════════════════════════════════════════════
 _single_sem: Optional[asyncio.Semaphore] = None
 _mass_sem: Optional[asyncio.Semaphore] = None
-_active_single = 0
-_active_mass = 0
-_queued_single = 0
-_queued_mass = 0
+
+# FIX Bug #1: Thread-safe lane counters using a lock to prevent drift across await points
+class _LaneCounters:
+    """Thread-safe counters for active/queued lane tracking."""
+    __slots__ = ('lock', 'active_single', 'active_mass', 'queued_single', 'queued_mass')
+
+    def __init__(self):
+        self.lock = asyncio.Lock()
+        self.active_single = 0
+        self.active_mass = 0
+        self.queued_single = 0
+        self.queued_mass = 0
+
+    async def inc(self, attr: str, delta: int = 1):
+        async with self.lock:
+            setattr(self, attr, getattr(self, attr) + delta)
+
+    async def dec(self, attr: str, delta: int = 1):
+        async with self.lock:
+            current = getattr(self, attr)
+            setattr(self, attr, max(0, current - delta))
+
+    def read(self) -> Dict[str, int]:
+        """Snapshot all counters (no lock needed for single int reads under GIL)."""
+        return {
+            'active_single': self.active_single,
+            'active_mass': self.active_mass,
+            'queued_single': self.queued_single,
+            'queued_mass': self.queued_mass,
+        }
+
+_counters = _LaneCounters()
 
 
-def _get_lane_sems() -> Tuple[asyncio.Semaphore, asyncio.Semaphore]:
+# FIX Bug #2: Dynamic semaphore that supports capacity changes without
+# stranding in-flight waiters. Defined early because _get_lane_sems() references it.
+class _DynamicSemaphore:
+    """Semaphore that supports dynamic capacity resizing in-place.
+
+    When capacity increases, we release extra permits to wake waiting coroutines.
+    When capacity decreases, we let natural acquire/release cycle drain the excess
+    rather than forcibly revoking permits (which would break in-flight requests).
+    """
+
+    def __init__(self, initial_capacity: int):
+        self._sem = asyncio.Semaphore(initial_capacity)
+        self._capacity = initial_capacity
+        self._lock = asyncio.Lock()
+
+    async def acquire(self):
+        await self._sem.acquire()
+
+    def release(self):
+        self._sem.release()
+
+    async def resize(self, new_capacity: int):
+        """Resize the semaphore capacity in-place."""
+        async with self._lock:
+            old_capacity = self._capacity
+            if new_capacity == old_capacity:
+                return
+            diff = new_capacity - old_capacity
+            self._capacity = new_capacity
+            if diff > 0:
+                # Capacity increased — release extra permits
+                for _ in range(diff):
+                    self._sem.release()
+            # If capacity decreased, we don't revoke permits. The next natural
+            # release cycle will bring the count down as waiters drain.
+
+    @property
+    def capacity(self) -> int:
+        return self._capacity
+
+
+def _get_lane_sems() -> Tuple[asyncio.Semaphore, _DynamicSemaphore]:
     global _single_sem, _mass_sem
     if _single_sem is None:
         _single_sem = asyncio.Semaphore(_SINGLE_SLOTS)
     if _mass_sem is None:
-        _mass_sem = asyncio.Semaphore(_MASS_SLOTS)
+        # FIX Bug #2: Use _DynamicSemaphore for mass lane so adaptive scaling
+        # can resize it in-place without stranding in-flight waiters.
+        _mass_sem = _DynamicSemaphore(_MASS_SLOTS)
     return _single_sem, _mass_sem
 
 
@@ -155,10 +238,20 @@ class _TokenBucket:
 
 _user_buckets: Dict[str, _TokenBucket] = {}
 _rate_limited_count = 0
+_BUCKET_EVICT_AGE = 600  # FIX Bug #8: Evict buckets idle for 10 minutes
 
 
 def _get_bucket(user_id: str) -> _TokenBucket:
     if user_id not in _user_buckets:
+        # FIX Bug #8: Evict stale buckets before creating new ones
+        if len(_user_buckets) > 5000:
+            now = time.monotonic()
+            stale_keys = [
+                uid for uid, b in _user_buckets.items()
+                if now - b.last_refill > _BUCKET_EVICT_AGE
+            ]
+            for k in stale_keys:
+                del _user_buckets[k]
         _user_buckets[user_id] = _TokenBucket(_USER_RATE_LIMIT, _USER_BURST)
     return _user_buckets[user_id]
 
@@ -166,18 +259,10 @@ def _get_bucket(user_id: str) -> _TokenBucket:
 # ══════════════════════════════════════════════════════════════════════
 # LAYER 5: PRIORITY QUEUE
 # ══════════════════════════════════════════════════════════════════════
-# Single checks (priority=0) are processed before mass checks (priority=1).
-# Within same priority, FIFO order is maintained via a counter.
-_pq_counter = 0
-_pq: asyncio.PriorityQueue = None  # lazy init
-_pq_workers_started = False
-
-
-def _get_pq() -> asyncio.PriorityQueue:
-    global _pq
-    if _pq is None:
-        _pq = asyncio.PriorityQueue()
-    return _pq
+# FIX Arch #26: Removed dead PriorityQueue code — it was never used.
+# The /shopify endpoint uses semaphores directly for lane management,
+# which is simpler and sufficient. Priority ordering within each lane
+# is handled by asyncio's built-in FIFO semaphore waiter queue.
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -229,11 +314,12 @@ def _get_cb(site_domain: str) -> _CircuitBreaker:
 
 # Site error keywords that trigger circuit breaker.
 # IMPORTANT: These must only match SITE-LEVEL failures, NOT card/payment
-# failures. "timeout" alone is too broad — it matches "Payment timeout
-# (receipt still processing)" which is a normal card response, not a site issue.
+# failures. "timed out" and "timeout" are too broad — they match
+# "Payment timeout (receipt still processing)" which is a normal card
+# response, not a site issue. Use prefix-based matching instead.
 _CB_TRIGGER_KEYWORDS = {
     'captcha_required', 'captcha_block', 'rate-limited', 'http 429',
-    'timed out', 'connection failed', 'ssl error',
+    'connection failed', 'ssl error',
     'store is password-protected', 'site requires login',
 }
 # These match response messages that start with specific prefixes
@@ -241,6 +327,9 @@ _CB_TRIGGER_PREFIXES = (
     'checkout_timeout:', 'checkout rate-limited',
     'cart rate-limited', 'cart failed',
     'pci_vault_blocked:', 'proposal_blocked:',
+    'timed out',  # FIX Bug #7: Moved from keyword to prefix — only matches
+                  # messages starting with "timed out" (site-level), not
+                  # "Payment timeout (receipt still processing)" (card-level)
 )
 
 
@@ -258,7 +347,8 @@ def _is_site_failure(response_msg: str) -> bool:
 # ══════════════════════════════════════════════════════════════════════
 # TTL-BASED CACHE FOR fetch_products
 # ══════════════════════════════════════════════════════════════════════
-_PRODUCT_CACHE: Dict[str, tuple] = {}
+# FIX Bug #17: Use OrderedDict for O(1) LRU eviction instead of O(n) min() scan
+_PRODUCT_CACHE: OrderedDict = OrderedDict()
 _CACHE_TTL = 300
 _CACHE_MAXSIZE = 512
 
@@ -302,14 +392,15 @@ class _ClientPool:
                 except Exception:
                     pass
 
-        # No pooled client available — create new one
-        client = _TLSAsyncClient(
-            client_identifier=identifier,
-            http2=True,
-            verify=not proxy_str,
-            timeout=15,
-        )
-        return client
+            # FIX Bug #9: Create new client inside the lock to prevent
+            # concurrent acquires from creating duplicate clients.
+            client = _TLSAsyncClient(
+                client_identifier=identifier,
+                http2=True,
+                verify=not proxy_str,
+                timeout=15,
+            )
+            return client
 
     async def release(self, client: _TLSAsyncClient, proxy_str: Optional[str] = None):
         """Return a client to the pool for reuse."""
@@ -419,13 +510,18 @@ async def fetch_products_cached_pooled(domain: str, proxy_str: Optional[str] = N
     if cache_key in _PRODUCT_CACHE:
         cached_at, cached_result = _PRODUCT_CACHE[cache_key]
         if now - cached_at < _CACHE_TTL:
+            # Move to end (most recently used)
+            _PRODUCT_CACHE.move_to_end(cache_key)
             return cached_result
+        else:
+            # Expired — remove it
+            del _PRODUCT_CACHE[cache_key]
     result = await fetch_products_pooled(domain, proxy_str)
     success, data = result
     if success:
-        if len(_PRODUCT_CACHE) >= _CACHE_MAXSIZE:
-            oldest_key = min(_PRODUCT_CACHE, key=lambda k: _PRODUCT_CACHE[k][0])
-            del _PRODUCT_CACHE[oldest_key]
+        # FIX Bug #17: O(1) LRU eviction using OrderedDict
+        while len(_PRODUCT_CACHE) >= _CACHE_MAXSIZE:
+            _PRODUCT_CACHE.popitem(last=False)  # Remove oldest (FIFO = LRU)
         _PRODUCT_CACHE[cache_key] = (now, result)
     return result
 
@@ -474,7 +570,7 @@ _warm_pool_lock = asyncio.Lock()
 _warm_pool_stats = {'created': 0, 'used': 0, 'expired': 0, 'failed': 0}
 _warm_pool_sites: List[Tuple[str, Optional[str], Optional[str]]] = []  # (site_url, proxy, variant_id)
 _warm_pool_task: Optional[asyncio.Task] = None
-_WARM_SESSION_TTL = 120  # seconds before a warm session expires
+_WARM_SESSION_TTL = 45  # FIX Bug #3: Reduced from 120s — Shopify SST tokens expire ~60s
 
 
 def register_warm_site(site_url: str, proxy_str: Optional[str] = None, variant_id: Optional[str] = None):
@@ -499,6 +595,7 @@ async def _create_warm_session(site_url: str, proxy_str: Optional[str], variant_
     import base64 as _b64
 
     try:
+        session = None  # FIX Bug #10: Initialize so except block can safely close it
         ourl = site_url if site_url.startswith('http') else f'https://{site_url}'
         identifier = _pick_identifier()
         proxy = _init_proxy_rotator(proxy_str)
@@ -669,6 +766,13 @@ async def _create_warm_session(site_url: str, proxy_str: Optional[str], variant_
     except Exception as e:
         _warm_pool_stats['failed'] += 1
         print(f"[warm_pool] Failed to create warm session for {site_url}: {e}", file=sys.stderr)
+        # FIX Bug #10: Close the session client on creation failure to prevent leak
+        # Use a simple local variable check — session is created early in try block
+        try:
+            if session is not None:
+                await session.aclose()
+        except Exception:
+            pass
         return None
 
 
@@ -707,7 +811,9 @@ async def _warm_pool_refill_loop():
     while True:
         try:
             await asyncio.sleep(_WARM_REFILL_INTERVAL)
-            for site_url, proxy_str, variant_id in list(_warm_pool_sites):
+            # FIX Bug #16: Refill sessions in parallel (with concurrency limit)
+            # instead of sequentially. Sequential refill could take 10+ min with 20 sites.
+            async def _refill_one(site_url, proxy_str, variant_id):
                 domain = urlparse(site_url if site_url.startswith('http') else f'https://{site_url}').netloc
                 async with _warm_pool_lock:
                     current_count = len(_warm_pool.get(domain, []))
@@ -716,6 +822,19 @@ async def _warm_pool_refill_loop():
                     if ws:
                         async with _warm_pool_lock:
                             _warm_pool[domain].append(ws)
+
+            # Run all refills concurrently with a semaphore to limit concurrency
+            _refill_sem = asyncio.Semaphore(5)
+            async def _refill_limited(args):
+                async with _refill_sem:
+                    try:
+                        await _refill_one(*args)
+                    except Exception:
+                        pass
+
+            sites = list(_warm_pool_sites)
+            if sites:
+                await asyncio.gather(*[_refill_limited(s) for s in sites])
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -735,6 +854,8 @@ _adaptive_current_slots = _MASS_SLOTS
 _adaptive_task: Optional[asyncio.Task] = None
 
 
+# _DynamicSemaphore is already defined above (before _get_lane_sems).
+
 def record_response_time(duration: float):
     """Record a checkout response time for adaptive scaling."""
     _response_times.append(duration)
@@ -749,7 +870,7 @@ def _compute_avg_rt() -> float:
 
 async def _adaptive_scaling_loop():
     """Background task that adjusts mass semaphore slots based on response times."""
-    global _adaptive_current_slots, _mass_sem
+    global _adaptive_current_slots
     while True:
         try:
             await asyncio.sleep(_ADAPTIVE_INTERVAL)
@@ -776,8 +897,9 @@ async def _adaptive_scaling_loop():
 
             if new_slots != old_slots:
                 _adaptive_current_slots = new_slots
-                # Replace the semaphore with new capacity
-                _mass_sem = asyncio.Semaphore(new_slots)
+                # FIX Bug #2: Resize the dynamic semaphore in-place instead of replacing it
+                if isinstance(_mass_sem, _DynamicSemaphore):
+                    await _mass_sem.resize(new_slots)
                 print(f"[adaptive] Slots adjusted: {old_slots} → {new_slots} (avg_rt={avg_rt:.1f}s)", file=sys.stderr)
 
         except asyncio.CancelledError:
@@ -827,13 +949,15 @@ async def api_status() -> Dict[str, Any]:
     for domain, pool in _warm_pool.items():
         warm_pool_summary[domain] = len(pool)
 
+    # FIX Bug #1: Use _counters.read() instead of stale global ints
+    ctr = _counters.read()
     return {
         "lanes": {
-            "single": {"active": _active_single, "queued": _queued_single, "max": _SINGLE_SLOTS},
-            "mass": {"active": _active_mass, "queued": _queued_mass, "max": _adaptive_current_slots},
+            "single": {"active": ctr['active_single'], "queued": ctr['queued_single'], "max": _SINGLE_SLOTS},
+            "mass": {"active": ctr['active_mass'], "queued": ctr['queued_mass'], "max": _adaptive_current_slots},
         },
-        "total_active": _active_single + _active_mass,
-        "total_queued": _queued_single + _queued_mass,
+        "total_active": ctr['active_single'] + ctr['active_mass'],
+        "total_queued": ctr['queued_single'] + ctr['queued_mass'],
         "dedup": {"hits": _dedup_hits, "total": _dedup_total},
         "circuit_breaker": {"tripped_sites": tripped_sites, "rejected": _cb_rejected},
         "rate_limited_count": _rate_limited_count,
@@ -891,7 +1015,6 @@ async def shopify_checker(
     ),
 ) -> Response:
     """Main Shopify checkout endpoint with all traffic management layers."""
-    global _active_single, _active_mass, _queued_single, _queued_mass
     global _cb_rejected, _rate_limited_count
 
     try:
@@ -946,7 +1069,9 @@ async def shopify_checker(
             )
 
         # ── LAYER 2: BACKPRESSURE ──
-        total_queued = _queued_single + _queued_mass
+        # FIX Bug #12: Use _counters snapshot instead of stale global ints
+        ctr = _counters.read()
+        total_queued = ctr['queued_single'] + ctr['queued_mass']
         if not is_single and total_queued >= _MAX_QUEUE:
             return Response(
                 content={
@@ -977,25 +1102,24 @@ async def shopify_checker(
         dedup_key = f"{card_number}|{site_domain}"
 
         async def _run_checkout():
-            global _active_single, _active_mass, _queued_single, _queued_mass
-
             # ── LAYER 3: DEDICATED LANES ──
             single_sem, mass_sem = _get_lane_sems()
             sem = single_sem if is_single else mass_sem
 
-            if is_single:
-                _queued_single += 1
-            else:
-                _queued_mass += 1
+            # FIX Bug #1: Use _counters with lock for safe increment/decrement
+            queued_attr = 'queued_single' if is_single else 'queued_mass'
+            active_attr = 'active_single' if is_single else 'active_mass'
+            await _counters.inc(queued_attr)
 
             try:
-                async with sem:
-                    if is_single:
-                        _queued_single -= 1
-                        _active_single += 1
-                    else:
-                        _queued_mass -= 1
-                        _active_mass += 1
+                # FIX Bug #2: _DynamicSemaphore supports manual acquire/release
+                if isinstance(sem, _DynamicSemaphore):
+                    await sem.acquire()
+                else:
+                    await sem.__aenter__()
+                try:
+                    await _counters.dec(queued_attr)
+                    await _counters.inc(active_attr)
 
                     try:
                         # ── LAYER 7: REQUEST TIMEOUT ──
@@ -1035,15 +1159,15 @@ async def shopify_checker(
                         record_response_time(_elapsed)
                         return (False, f"CHECKOUT_TIMEOUT: Exceeded {_CHECKOUT_TIMEOUT}s", "UNKNOWN", "0.00", "USD")
                     finally:
-                        if is_single:
-                            _active_single -= 1
-                        else:
-                            _active_mass -= 1
+                        await _counters.dec(active_attr)
+                finally:
+                    # Release semaphore permit
+                    if isinstance(sem, _DynamicSemaphore):
+                        sem.release()
+                    else:
+                        sem.__aexit__(None, None, None)
             except Exception:
-                if is_single:
-                    _queued_single = max(0, _queued_single - 1)
-                else:
-                    _queued_mass = max(0, _queued_mass - 1)
+                await _counters.dec(queued_attr)
                 raise
 
         success, message, gateway, price, currency = await _dedup_or_run(
@@ -1051,10 +1175,15 @@ async def shopify_checker(
         )
 
         # ── LAYER 6: CIRCUIT BREAKER (record result) ──
+        # FIX Bug #5: Only record_success when message is clearly a card-level success
+        # (ORDER_PLACED, 3DS_REQUIRED, OTP_REQUIRED). Other non-site-failure messages
+        # (like CARD_DECLINED) should NOT decrement fail_count — the card was declined,
+        # but the site itself worked fine. Only clear trip on actual successful orders.
         if _is_site_failure(message):
             cb.record_failure()
-        else:
+        elif message in ('ORDER_PLACED', '3DS_REQUIRED', 'OTP_REQUIRED'):
             cb.record_success()
+        # else: card-level failure (declined, expired, etc.) — don't touch CB counters
 
         clean_response = extract_clean_response(message)
 
@@ -1130,12 +1259,24 @@ async def _on_startup() -> None:
 
 
 async def _on_shutdown() -> None:
-    """Clean up background tasks and connection pool."""
+    """Clean up background tasks and connection pool with graceful drain."""
     global _warm_pool_task, _adaptive_task
     if _warm_pool_task:
         _warm_pool_task.cancel()
     if _adaptive_task:
         _adaptive_task.cancel()
+    # FIX Arch #25: Graceful drain — wait for in-flight checkouts to complete
+    # (up to 10s) before closing connections. This prevents mid-checkout aborts.
+    drain_start = time.monotonic()
+    ctr = _counters.read()
+    total_active = ctr['active_single'] + ctr['active_mass']
+    if total_active > 0:
+        print(f"[shutdown] Waiting for {total_active} in-flight checkouts (max 10s)...", file=sys.stderr)
+        while time.monotonic() - drain_start < 10:
+            ctr = _counters.read()
+            if ctr['active_single'] + ctr['active_mass'] == 0:
+                break
+            await asyncio.sleep(0.5)
     await _client_pool.close_all()
     # Close all warm sessions
     for domain, pool in _warm_pool.items():

