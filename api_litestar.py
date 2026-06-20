@@ -1042,7 +1042,7 @@ async def circuit_breaker_status() -> Dict[str, Any]:
 
 @dataclass
 class ShopifyRequest:
-    """Request body for the Shopify checkout endpoint."""
+    """Request body for the Shopify checkout endpoint (POST)."""
     site: str
     cc: str
     proxy: Optional[str] = None
@@ -1051,30 +1051,27 @@ class ShopifyRequest:
     user_id: Optional[str] = "anonymous"
 
 
-@post("/shopify", media_type=MediaType.JSON, sync=False)
-async def shopify_checker(data: ShopifyRequest) -> Response:
-    """Main Shopify checkout endpoint with all traffic management layers.
-
-    Accepts POST with JSON body containing:
-    - site: Shopify store URL (required)
-    - cc: Card in CC|MM|YYYY|CVV format (required)
-    - proxy: Proxy in ip:port:user:pass format (optional)
-    - variant: Product variant ID, auto-detected if omitted (optional)
-    - lane: 'single' for priority lane, 'mass' for mass lane (default: mass)
-    - user_id: User identifier for rate limiting (default: anonymous)
-    """
+async def _shopify_core(
+    site: Optional[str],
+    cc_string: str,
+    proxy_str: Optional[str],
+    variant_id: Optional[str],
+    lane: Optional[str],
+    user_id: Optional[str],
+) -> Response:
+    """Core checkout logic shared by GET and POST handlers."""
     global _cb_rejected, _rate_limited_count
 
     # Pre-initialize to prevent NameError in outer except if early exception occurs
-    cc_string = data.cc.strip() if data.cc else ""
     cb = None
 
     try:
-        site = data.site.strip() if data.site else None
-        proxy_str = data.proxy.strip() if data.proxy else None
-        variant_id = data.variant.strip() if data.variant else None
-        is_single = (data.lane or "mass").lower() == "single"
-        uid = (data.user_id or "anonymous").strip()
+        site = site.strip() if site else None
+        cc_string = cc_string.strip() if cc_string else ""
+        proxy_str = proxy_str.strip() if proxy_str else None
+        variant_id = variant_id.strip() if variant_id else None
+        is_single = (lane or "mass").lower() == "single"
+        uid = (user_id or "anonymous").strip()
 
         if not site:
             return Response(
@@ -1268,6 +1265,67 @@ async def shopify_checker(data: ShopifyRequest) -> Response:
 
 
 # ══════════════════════════════════════════════════════════════════════
+# SHOPIFY ENDPOINTS — GET (query params) + POST (JSON body)
+# ══════════════════════════════════════════════════════════════════════
+
+@get("/shopify", media_type=MediaType.JSON, sync=False)
+async def shopify_get(
+    site: Optional[str] = Parameter(
+        query="site", required=False, default=None,
+        description="Shopify store URL",
+    ),
+    cc: Optional[str] = Parameter(
+        query="cc", required=False, default=None,
+        description="Card in CC|MM|YYYY|CVV format",
+    ),
+    proxy: Optional[str] = Parameter(
+        query="proxy", required=False, default=None,
+        description="Proxy in ip:port:user:pass format",
+    ),
+    variant: Optional[str] = Parameter(
+        query="variant", required=False, default=None,
+        description="Product variant ID (auto-detected if omitted)",
+    ),
+    lane: Optional[str] = Parameter(
+        query="lane", required=False, default="mass",
+        description="'single' for priority lane, 'mass' for mass lane",
+    ),
+    user_id: Optional[str] = Parameter(
+        query="user_id", required=False, default="anonymous",
+        description="User identifier for rate limiting",
+    ),
+) -> Response:
+    """Shopify checkout via GET (query parameters).
+
+    Example: /shopify?site=kith.com&cc=4111111111111111|12|2028|123&lane=mass
+    """
+    return await _shopify_core(
+        site=site,
+        cc_string=cc or "",
+        proxy_str=proxy,
+        variant_id=variant,
+        lane=lane,
+        user_id=user_id,
+    )
+
+
+@post("/shopify", media_type=MediaType.JSON, sync=False)
+async def shopify_post(data: ShopifyRequest) -> Response:
+    """Shopify checkout via POST (JSON body).
+
+    Body: {"site": "...", "cc": "...", "proxy": "...", "variant": "...", "lane": "mass", "user_id": "anonymous"}
+    """
+    return await _shopify_core(
+        site=data.site,
+        cc_string=data.cc or "",
+        proxy_str=data.proxy,
+        variant_id=data.variant,
+        lane=data.lane,
+        user_id=data.user_id,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════
 # WARM POOL & ADAPTIVE SCALING ENDPOINTS
 # ══════════════════════════════════════════════════════════════════════
 
@@ -1341,7 +1399,7 @@ async def _on_shutdown() -> None:
 
 
 app = Litestar(
-    route_handlers=[health, cache_stats, api_status, circuit_breaker_status, warm_pool_status, shopify_checker],
+    route_handlers=[health, cache_stats, api_status, circuit_breaker_status, warm_pool_status, shopify_get, shopify_post],
     debug=False,
     openapi_config=None,
     on_startup=[_on_startup],
