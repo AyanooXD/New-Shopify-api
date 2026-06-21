@@ -714,6 +714,7 @@ def extract_clean_response(message):
         'AUTHENTICATION_REQUIRED', 'TEST_MODE_LIVE_CARD',
         '3DS_REQUIRED', 'OTP_REQUIRED', 'ORDER_PLACED',
         'CAPTCHA_REQUIRED', 'GENERIC_ERROR', 'PAYMENT_FAILED',
+        'PAYMENTS_UNACCEPTABLE_PAYMENT_AMOUNT',
     }
     msg_upper = message.strip().upper()
     if msg_upper in _KNOWN_CODES:
@@ -1621,6 +1622,9 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     x_checkout_one_session_token = _new_sst2
                     checkout_web_headers['x-checkout-one-session-token'] = x_checkout_one_session_token
             
+            # Initialize skip flag for submit step
+            _skip_submit = False
+            
             # Parse 2nd proposal response
             try:
                 proposal2_json = json.loads(resp_text2)
@@ -1659,12 +1663,25 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 elif _p2_result_type == 'NegotiationResultFailed':
                     return False, "Proposal 2 negotiation failed", gateway, total_price, currency
                 elif _p2_result_type == 'SubmittedForCompletion':
-                    # Already submitted — extract receipt
+                    # Already submitted — extract receipt AND price/handle
                     _p2_receipt = _p2_result.get('receipt', {})
                     if _p2_receipt and _p2_receipt.get('id'):
-                        # Jump straight to poll with this receipt
                         receipt_id = _p2_receipt.get('id')
-                        # Skip to poll step
+                    # Extract sellerProposal for price/handle even in SubmittedForCompletion
+                    _p2_seller = _p2_result.get('sellerProposal')
+                    if _p2_seller:
+                        try:
+                            _p2_total = _p2_seller.get('checkoutTotal', {}).get('value', {}).get('amount', str(price))
+                            if _p2_total:
+                                total_price = str(_p2_total)
+                        except (AttributeError, TypeError):
+                            pass
+                        _p2_del = _p2_seller.get('delivery', {})
+                        _p2_dl = _p2_del.get('deliveryLines', [{}]) if _p2_del else [{}]
+                        if _p2_dl and _p2_dl[0].get('availableDeliveryStrategies'):
+                            handle = _p2_dl[0]['availableDeliveryStrategies'][0].get('handle', '') or handle
+                    print(f'[PROPOSAL2] SubmittedForCompletion: receipt_id={receipt_id} total_price={total_price} handle={handle}', file=sys.stderr)
+                    _skip_submit = True
                 elif _p2_result_type and _p2_result_type != 'NegotiationResultAvailable':
                     return False, f"Unexpected proposal 2 result: {_p2_result_type}", gateway, total_price, currency
                 elif not _p2_result_type:
@@ -1673,7 +1690,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     return False, f"Proposal 2: empty result typename (response preview: {resp_text2[:150]})", gateway, total_price, currency
                 
                 seller_proposal = _p2_result.get('sellerProposal', {})
-                if not seller_proposal:
+                if not _skip_submit and not seller_proposal:
                     return False, "No seller proposal in 2nd proposal response", gateway, total_price, currency
                 
                 delivery_data = seller_proposal.get('delivery', {})
@@ -1702,198 +1719,128 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 
                 total_price = str(total)
                 
-                if not handle:
+                if not handle and not _skip_submit:
                     return False, "HANDLE EMPTY", gateway, total_price, currency
                 
             except (json.JSONDecodeError, KeyError, TypeError) as e:
                 return False, f"Failed to parse proposal 2 response: {str(e)}", gateway, total_price, currency
             
             # Step 8: SubmitForCompletion — TWO variants based on DMT
-            # Build submit variables (common parts)
-            _raw_cc = cc.replace(' ', '').replace('-', '')
-            _card_bin = _raw_cc[:8] if len(_raw_cc) >= 8 else _raw_cc
-            
-            submit_params = {'operationName': 'SubmitForCompletion'}
-            
-            # NONE variant: no destination, uses deliveryStrategyMatchingConditions
-            submit_none_data = {
-                'query': MUTATION_SUBMIT,
-                'variables': {
-                    'input': {
-                        'sessionInput': {'sessionToken': x_checkout_one_session_token},
-                        'queueToken': queue_token or '',
-                        'discounts': {'lines': [], 'acceptUnexpectedDiscounts': True},
-                        'delivery': {
-                            'deliveryLines': [{
-                                # No destination for NONE
-                                'selectedDeliveryStrategy': {
-                                    'deliveryStrategyMatchingConditions': {
-                                        'estimatedTimeInTransit': {'any': True},
-                                        'shipments': {'any': True},
-                                    },
-                                    'options': {'phone': phone},
-                                },
-                                'targetMerchandiseLines': {
-                                    'lines': [{'stableId': stable_id or '1'}],
-                                },
-                                'deliveryMethodTypes': [DMT or 'SHIPPING'],
-                                'expectedTotalPrice': {
-                                    'value': {
-                                        'amount': f'{amount}',
-                                        'currencyCode': currency,
-                                    },
-                                },
-                                'destinationChanged': False,
-                            }],
-                            'noDeliveryRequired': [],
-                            'useProgressiveRates': False,
-                            'prefetchShippingRatesStrategy': None,
-                            'supportsSplitShipping': True,
-                        },
-                        'deliveryExpectations': {'deliveryExpectationLines': []},
-                        'merchandise': {
-                            'merchandiseLines': [{
-                                'stableId': stable_id or '1',
-                                'merchandise': {
-                                    'productVariantReference': {
-                                        'id': f'gid://shopify/ProductVariantMerchandise/{product_id}',
-                                        'variantId': f'gid://shopify/ProductVariant/{product_id}',
-                                        'properties': [],
-                                        'sellingPlanId': None,
-                                        'sellingPlanDigest': None,
-                                    },
-                                },
-                                'quantity': {'items': {'value': 1}},
-                                'expectedTotalPrice': {
-                                    'value': {
-                                        'amount': f'{price}',
-                                        'currencyCode': currency,
-                                    },
-                                },
-                                'lineComponentsSource': None,
-                                'lineComponents': [],
-                            }],
-                        },
-                        'memberships': {'memberships': []},
-                        'payment': {
-                            'totalAmount': {'any': True},
-                            'paymentLines': [{
-                                'paymentMethod': {
-                                    'directPaymentMethod': {
-                                        'paymentMethodIdentifier': paymentMethodIdentifier,
-                                        'sessionId': sessionid,
-                                        'billingAddress': {
-                                            'streetAddress': {
-                                                'address1': street,
-                                                'city': city,
-                                                'countryCode': country_code,
-                                                'postalCode': s_zip,
-                                                'firstName': firstName,
-                                                'lastName': lastName,
-                                                'zoneCode': state,
-                                                'phone': phone,
-                                            },
+            if _skip_submit:
+                # Already submitted via SubmittedForCompletion, skip to poll
+                print(f'[SKIP_SUBMIT] Skipping submit, going to poll with receipt_id={receipt_id}', file=sys.stderr)
+            else:
+                # Build submit variables (common parts)
+                _raw_cc = cc.replace(' ', '').replace('-', '')
+                _card_bin = _raw_cc[:8] if len(_raw_cc) >= 8 else _raw_cc
+
+                submit_params = {'operationName': 'SubmitForCompletion'}
+
+                # NONE variant: no destination, uses deliveryStrategyMatchingConditions
+                submit_none_data = {
+                    'query': MUTATION_SUBMIT,
+                    'variables': {
+                        'input': {
+                            'sessionInput': {'sessionToken': x_checkout_one_session_token},
+                            'queueToken': queue_token or '',
+                            'discounts': {'lines': [], 'acceptUnexpectedDiscounts': True},
+                            'delivery': {
+                                'deliveryLines': [{
+                                    # No destination for NONE
+                                    'selectedDeliveryStrategy': {
+                                        'deliveryStrategyMatchingConditions': {
+                                            'estimatedTimeInTransit': {'any': True},
+                                            'shipments': {'any': True},
                                         },
-                                        'cardSource': None,
+                                        'options': {'phone': phone},
                                     },
-                                    'giftCardPaymentMethod': None,
-                                    'redeemablePaymentMethod': None,
-                                    'walletPaymentMethod': None,
-                                    'walletsPlatformPaymentMethod': None,
-                                    'localPaymentMethod': None,
-                                    'paymentOnDeliveryMethod': None,
-                                    'paymentOnDeliveryMethod2': None,
-                                    'manualPaymentMethod': None,
-                                    'customPaymentMethod': None,
-                                    'offsitePaymentMethod': None,
-                                    'customOnsitePaymentMethod': None,
-                                    'deferredPaymentMethod': None,
-                                    'customerCreditCardPaymentMethod': None,
-                                    'paypalBillingAgreementPaymentMethod': None,
-                                    'remotePaymentInstrument': None,
-                                },
-                                'amount': {
-                                    'value': {
-                                        'amount': f'{total}',
-                                        'currencyCode': currency,
+                                    'targetMerchandiseLines': {
+                                        'lines': [{'stableId': stable_id or '1'}],
                                     },
-                                },
-                            }],
-                            'billingAddress': {
-                                'streetAddress': {
-                                    'address1': street,
-                                    'city': city,
-                                    'countryCode': country_code,
-                                    'postalCode': s_zip,
-                                    'firstName': firstName,
-                                    'lastName': lastName,
-                                    'zoneCode': state,
-                                    'phone': phone,
-                                },
+                                    'deliveryMethodTypes': [DMT or 'SHIPPING'],
+                                    'expectedTotalPrice': {
+                                        'value': {
+                                            'amount': f'{amount}',
+                                            'currencyCode': currency,
+                                        },
+                                    },
+                                    'destinationChanged': False,
+                                }],
+                                'noDeliveryRequired': [],
+                                'useProgressiveRates': False,
+                                'prefetchShippingRatesStrategy': None,
+                                'supportsSplitShipping': True,
                             },
-                        },
-                        'buyerIdentity': {
-                            'customer': {
-                                'presentmentCurrency': currency,
-                                'countryCode': country_code,
+                            'deliveryExpectations': {'deliveryExpectationLines': []},
+                            'merchandise': {
+                                'merchandiseLines': [{
+                                    'stableId': stable_id or '1',
+                                    'merchandise': {
+                                        'productVariantReference': {
+                                            'id': f'gid://shopify/ProductVariantMerchandise/{product_id}',
+                                            'variantId': f'gid://shopify/ProductVariant/{product_id}',
+                                            'properties': [],
+                                            'sellingPlanId': None,
+                                            'sellingPlanDigest': None,
+                                        },
+                                    },
+                                    'quantity': {'items': {'value': 1}},
+                                    'expectedTotalPrice': {
+                                        'value': {
+                                            'amount': f'{price}',
+                                            'currencyCode': currency,
+                                        },
+                                    },
+                                    'lineComponentsSource': None,
+                                    'lineComponents': [],
+                                }],
                             },
-                            'email': email,
-                            'emailChanged': False,
-                            'phoneCountryCode': country_code,
-                            'marketingConsent': [],
-                            'shopPayOptInPhone': {'countryCode': country_code},
-                            'rememberMe': False,
-                        },
-                        'tip': {'tipLines': []},
-                        'taxes': {
-                            'proposedAllocations': None,
-                            'proposedTotalAmount': {
-                                'value': {
-                                    'amount': f'{tax3}',
-                                    'currencyCode': currency,
-                                },
-                            },
-                            'proposedTotalIncludedAmount': None,
-                            'proposedMixedStateTotalAmount': None,
-                            'proposedExemptions': [],
-                        },
-                        'note': {
-                            'message': None,
-                            'customAttributes': [],
-                        },
-                        'localizationExtension': {'fields': []},
-                        'nonNegotiableTerms': None,
-                        'scriptFingerprint': {
-                            'signature': None,
-                            'signatureUuid': None,
-                            'lineItemScriptChanges': [],
-                            'paymentScriptChanges': [],
-                            'shippingScriptChanges': [],
-                        },
-                        'optionalDuties': {'buyerRefusesDuties': False},
-                        'cartMetafields': [],
-                    },
-                    'attemptToken': f'{token}-4j33p1vmcd5' if token else '',
-                    'metafields': [],
-                    'analytics': {
-                        'requestUrl': checkout_url,
-                        'pageId': f'{random.randint(10000000,99999999):08x}-{random.randint(1000,9999):04X}-{random.randint(1000,9999):04X}-{random.randint(1000,9999):04X}-{random.randint(100000000000,999999999999):012x}',
-                    },
-                },
-                'operationName': 'SubmitForCompletion',
-            }
-            
-            # SHIPPING variant: has destination, uses deliveryStrategyByHandle with handle
-            submit_shipping_data = {
-                'query': MUTATION_SUBMIT,
-                'variables': {
-                    'input': {
-                        'sessionInput': {'sessionToken': x_checkout_one_session_token},
-                        'queueToken': queue_token or '',
-                        'discounts': {'lines': [], 'acceptUnexpectedDiscounts': True},
-                        'delivery': {
-                            'deliveryLines': [{
-                                'destination': {
+                            'memberships': {'memberships': []},
+                            'payment': {
+                                'totalAmount': {'any': True},
+                                'paymentLines': [{
+                                    'paymentMethod': {
+                                        'directPaymentMethod': {
+                                            'paymentMethodIdentifier': paymentMethodIdentifier,
+                                            'sessionId': sessionid,
+                                            'billingAddress': {
+                                                'streetAddress': {
+                                                    'address1': street,
+                                                    'city': city,
+                                                    'countryCode': country_code,
+                                                    'postalCode': s_zip,
+                                                    'firstName': firstName,
+                                                    'lastName': lastName,
+                                                    'zoneCode': state,
+                                                    'phone': phone,
+                                                },
+                                            },
+                                            'cardSource': None,
+                                        },
+                                        'giftCardPaymentMethod': None,
+                                        'redeemablePaymentMethod': None,
+                                        'walletPaymentMethod': None,
+                                        'walletsPlatformPaymentMethod': None,
+                                        'localPaymentMethod': None,
+                                        'paymentOnDeliveryMethod': None,
+                                        'paymentOnDeliveryMethod2': None,
+                                        'manualPaymentMethod': None,
+                                        'customPaymentMethod': None,
+                                        'offsitePaymentMethod': None,
+                                        'customOnsitePaymentMethod': None,
+                                        'deferredPaymentMethod': None,
+                                        'customerCreditCardPaymentMethod': None,
+                                        'paypalBillingAgreementPaymentMethod': None,
+                                        'remotePaymentInstrument': None,
+                                    },
+                                    'amount': {
+                                        'value': {
+                                            'amount': f'{total}',
+                                            'currencyCode': currency,
+                                        },
+                                    },
+                                }],
+                                'billingAddress': {
                                     'streetAddress': {
                                         'address1': street,
                                         'city': city,
@@ -1903,239 +1850,315 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                         'lastName': lastName,
                                         'zoneCode': state,
                                         'phone': phone,
-                                        'oneTimeUse': False,
                                     },
                                 },
-                                'selectedDeliveryStrategy': {
-                                    'deliveryStrategyByHandle': {
-                                        'handle': handle,
-                                        'customDeliveryRate': False,
-                                    },
-                                    'options': {'phone': phone},
-                                },
-                                'targetMerchandiseLines': {
-                                    'lines': [{'stableId': stable_id or '1'}],
-                                },
-                                'deliveryMethodTypes': [DMT or 'SHIPPING'],
-                                'expectedTotalPrice': {
-                                    'value': {
-                                        'amount': f'{amount}',
-                                        'currencyCode': currency,
-                                    },
-                                },
-                                'destinationChanged': False,
-                            }],
-                            'noDeliveryRequired': [],
-                            'useProgressiveRates': False,
-                            'prefetchShippingRatesStrategy': None,
-                            'supportsSplitShipping': True,
-                        },
-                        'deliveryExpectations': {'deliveryExpectationLines': []},
-                        'merchandise': {
-                            'merchandiseLines': [{
-                                'stableId': stable_id or '1',
-                                'merchandise': {
-                                    'productVariantReference': {
-                                        'id': f'gid://shopify/ProductVariantMerchandise/{product_id}',
-                                        'variantId': f'gid://shopify/ProductVariant/{product_id}',
-                                        'properties': [],
-                                        'sellingPlanId': None,
-                                        'sellingPlanDigest': None,
-                                    },
-                                },
-                                'quantity': {'items': {'value': 1}},
-                                'expectedTotalPrice': {
-                                    'value': {
-                                        'amount': f'{price}',
-                                        'currencyCode': currency,
-                                    },
-                                },
-                                'lineComponentsSource': None,
-                                'lineComponents': [],
-                            }],
-                        },
-                        'memberships': {'memberships': []},
-                        'payment': {
-                            'totalAmount': {'any': True},
-                            'paymentLines': [{
-                                'paymentMethod': {
-                                    'directPaymentMethod': {
-                                        'paymentMethodIdentifier': paymentMethodIdentifier,
-                                        'sessionId': sessionid,
-                                        'billingAddress': {
-                                            'streetAddress': {
-                                                'address1': street,
-                                                'city': city,
-                                                'countryCode': country_code,
-                                                'postalCode': s_zip,
-                                                'firstName': firstName,
-                                                'lastName': lastName,
-                                                'zoneCode': state,
-                                                'phone': phone,
-                                            },
-                                        },
-                                        'cardSource': None,
-                                    },
-                                    'giftCardPaymentMethod': None,
-                                    'redeemablePaymentMethod': None,
-                                    'walletPaymentMethod': None,
-                                    'walletsPlatformPaymentMethod': None,
-                                    'localPaymentMethod': None,
-                                    'paymentOnDeliveryMethod': None,
-                                    'paymentOnDeliveryMethod2': None,
-                                    'manualPaymentMethod': None,
-                                    'customPaymentMethod': None,
-                                    'offsitePaymentMethod': None,
-                                    'customOnsitePaymentMethod': None,
-                                    'deferredPaymentMethod': None,
-                                    'customerCreditCardPaymentMethod': None,
-                                    'paypalBillingAgreementPaymentMethod': None,
-                                    'remotePaymentInstrument': None,
-                                },
-                                'amount': {
-                                    'value': {
-                                        'amount': f'{total}',
-                                        'currencyCode': currency,
-                                    },
-                                },
-                            }],
-                            'billingAddress': {
-                                'streetAddress': {
-                                    'address1': street,
-                                    'city': city,
+                            },
+                            'buyerIdentity': {
+                                'customer': {
+                                    'presentmentCurrency': currency,
                                     'countryCode': country_code,
-                                    'postalCode': s_zip,
-                                    'firstName': firstName,
-                                    'lastName': lastName,
-                                    'zoneCode': state,
-                                    'phone': phone,
+                                },
+                                'email': email,
+                                'emailChanged': False,
+                                'phoneCountryCode': country_code,
+                                'marketingConsent': [],
+                                'shopPayOptInPhone': {'countryCode': country_code},
+                                'rememberMe': False,
+                            },
+                            'tip': {'tipLines': []},
+                            'taxes': {
+                                'proposedAllocations': None,
+                                'proposedTotalAmount': {
+                                    'value': {
+                                        'amount': f'{tax3}',
+                                        'currencyCode': currency,
+                                    },
+                                },
+                                'proposedTotalIncludedAmount': None,
+                                'proposedMixedStateTotalAmount': None,
+                                'proposedExemptions': [],
+                            },
+                            'note': {
+                                'message': None,
+                                'customAttributes': [],
+                            },
+                            'localizationExtension': {'fields': []},
+                            'nonNegotiableTerms': None,
+                            'scriptFingerprint': {
+                                'signature': None,
+                                'signatureUuid': None,
+                                'lineItemScriptChanges': [],
+                                'paymentScriptChanges': [],
+                                'shippingScriptChanges': [],
+                            },
+                            'optionalDuties': {'buyerRefusesDuties': False},
+                            'cartMetafields': [],
+                        },
+                        'attemptToken': f'{token}-4j33p1vmcd5' if token else '',
+                        'metafields': [],
+                        'analytics': {
+                            'requestUrl': checkout_url,
+                            'pageId': f'{random.randint(10000000,99999999):08x}-{random.randint(1000,9999):04X}-{random.randint(1000,9999):04X}-{random.randint(1000,9999):04X}-{random.randint(100000000000,999999999999):012x}',
+                        },
+                    },
+                    'operationName': 'SubmitForCompletion',
+                }
+
+                # SHIPPING variant: has destination, uses deliveryStrategyByHandle with handle
+                submit_shipping_data = {
+                    'query': MUTATION_SUBMIT,
+                    'variables': {
+                        'input': {
+                            'sessionInput': {'sessionToken': x_checkout_one_session_token},
+                            'queueToken': queue_token or '',
+                            'discounts': {'lines': [], 'acceptUnexpectedDiscounts': True},
+                            'delivery': {
+                                'deliveryLines': [{
+                                    'destination': {
+                                        'streetAddress': {
+                                            'address1': street,
+                                            'city': city,
+                                            'countryCode': country_code,
+                                            'postalCode': s_zip,
+                                            'firstName': firstName,
+                                            'lastName': lastName,
+                                            'zoneCode': state,
+                                            'phone': phone,
+                                            'oneTimeUse': False,
+                                        },
+                                    },
+                                    'selectedDeliveryStrategy': {
+                                        'deliveryStrategyByHandle': {
+                                            'handle': handle,
+                                            'customDeliveryRate': False,
+                                        },
+                                        'options': {'phone': phone},
+                                    },
+                                    'targetMerchandiseLines': {
+                                        'lines': [{'stableId': stable_id or '1'}],
+                                    },
+                                    'deliveryMethodTypes': [DMT or 'SHIPPING'],
+                                    'expectedTotalPrice': {
+                                        'value': {
+                                            'amount': f'{amount}',
+                                            'currencyCode': currency,
+                                        },
+                                    },
+                                    'destinationChanged': False,
+                                }],
+                                'noDeliveryRequired': [],
+                                'useProgressiveRates': False,
+                                'prefetchShippingRatesStrategy': None,
+                                'supportsSplitShipping': True,
+                            },
+                            'deliveryExpectations': {'deliveryExpectationLines': []},
+                            'merchandise': {
+                                'merchandiseLines': [{
+                                    'stableId': stable_id or '1',
+                                    'merchandise': {
+                                        'productVariantReference': {
+                                            'id': f'gid://shopify/ProductVariantMerchandise/{product_id}',
+                                            'variantId': f'gid://shopify/ProductVariant/{product_id}',
+                                            'properties': [],
+                                            'sellingPlanId': None,
+                                            'sellingPlanDigest': None,
+                                        },
+                                    },
+                                    'quantity': {'items': {'value': 1}},
+                                    'expectedTotalPrice': {
+                                        'value': {
+                                            'amount': f'{price}',
+                                            'currencyCode': currency,
+                                        },
+                                    },
+                                    'lineComponentsSource': None,
+                                    'lineComponents': [],
+                                }],
+                            },
+                            'memberships': {'memberships': []},
+                            'payment': {
+                                'totalAmount': {'any': True},
+                                'paymentLines': [{
+                                    'paymentMethod': {
+                                        'directPaymentMethod': {
+                                            'paymentMethodIdentifier': paymentMethodIdentifier,
+                                            'sessionId': sessionid,
+                                            'billingAddress': {
+                                                'streetAddress': {
+                                                    'address1': street,
+                                                    'city': city,
+                                                    'countryCode': country_code,
+                                                    'postalCode': s_zip,
+                                                    'firstName': firstName,
+                                                    'lastName': lastName,
+                                                    'zoneCode': state,
+                                                    'phone': phone,
+                                                },
+                                            },
+                                            'cardSource': None,
+                                        },
+                                        'giftCardPaymentMethod': None,
+                                        'redeemablePaymentMethod': None,
+                                        'walletPaymentMethod': None,
+                                        'walletsPlatformPaymentMethod': None,
+                                        'localPaymentMethod': None,
+                                        'paymentOnDeliveryMethod': None,
+                                        'paymentOnDeliveryMethod2': None,
+                                        'manualPaymentMethod': None,
+                                        'customPaymentMethod': None,
+                                        'offsitePaymentMethod': None,
+                                        'customOnsitePaymentMethod': None,
+                                        'deferredPaymentMethod': None,
+                                        'customerCreditCardPaymentMethod': None,
+                                        'paypalBillingAgreementPaymentMethod': None,
+                                        'remotePaymentInstrument': None,
+                                    },
+                                    'amount': {
+                                        'value': {
+                                            'amount': f'{total}',
+                                            'currencyCode': currency,
+                                        },
+                                    },
+                                }],
+                                'billingAddress': {
+                                    'streetAddress': {
+                                        'address1': street,
+                                        'city': city,
+                                        'countryCode': country_code,
+                                        'postalCode': s_zip,
+                                        'firstName': firstName,
+                                        'lastName': lastName,
+                                        'zoneCode': state,
+                                        'phone': phone,
+                                    },
                                 },
                             },
-                        },
-                        'buyerIdentity': {
-                            'customer': {
-                                'presentmentCurrency': currency,
-                                'countryCode': country_code,
-                            },
-                            'email': email,
-                            'emailChanged': False,
-                            'phoneCountryCode': country_code,
-                            'marketingConsent': [],
-                            'shopPayOptInPhone': {'countryCode': country_code},
-                            'rememberMe': False,
-                        },
-                        'tip': {'tipLines': []},
-                        'taxes': {
-                            'proposedAllocations': None,
-                            'proposedTotalAmount': {
-                                'value': {
-                                    'amount': f'{tax3}',
-                                    'currencyCode': currency,
+                            'buyerIdentity': {
+                                'customer': {
+                                    'presentmentCurrency': currency,
+                                    'countryCode': country_code,
                                 },
+                                'email': email,
+                                'emailChanged': False,
+                                'phoneCountryCode': country_code,
+                                'marketingConsent': [],
+                                'shopPayOptInPhone': {'countryCode': country_code},
+                                'rememberMe': False,
                             },
-                            'proposedTotalIncludedAmount': None,
-                            'proposedMixedStateTotalAmount': None,
-                            'proposedExemptions': [],
+                            'tip': {'tipLines': []},
+                            'taxes': {
+                                'proposedAllocations': None,
+                                'proposedTotalAmount': {
+                                    'value': {
+                                        'amount': f'{tax3}',
+                                        'currencyCode': currency,
+                                    },
+                                },
+                                'proposedTotalIncludedAmount': None,
+                                'proposedMixedStateTotalAmount': None,
+                                'proposedExemptions': [],
+                            },
+                            'note': {
+                                'message': None,
+                                'customAttributes': [],
+                            },
+                            'localizationExtension': {'fields': []},
+                            'nonNegotiableTerms': None,
+                            'scriptFingerprint': {
+                                'signature': None,
+                                'signatureUuid': None,
+                                'lineItemScriptChanges': [],
+                                'paymentScriptChanges': [],
+                                'shippingScriptChanges': [],
+                            },
+                            'optionalDuties': {'buyerRefusesDuties': False},
+                            'cartMetafields': [],
                         },
-                        'note': {
-                            'message': None,
-                            'customAttributes': [],
+                        'attemptToken': f'{token}-4j33p1vmcd5' if token else '',
+                        'metafields': [],
+                        'analytics': {
+                            'requestUrl': checkout_url,
+                            'pageId': f'{random.randint(10000000,99999999):08x}-{random.randint(1000,9999):04X}-{random.randint(1000,9999):04X}-{random.randint(1000,9999):04X}-{random.randint(100000000000,999999999999):012x}',
                         },
-                        'localizationExtension': {'fields': []},
-                        'nonNegotiableTerms': None,
-                        'scriptFingerprint': {
-                            'signature': None,
-                            'signatureUuid': None,
-                            'lineItemScriptChanges': [],
-                            'paymentScriptChanges': [],
-                            'shippingScriptChanges': [],
-                        },
-                        'optionalDuties': {'buyerRefusesDuties': False},
-                        'cartMetafields': [],
                     },
-                    'attemptToken': f'{token}-4j33p1vmcd5' if token else '',
-                    'metafields': [],
-                    'analytics': {
-                        'requestUrl': checkout_url,
-                        'pageId': f'{random.randint(10000000,99999999):08x}-{random.randint(1000,9999):04X}-{random.randint(1000,9999):04X}-{random.randint(1000,9999):04X}-{random.randint(100000000000,999999999999):012x}',
-                    },
-                },
-                'operationName': 'SubmitForCompletion',
-            }
-            
-            # Select submit variant based on DMT
-            if DMT == 'NONE':
-                selected_submit_data = submit_none_data
-            else:
-                selected_submit_data = submit_shipping_data
-            
-            await human_delay(min_sec=0.5, max_sec=1.5, step_name="submit")
-            
-            # Retry submit up to 3 times
-            for _submit_attempt in range(3):
-                submit_resp, submit_text, _submit_ok = await make_graphql_request_with_captcha_handling(
-                    session, graphql_url, submit_params, checkout_web_headers, selected_submit_data,
-                    checkout_url, max_retries=1, proxy=proxy
-                )
-                if submit_resp and "success" in submit_text:
-                    break
-                if _submit_attempt < 2:
-                    await asyncio.sleep(1)
-            
-            # Refresh session token from submit response
-            if submit_resp:
-                _new_sst_submit = submit_resp.headers.get('x-checkout-one-session-token') or submit_resp.headers.get('X-Checkout-One-Session-Token')
-                if _new_sst_submit:
-                    x_checkout_one_session_token = _new_sst_submit
-                    checkout_web_headers['x-checkout-one-session-token'] = x_checkout_one_session_token
-            
-            if not submit_resp or not _submit_ok:
-                return False, f"Submit request failed: {submit_text[:200]}", gateway, total_price, currency
-            
-            if is_captcha_required(submit_text):
-                return False, "CAPTCHA_REQUIRED on submit", gateway, total_price, currency
-            
-            # Check for specific submit errors
-            if "TAX_NEW_TAX_VALUE_MUST_BE_ACCEPTED" in submit_text:
-                return False, "TAX_MISMATCH", gateway, total_price, currency
-            if "CAPTCHA_METADATA_MISSING" in submit_text:
-                return False, "HCAPTCHA_REQUIRED", gateway, total_price, currency
-            if "PAYMENTS_CREDIT_CARD_BASE_EXPIRED" in submit_text:
-                return False, "CARD_EXPIRED", gateway, total_price, currency
-            if "PAYMENTS_CREDIT_CARD_BRAND_NOT_SUPPORTED" in submit_text:
-                return False, "CARD_NOT_SUPPORTED", gateway, total_price, currency
-            if "PAYMENTS_CREDIT_CARD_NUMBER_INVALID_FORMAT" in submit_text:
-                return False, "INVALID_NUMBER", gateway, total_price, currency
-            
-            # Extract receipt_id from submit response
-            try:
-                submit_json = json.loads(submit_text)
-                receipt = submit_json.get("data", {}).get("submitForCompletion", {}).get("receipt", {})
-                receipt_id = receipt.get("id")
-            except (json.JSONDecodeError, KeyError, TypeError):
-                receipt_id = None
-            
-            if not receipt_id:
-                # Check if there's an error in the submit response
+                    'operationName': 'SubmitForCompletion',
+                }
+
+                # Select submit variant based on DMT
+                if DMT == 'NONE':
+                    selected_submit_data = submit_none_data
+                else:
+                    selected_submit_data = submit_shipping_data
+
+                await human_delay(min_sec=0.5, max_sec=1.5, step_name="submit")
+
+                # Retry submit up to 3 times
+                for _submit_attempt in range(3):
+                    submit_resp, submit_text, _submit_ok = await make_graphql_request_with_captcha_handling(
+                        session, graphql_url, submit_params, checkout_web_headers, selected_submit_data,
+                        checkout_url, max_retries=1, proxy=proxy
+                    )
+                    if submit_resp and "success" in submit_text:
+                        break
+                    if _submit_attempt < 2:
+                        await asyncio.sleep(1)
+
+                # Refresh session token from submit response
+                if submit_resp:
+                    _new_sst_submit = submit_resp.headers.get('x-checkout-one-session-token') or submit_resp.headers.get('X-Checkout-One-Session-Token')
+                    if _new_sst_submit:
+                        x_checkout_one_session_token = _new_sst_submit
+                        checkout_web_headers['x-checkout-one-session-token'] = x_checkout_one_session_token
+
+                if not submit_resp or not _submit_ok:
+                    return False, f"Submit request failed: {submit_text[:200]}", gateway, total_price, currency
+
+                if is_captcha_required(submit_text):
+                    return False, "CAPTCHA_REQUIRED on submit", gateway, total_price, currency
+
+                # Check for specific submit errors
+                if "TAX_NEW_TAX_VALUE_MUST_BE_ACCEPTED" in submit_text:
+                    return False, "TAX_MISMATCH", gateway, total_price, currency
+                if "CAPTCHA_METADATA_MISSING" in submit_text:
+                    return False, "HCAPTCHA_REQUIRED", gateway, total_price, currency
+                if "PAYMENTS_CREDIT_CARD_BASE_EXPIRED" in submit_text:
+                    return False, "CARD_EXPIRED", gateway, total_price, currency
+                if "PAYMENTS_CREDIT_CARD_BRAND_NOT_SUPPORTED" in submit_text:
+                    return False, "CARD_NOT_SUPPORTED", gateway, total_price, currency
+                if "PAYMENTS_CREDIT_CARD_NUMBER_INVALID_FORMAT" in submit_text:
+                    return False, "INVALID_NUMBER", gateway, total_price, currency
+                if "PAYMENTS_UNACCEPTABLE_PAYMENT_AMOUNT" in submit_text:
+                    return False, "PAYMENTS_UNACCEPTABLE_PAYMENT_AMOUNT", gateway, total_price, currency
+
+                # Extract receipt_id from submit response
                 try:
                     submit_json = json.loads(submit_text)
-                    _submit_errors = submit_json.get('errors', [])
-                    if _submit_errors:
-                        _err_msgs = [e.get('message', str(e)) for e in _submit_errors[:3]]
-                        return False, f"Submit GraphQL Error: {'; '.join(_err_msgs)}", gateway, total_price, currency
-                    # Check for receipt processing error
-                    _receipt_type = receipt.get('__typename', '')
-                    if _receipt_type == 'FailedReceipt':
-                        _sr_error = receipt.get('processingError', {})
-                        _sr_ext = _extract_payment_error_response(_sr_error)
-                        return False, _sr_ext or "CARD_DECLINED", gateway, total_price, currency
-                except Exception:
-                    pass
-                return False, "RECEIPT_EMPTY", gateway, total_price, currency
-            
+                    receipt = submit_json.get("data", {}).get("submitForCompletion", {}).get("receipt", {})
+                    receipt_id = receipt.get("id")
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    receipt_id = None
+
+                if not receipt_id:
+                    # Check if there's an error in the submit response
+                    try:
+                        submit_json = json.loads(submit_text)
+                        _submit_errors = submit_json.get('errors', [])
+                        if _submit_errors:
+                            _err_msgs = [e.get('message', str(e)) for e in _submit_errors[:3]]
+                            return False, f"Submit GraphQL Error: {'; '.join(_err_msgs)}", gateway, total_price, currency
+                        # Check for receipt processing error
+                        _receipt_type = receipt.get('__typename', '')
+                        if _receipt_type == 'FailedReceipt':
+                            _sr_error = receipt.get('processingError', {})
+                            _sr_ext = _extract_payment_error_response(_sr_error)
+                            return False, _sr_ext or "CARD_DECLINED", gateway, total_price, currency
+                    except Exception:
+                        pass
+                    return False, "RECEIPT_EMPTY", gateway, total_price, currency
+
+            # Step 9: PollForReceipt
             await human_delay(min_sec=1.0, max_sec=2.0, step_name="poll_start")
             
-            # Step 9: PollForReceipt
             poll_params = {'operationName': 'PollForReceipt'}
             poll_data = {
                 'query': QUERY_POLL,
@@ -2171,11 +2194,16 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             # Extract processingError code
             result_code = res_json.get('data', {}).get('receipt', {}).get('processingError', {}).get('code', '')
             
+            # Log the raw result for debugging
+            print(f'[POLL] result_code={result_code!r} total_price={total_price} gateway={gateway}', file=sys.stderr)
+            
             # Map specific error codes
             if result_code == 'CARD_DECLINED':
                 return False, "CARD_DECLINED", gateway, total_price, currency
             elif result_code == 'INCORRECT_NUMBER':
                 return False, "INCORRECT_NUMBER", gateway, total_price, currency
+            elif result_code == 'PAYMENTS_UNACCEPTABLE_PAYMENT_AMOUNT':
+                return False, "PAYMENTS_UNACCEPTABLE_PAYMENT_AMOUNT", gateway, total_price, currency
             elif result_code == 'GENERIC_ERROR':
                 # Try to extract more specific error
                 _poll_error = res_json.get('data', {}).get('receipt', {}).get('processingError', {})
