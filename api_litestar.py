@@ -1085,12 +1085,13 @@ async def _shopify_core(
             )
 
         try:
-            cc_parts = parse_cc_string(cc_string)
-            card_number = cc_parts["cc"]
-            mes = cc_parts["mes"]
-            ano = cc_parts["ano"]
-            cvv = cc_parts["cvv"]
-        except ValueError as e:
+            card_number, mes, ano, cvv = parse_cc_string(cc_string)
+            if not card_number:
+                return Response(
+                    content={"error": "Invalid CC format. Use CC|MM|YYYY|CVV", "status": False},
+                    status_code=400, media_type=MediaType.JSON,
+                )
+        except (ValueError, TypeError) as e:
             return Response(
                 content={"error": str(e), "status": False},
                 status_code=400, media_type=MediaType.JSON,
