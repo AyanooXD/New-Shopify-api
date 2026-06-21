@@ -1346,18 +1346,6 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     'payment': {
                         'totalAmount': {'any': True},
                         'paymentLines': [],
-                        'billingAddress': {
-                            'streetAddress': {
-                                'address1': street,
-                                'city': city,
-                                'countryCode': country_code,
-                                'postalCode': s_zip,
-                                'firstName': firstName,
-                                'lastName': lastName,
-                                'zoneCode': state,
-                                'phone': phone,
-                            },
-                        },
                     },
                     'buyerIdentity': {
                         'customer': {
@@ -1447,6 +1435,10 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 return False, "CAPTCHA_REQUIRED", gateway, total_price, currency
             
             # Extract tax2 from 1st proposal response
+            # LOG: Save Proposal 1 response for debugging
+            with open('/tmp/proposal1_response.json', 'w') as _dbg_f1:
+                _dbg_f1.write(resp_text)
+            print(f'[PROPOSAL1_RAW] Saved to /tmp/proposal1_response.json ({len(resp_text)} chars)', file=sys.stderr)
             tax2_match = re.search(r'"totalTaxAndDutyAmount"\s*:\s*{[^}]*"value"\s*:\s*{[^}]*"amount"\s*:\s*"([\d.]+)"', resp_text)
             if not tax2_match:
                 tax2_match = re.search(r'"totalAmountIncludedInTarget"\s*:\s*{[^}]*"value"\s*:\s*{[^}]*"amount"\s*:\s*"([\d.]+)"', resp_text)
@@ -1486,15 +1478,63 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                         break
                     print(f'[PROPOSAL1] shipping_cost={_p1_shipping_cost}', file=sys.stderr)
                 else:
-                    print(f'[PROPOSAL1] No sellerProposal in response.', file=sys.stderr)
+                    _p1_result_type = _p1_json.get("data", {}).get("session", {}).get("negotiate", {}).get("result", {}).get("__typename", "UNKNOWN")
+                    print(f'[PROPOSAL1] No sellerProposal. result type: {_p1_result_type}', file=sys.stderr)
+                    _p1_neg_errors = _p1_json.get('data', {}).get('session', {}).get('negotiate', {}).get('errors', [])
+                    if _p1_neg_errors:
+                        print(f'[PROPOSAL1] Negotiate errors: {json.dumps(_p1_neg_errors[:2])}', file=sys.stderr)
             except (json.JSONDecodeError, KeyError, TypeError, ValueError) as _e:
                 print(f'[PROPOSAL1] Error parsing: {_e}', file=sys.stderr)
             
             # Calculate estimated total for payment (price + shipping estimate + tax)
+            # If Proposal 1 gave us checkoutTotal, use it; otherwise try to poll for shipping rates
             if _p1_checkout_total and _p1_checkout_total > 0:
                 _estimated_total = _p1_checkout_total
-            else:
+            elif _p1_shipping_cost > 0:
                 _estimated_total = price + _p1_shipping_cost + tax2
+            else:
+                # Shipping rates not yet available — try polling Proposal 1 again
+                # to get the shipping rates (they load asynchronously)
+                print(f'[PROPOSAL1] Shipping rates not ready, retrying Proposal 1...', file=sys.stderr)
+                await asyncio.sleep(2)
+                _p1_checkout_total2 = None
+                _p1_shipping_cost2 = 0.0
+                try:
+                    _resp2, _resp_text2, _ok2 = await make_graphql_request_with_captcha_handling(
+                        session, graphql_url, proposal1_params, checkout_web_headers, proposal1_data,
+                        checkout_url, max_retries=1, proxy=proxy
+                    )
+                    if _resp2 and _ok2:
+                        _p1_json2 = json.loads(_resp_text2)
+                        _p1_seller2 = _p1_json2.get('data', {}).get('session', {}).get('negotiate', {}).get('result', {}).get('sellerProposal', {})
+                        if _p1_seller2:
+                            _p1_ct2 = _p1_seller2.get('checkoutTotal', {}).get('value', {}).get('amount')
+                            if _p1_ct2:
+                                _p1_checkout_total2 = float(_p1_ct2)
+                            _p1_del2 = _p1_seller2.get('delivery', {})
+                            _p1_dls2 = _p1_del2.get('deliveryLines', []) if _p1_del2 else []
+                            for _dl2 in _p1_dls2:
+                                _strats2 = _dl2.get('availableDeliveryStrategies', [])
+                                for _s2 in _strats2:
+                                    _bd2 = _s2.get('deliveryStrategyBreakdown', [])
+                                    for _bd_item in _bd2:
+                                        _bd_amt2 = _bd_item.get('amount', {}).get('value', {}).get('amount', '0')
+                                        if _bd_amt2 and float(_bd_amt2) > 0:
+                                            _p1_shipping_cost2 = float(_bd_amt2)
+                                            break
+                        print(f'[PROPOSAL1_RETRY] checkoutTotal={_p1_checkout_total2} shipping={_p1_shipping_cost2}', file=sys.stderr)
+                except Exception as _e2:
+                    print(f'[PROPOSAL1_RETRY] Error: {_e2}', file=sys.stderr)
+                
+                if _p1_checkout_total2 and _p1_checkout_total2 > 0:
+                    _estimated_total = _p1_checkout_total2
+                elif _p1_shipping_cost2 > 0:
+                    _estimated_total = price + _p1_shipping_cost2 + tax2
+                else:
+                    # Still no shipping — use a large overestimate that Shopify will accept
+                    # We'll use price * 2 as a safe upper bound (covers shipping + tax)
+                    _estimated_total = price * 2
+                    print(f'[PROPOSAL1] Still no shipping rates, using price*2={_estimated_total}', file=sys.stderr)
             print(f'[PROPOSAL1] _estimated_total={_estimated_total} (price={price} + shipping={_p1_shipping_cost} + tax2={tax2})', file=sys.stderr)
             
             # Fallback DMT from 1st proposal response
