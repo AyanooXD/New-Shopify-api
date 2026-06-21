@@ -1680,7 +1680,11 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         _p2_dl = _p2_del.get('deliveryLines', [{}]) if _p2_del else [{}]
                         if _p2_dl and _p2_dl[0].get('availableDeliveryStrategies'):
                             handle = _p2_dl[0]['availableDeliveryStrategies'][0].get('handle', '') or handle
-                    print(f'[PROPOSAL2] SubmittedForCompletion: receipt_id={receipt_id} total_price={total_price} handle={handle}', file=sys.stderr)
+                    else:
+                        # SubmittedForCompletion usually has no sellerProposal — use price as total
+                        if price and float(price) > 0:
+                            total_price = f"{float(price):.2f}"
+                    print(f'[PROPOSAL2] SubmittedForCompletion: receipt_id={receipt_id} total_price={total_price} handle={handle} price={price}', file=sys.stderr)
                     _skip_submit = True
                 elif _p2_result_type and _p2_result_type != 'NegotiationResultAvailable':
                     return False, f"Unexpected proposal 2 result: {_p2_result_type}", gateway, total_price, currency
@@ -1717,7 +1721,16 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 if not total:
                     total = str(price)
                 
+                # Ensure total is a valid number (not 'None' or empty)
+                try:
+                    float(total)
+                except (ValueError, TypeError):
+                    total = str(price)
+                
                 total_price = str(total)
+                
+                # LOG key values for debugging
+                print(f'[PROPOSAL2] price={price} amount={amount} total={total} total_price={total_price} handle={handle} tax3={tax3}', file=sys.stderr)
                 
                 if not handle and not _skip_submit:
                     return False, "HANDLE EMPTY", gateway, total_price, currency
@@ -1726,6 +1739,20 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 return False, f"Failed to parse proposal 2 response: {str(e)}", gateway, total_price, currency
             
             # Step 8: SubmitForCompletion — TWO variants based on DMT
+            print(f'[SUBMIT_PREP] price={price} total_price={total_price} amount={amount} total={total} handle={handle} DMT={DMT} _skip_submit={_skip_submit}', file=sys.stderr)
+            
+            # CRITICAL: Validate total_price before proceeding
+            try:
+                _tp_check = float(total_price)
+                if _tp_check <= 0 and price and float(price) > 0:
+                    total_price = f"{float(price):.2f}"
+                    total = total_price
+                    print(f'[SUBMIT_PREP] FIXED total_price from {total_price} to {total_price} (was 0, using price)', file=sys.stderr)
+            except (ValueError, TypeError):
+                if price and float(price) > 0:
+                    total_price = f"{float(price):.2f}"
+                    total = total_price
+            
             if _skip_submit:
                 # Already submitted via SubmittedForCompletion, skip to poll
                 print(f'[SKIP_SUBMIT] Skipping submit, going to poll with receipt_id={receipt_id}', file=sys.stderr)
