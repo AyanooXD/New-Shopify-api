@@ -2417,69 +2417,74 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
 
                 pp = payment_proposal_input.get('purchaseProposal', payment_proposal_input)
 
-                # Build delivery using server-confirmed data when available
+                # Build delivery for submit step.
                 # KEY FIX for DELIVERY_DELIVERY_LINE_DETAIL_CHANGED:
-                # Use server_delivery_lines from negotiate response if available,
-                # as they contain the exact server-confirmed delivery strategy.
-                # IMPORTANT: We MUST inject the destination address because the
-                # server's FilledDeliveryTerms doesn't always include it — but the
-                # submit step REQUIRES it (DESTINATION_ADDRESS_REQUIRED).
+                # The submit step requires an EXACT expectedTotalPrice, NOT {any: true}.
+                # {any: true} works in the negotiate step but causes
+                # DELIVERY_DELIVERY_LINE_DETAIL_CHANGED in submit because
+                # the server validates that our price matches its calculation.
+                #
+                # Strategy:
+                # 1. Use the server-confirmed delivery strategy handle
+                # 2. Calculate exact shipping price: checkout_total - merchandise_price
+                # 3. Build a fresh delivery line with the exact price
+                # 4. Always include destination address
                 submit_delivery = pp.get('delivery')
                 if is_shipping_required and stable_ids:
-                    if server_delivery_lines:
-                        # Inject destination address and stableId references into
-                        # server-confirmed delivery lines
-                        _buyer_dest = {
-                            'streetAddress': {
-                                'firstName': firstName,
-                                'lastName': lastName,
-                                'address1': street,
-                                'address2': '',
-                                'city': city,
-                                'countryCode': country_code,
-                                'zoneCode': state,
-                                'postalCode': s_zip,
-                                'phone': phone,
-                            },
-                        }
+                    # Calculate exact shipping amount from checkout_total
+                    _exact_ship_amount = None
+                    if total_price and total_price != '0':
+                        try:
+                            _total_f = float(total_price)
+                            _price_f = float(price) if price else 0
+                            _ship_est = max(0, _total_f - _price_f)
+                            if _ship_est > 0:
+                                _exact_ship_amount = f'{_ship_est:.2f}'
+                        except (ValueError, TypeError):
+                            pass
+                    
+                    # Also try to get exact price from server-confirmed strategies
+                    if server_delivery_lines and not _exact_ship_amount:
                         for sdl in server_delivery_lines:
-                            # Always ensure destination is present — REQUIRED by submit
-                            if 'destination' not in sdl or not sdl.get('destination'):
-                                sdl['destination'] = _buyer_dest
-                            # Update stableId references for target merchandise lines
-                            sdl['targetMerchandiseLines'] = {
-                                'lines': [{'stableId': sid} for sid in stable_ids]
-                            }
-                            # Accept any price the server calculated
-                            sdl['expectedTotalPrice'] = {'any': True}
-                        submit_delivery = _build_delivery_terms(
-                            delivery_lines=server_delivery_lines,
-                            no_delivery_required=[],
-                        )
-                        print(f'[SUBMIT_DL] Using server-confirmed delivery lines ({len(server_delivery_lines)}) with injected destination', file=sys.stderr)
-                    else:
-                        # Fallback: Build delivery line from scratch with buyer address
-                        submit_delivery_line = _build_delivery_line(
-                            currency=currency,
-                            first_name=firstName,
-                            last_name=lastName,
-                            street=street,
-                            city=city,
-                            country_code=country_code,
-                            zone_code=state,
-                            postal_code=s_zip,
-                            phone=phone,
-                            shipping_handle=selected_handle,
-                            shipping_amount=None,  # {any: true} by default
-                        )
-                        # Use stableId-only references for target merchandise lines
-                        submit_delivery_line['targetMerchandiseLines'] = {
-                            'lines': [{'stableId': sid} for sid in stable_ids]
-                        }
-                        submit_delivery = _build_delivery_terms(
-                            delivery_lines=[submit_delivery_line],
-                            no_delivery_required=[],
-                        )
+                            _srv_price = sdl.get('expectedTotalPrice', {})
+                            if _srv_price and 'value' in _srv_price:
+                                _srv_amt = _srv_price.get('value', {}).get('amount', '')
+                                if _srv_amt and _srv_amt != '0':
+                                    _exact_ship_amount = _srv_amt
+                                    break
+                    
+                    # Get server-confirmed strategy handle
+                    _submit_handle = selected_handle
+                    if server_delivery_lines:
+                        for sdl in server_delivery_lines:
+                            _by_handle = _dget(sdl, 'selectedDeliveryStrategy', 'deliveryStrategyByHandle', 'handle')
+                            if _by_handle:
+                                _submit_handle = _by_handle
+                                break
+                    
+                    # Build fresh delivery line with EXACT price for submit
+                    submit_delivery_line = _build_delivery_line(
+                        currency=currency,
+                        first_name=firstName,
+                        last_name=lastName,
+                        street=street,
+                        city=city,
+                        country_code=country_code,
+                        zone_code=state,
+                        postal_code=s_zip,
+                        phone=phone,
+                        shipping_handle=_submit_handle,
+                        shipping_amount=_exact_ship_amount,
+                    )
+                    # Use stableId references for target merchandise lines
+                    submit_delivery_line['targetMerchandiseLines'] = {
+                        'lines': [{'stableId': sid} for sid in stable_ids]
+                    }
+                    submit_delivery = _build_delivery_terms(
+                        delivery_lines=[submit_delivery_line],
+                        no_delivery_required=[],
+                    )
+                    print(f'[SUBMIT_DL] Built delivery: handle={_submit_handle} exact_price={_exact_ship_amount} any_price={_exact_ship_amount is None}', file=sys.stderr)
 
                 submit_input = {
                     'sessionInput': {'sessionToken': x_checkout_one_session_token},
@@ -2700,80 +2705,72 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                     stable_ids = _reneg_parsed['stable_ids']
                                 # Update delivery from re-negotiation
                                 # When DELIVERY_DELIVERY_LINE_DETAIL_CHANGED, the server
-                                # recalculated delivery. We MUST use the server's confirmed
-                                # delivery lines instead of rebuilding from scratch.
-                                # KEY FIX: Use server_delivery_lines from _parse_negotiate_response
-                                # which contains the exact server-confirmed delivery data.
-                                # Also inject destination address (DESTINATION_ADDRESS_REQUIRED fix).
-                                _reneg_server_dl = _reneg_parsed.get('server_delivery_lines', [])
-                                if _reneg_server_dl and is_shipping_required:
-                                    # Build buyer destination for injection
-                                    _reneg_dest = {
-                                        'streetAddress': {
-                                            'firstName': firstName,
-                                            'lastName': lastName,
-                                            'address1': street,
-                                            'address2': '',
-                                            'city': city,
-                                            'countryCode': country_code,
-                                            'zoneCode': state,
-                                            'postalCode': s_zip,
-                                            'phone': phone,
-                                        },
-                                    }
-                                    for sdl in _reneg_server_dl:
-                                        # Always inject destination — server doesn't always include it
-                                        if 'destination' not in sdl or not sdl.get('destination'):
-                                            sdl['destination'] = _reneg_dest
-                                        if stable_ids:
-                                            sdl['targetMerchandiseLines'] = {
-                                                'lines': [{'stableId': sid} for sid in stable_ids]
-                                            }
-                                        # Use {any: true} for expectedTotalPrice to accept
-                                        # whatever the server calculated
-                                        sdl['expectedTotalPrice'] = {'any': True}
+                                # recalculated delivery. We MUST build the delivery line
+                                # with the EXACT price the server calculated, NOT {any: true}.
+                                # The submit step validates expectedTotalPrice exactly.
+                                if is_shipping_required:
+                                    # Calculate exact shipping price from updated checkout_total
+                                    _reneg_ship_amount = None
+                                    if total_price and total_price != '0':
+                                        try:
+                                            _total_f = float(total_price)
+                                            _price_f = float(price) if price else 0
+                                            _ship_est = max(0, _total_f - _price_f)
+                                            if _ship_est > 0:
+                                                _reneg_ship_amount = f'{_ship_est:.2f}'
+                                        except (ValueError, TypeError):
+                                            pass
                                     
+                                    # Try to get exact price from server-confirmed delivery lines
+                                    _reneg_server_dl = _reneg_parsed.get('server_delivery_lines', [])
+                                    if _reneg_server_dl and not _reneg_ship_amount:
+                                        for sdl in _reneg_server_dl:
+                                            _srv_price = sdl.get('expectedTotalPrice', {})
+                                            if _srv_price and 'value' in _srv_price:
+                                                _srv_amt = _srv_price.get('value', {}).get('amount', '')
+                                                if _srv_amt and _srv_amt != '0':
+                                                    _reneg_ship_amount = _srv_amt
+                                                    break
+                                    
+                                    # Get server-confirmed strategy handle
+                                    _reneg_handle = selected_handle
+                                    if _reneg_server_dl:
+                                        for sdl in _reneg_server_dl:
+                                            _by_handle = _dget(sdl, 'selectedDeliveryStrategy', 'deliveryStrategyByHandle', 'handle')
+                                            if _by_handle:
+                                                _reneg_handle = _by_handle
+                                                break
+                                    elif _reneg_parsed['shipping_strategies']:
+                                        _handle_strategies = [s for s in _reneg_parsed['shipping_strategies'] if s.get('handle')]
+                                        if _handle_strategies:
+                                            _reneg_handle = _handle_strategies[0]['handle']
+                                    
+                                    # Build fresh delivery line with EXACT price
+                                    _new_dl = _build_delivery_line(
+                                        currency=currency,
+                                        first_name=firstName,
+                                        last_name=lastName,
+                                        street=street,
+                                        city=city,
+                                        country_code=country_code,
+                                        zone_code=state,
+                                        postal_code=s_zip,
+                                        phone=phone,
+                                        shipping_handle=_reneg_handle,
+                                        shipping_amount=_reneg_ship_amount,
+                                    )
+                                    if stable_ids:
+                                        _new_dl['targetMerchandiseLines'] = {
+                                            'lines': [{'stableId': sid} for sid in stable_ids]
+                                        }
                                     _new_delivery_terms = _build_delivery_terms(
-                                        delivery_lines=_reneg_server_dl,
+                                        delivery_lines=[_new_dl],
                                         no_delivery_required=[],
                                     )
                                     # Update in submit input
                                     submit_data['variables']['input']['delivery'] = _new_delivery_terms
                                     pp['delivery'] = _new_delivery_terms
-                                    print(f'[RENEG_DL] Using server-confirmed delivery lines ({len(_reneg_server_dl)}) with injected destination', file=sys.stderr)
-                                elif _reneg_parsed['shipping_strategies']:
-                                    shipping_strategies = _reneg_parsed['shipping_strategies']
-                                    # Fallback: Rebuild delivery line with updated strategy
-                                    if is_shipping_required:
-                                        _handle_strategies = [s for s in shipping_strategies if s.get('handle')]
-                                        if _handle_strategies:
-                                            selected_handle = _handle_strategies[0]['handle']
-                                        # Use {any: true} for expectedTotalPrice to accept server's price
-                                        _new_dl = _build_delivery_line(
-                                            currency=currency,
-                                            first_name=firstName,
-                                            last_name=lastName,
-                                            street=street,
-                                            city=city,
-                                            country_code=country_code,
-                                            zone_code=state,
-                                            postal_code=s_zip,
-                                            phone=phone,
-                                            shipping_handle=selected_handle,
-                                            shipping_amount=None,  # {any: true} — accept any amount
-                                        )
-                                        if stable_ids:
-                                            _new_dl['targetMerchandiseLines'] = {
-                                                'lines': [{'stableId': sid} for sid in stable_ids]
-                                            }
-                                        _new_delivery_terms = _build_delivery_terms(
-                                            delivery_lines=[_new_dl],
-                                            no_delivery_required=[],
-                                        )
-                                        # Update in submit input
-                                        submit_data['variables']['input']['delivery'] = _new_delivery_terms
-                                        pp['delivery'] = _new_delivery_terms
-                                        print(f'[RENEG_DL] Rebuilt delivery line with handle={selected_handle} any price', file=sys.stderr)
+                                    print(f'[RENEG_DL] Rebuilt delivery: handle={_reneg_handle} exact_price={_reneg_ship_amount}', file=sys.stderr)
                                 # Update merchandise from re-negotiation (seller-confirmed)
                                 if _reneg_parsed.get('seller_variant_id'):
                                     _svid = _reneg_parsed['seller_variant_id']
