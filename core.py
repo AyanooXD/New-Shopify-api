@@ -461,7 +461,8 @@ def extract_clean_response(message):
         '3DS_REQUIRED', 'OTP_REQUIRED', 'ORDER_PLACED',
         'CAPTCHA_REQUIRED', 'GENERIC_ERROR', 'PAYMENT_FAILED',
         'PAYMENTS_UNACCEPTABLE_PAYMENT_AMOUNT', 'TAX_MISMATCH',
-        'TAX_NEW_TAX_MUST_BE_ACCEPTED',
+        'TAX_NEW_TAX_MUST_BE_ACCEPTED', 'DESTINATION_ADDRESS_REQUIRED',
+        'DELIVERY_DELIVERY_LINE_DETAIL_CHANGED', 'MERCHANDISE_SIGNATURE_MISMATCH',
     }
     msg_upper = message.strip().upper()
     if msg_upper in _KNOWN_CODES:
@@ -788,9 +789,9 @@ def _parse_negotiate_response(resp_json):
                 # Extract server-confirmed expectedTotalPrice
                 server_price_obj = dl.get('expectedTotalPrice', {})
                 server_price_amount, server_price_currency = _extract_money(server_price_obj)
-                # Extract server-confirmed destination
+                # Extract server-confirmed destination (may be absent — server doesn't
+                # always echo back the buyer's address in FilledDeliveryTerms)
                 server_dest = dl.get('destination', {})
-                server_street_addr = server_dest.get('streetAddress', {})
                 
                 # Build a complete strategy entry with server-confirmed data
                 dl_strategy = {
@@ -804,7 +805,12 @@ def _parse_negotiate_response(resp_json):
                 }
                 strategies.append(dl_strategy)
                 
-                # Store the full server-confirmed delivery line for reuse in submit
+                # Store the full server-confirmed delivery line for reuse in submit.
+                # IMPORTANT: The server's FilledDeliveryTerms may NOT include the
+                # destination address (it only confirms the strategy and price).
+                # The destination MUST be provided by us — it's a required input.
+                # We store the server-confirmed parts (strategy, price) and will
+                # inject the buyer's destination address when building the submit input.
                 server_dl = {
                     'deliveryMethodTypes': methods or ['SHIPPING'],
                     'selectedDeliveryStrategy': {
@@ -813,12 +819,13 @@ def _parse_negotiate_response(resp_json):
                             'customDeliveryRate': server_custom_rate,
                         },
                     },
-                    'destination': server_dest if server_dest else None,
                     'expectedTotalPrice': server_price_obj if server_price_obj else {'any': True},
                     'targetMerchandiseLines': dl.get('targetMerchandiseLines', {'any': True}),
                 }
-                # Remove None values
-                server_dl = {k: v for k, v in server_dl.items() if v is not None}
+                # Only include destination from server if it has actual address data
+                if server_dest and server_dest.get('streetAddress'):
+                    server_dl['destination'] = server_dest
+                # NOTE: destination will be injected later in submit step if missing
                 server_delivery_lines.append(server_dl)
                 
                 # If we have deliveryMethodTypes, create strategy entries (legacy compat)
@@ -2413,15 +2420,33 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 # Build delivery using server-confirmed data when available
                 # KEY FIX for DELIVERY_DELIVERY_LINE_DETAIL_CHANGED:
                 # Use server_delivery_lines from negotiate response if available,
-                # as they contain the exact server-confirmed delivery data.
+                # as they contain the exact server-confirmed delivery strategy.
+                # IMPORTANT: We MUST inject the destination address because the
+                # server's FilledDeliveryTerms doesn't always include it — but the
+                # submit step REQUIRES it (DESTINATION_ADDRESS_REQUIRED).
                 submit_delivery = pp.get('delivery')
                 if is_shipping_required and stable_ids:
                     if server_delivery_lines:
-                        # Use server-confirmed delivery lines — these have the exact
-                        # strategy handle, destination, and expectedTotalPrice that the
-                        # server expects. Update stableId references and use {any: True}
-                        # for expectedTotalPrice to prevent detail mismatch.
+                        # Inject destination address and stableId references into
+                        # server-confirmed delivery lines
+                        _buyer_dest = {
+                            'streetAddress': {
+                                'firstName': firstName,
+                                'lastName': lastName,
+                                'address1': street,
+                                'address2': '',
+                                'city': city,
+                                'countryCode': country_code,
+                                'zoneCode': state,
+                                'postalCode': s_zip,
+                                'phone': phone,
+                            },
+                        }
                         for sdl in server_delivery_lines:
+                            # Always ensure destination is present — REQUIRED by submit
+                            if 'destination' not in sdl or not sdl.get('destination'):
+                                sdl['destination'] = _buyer_dest
+                            # Update stableId references for target merchandise lines
                             sdl['targetMerchandiseLines'] = {
                                 'lines': [{'stableId': sid} for sid in stable_ids]
                             }
@@ -2431,10 +2456,9 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                             delivery_lines=server_delivery_lines,
                             no_delivery_required=[],
                         )
-                        print(f'[SUBMIT_DL] Using server-confirmed delivery lines ({len(server_delivery_lines)}) with any price', file=sys.stderr)
+                        print(f'[SUBMIT_DL] Using server-confirmed delivery lines ({len(server_delivery_lines)}) with injected destination', file=sys.stderr)
                     else:
-                        # Fallback: Calculate shipping amount for submit delivery
-                        _ship_amount = None
+                        # Fallback: Build delivery line from scratch with buyer address
                         submit_delivery_line = _build_delivery_line(
                             currency=currency,
                             first_name=firstName,
@@ -2446,7 +2470,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                             postal_code=s_zip,
                             phone=phone,
                             shipping_handle=selected_handle,
-                            shipping_amount=_ship_amount,  # {any: true} by default
+                            shipping_amount=None,  # {any: true} by default
                         )
                         # Use stableId-only references for target merchandise lines
                         submit_delivery_line['targetMerchandiseLines'] = {
@@ -2680,18 +2704,33 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                 # delivery lines instead of rebuilding from scratch.
                                 # KEY FIX: Use server_delivery_lines from _parse_negotiate_response
                                 # which contains the exact server-confirmed delivery data.
+                                # Also inject destination address (DESTINATION_ADDRESS_REQUIRED fix).
                                 _reneg_server_dl = _reneg_parsed.get('server_delivery_lines', [])
                                 if _reneg_server_dl and is_shipping_required:
-                                    # Use the server-confirmed delivery lines directly
-                                    # Update stableId references in targetMerchandiseLines
+                                    # Build buyer destination for injection
+                                    _reneg_dest = {
+                                        'streetAddress': {
+                                            'firstName': firstName,
+                                            'lastName': lastName,
+                                            'address1': street,
+                                            'address2': '',
+                                            'city': city,
+                                            'countryCode': country_code,
+                                            'zoneCode': state,
+                                            'postalCode': s_zip,
+                                            'phone': phone,
+                                        },
+                                    }
                                     for sdl in _reneg_server_dl:
+                                        # Always inject destination — server doesn't always include it
+                                        if 'destination' not in sdl or not sdl.get('destination'):
+                                            sdl['destination'] = _reneg_dest
                                         if stable_ids:
                                             sdl['targetMerchandiseLines'] = {
                                                 'lines': [{'stableId': sid} for sid in stable_ids]
                                             }
                                         # Use {any: true} for expectedTotalPrice to accept
-                                        # whatever the server calculated (this is what real
-                                        # Shopify checkout does after DELIVERY_LINE_DETAIL_CHANGED)
+                                        # whatever the server calculated
                                         sdl['expectedTotalPrice'] = {'any': True}
                                     
                                     _new_delivery_terms = _build_delivery_terms(
@@ -2701,7 +2740,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                     # Update in submit input
                                     submit_data['variables']['input']['delivery'] = _new_delivery_terms
                                     pp['delivery'] = _new_delivery_terms
-                                    print(f'[RENEG_DL] Using server-confirmed delivery lines ({len(_reneg_server_dl)}) with any price', file=sys.stderr)
+                                    print(f'[RENEG_DL] Using server-confirmed delivery lines ({len(_reneg_server_dl)}) with injected destination', file=sys.stderr)
                                 elif _reneg_parsed['shipping_strategies']:
                                     shipping_strategies = _reneg_parsed['shipping_strategies']
                                     # Fallback: Rebuild delivery line with updated strategy
