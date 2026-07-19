@@ -2252,6 +2252,17 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 # Build delivery using stableId references only
                 submit_delivery = pp.get('delivery')
                 if is_shipping_required and stable_ids:
+                    # Calculate shipping amount for submit delivery
+                    _ship_amount = None
+                    if total_price and total_price != '0':
+                        try:
+                            _total_f = float(total_price)
+                            _price_f = float(price) if price else 0
+                            _ship_est = max(0, _total_f - _price_f)
+                            if _ship_est > 0:
+                                _ship_amount = f'{_ship_est:.2f}'
+                        except (ValueError, TypeError):
+                            pass
                     submit_delivery_line = _build_delivery_line(
                         currency=currency,
                         first_name=firstName,
@@ -2263,7 +2274,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         postal_code=s_zip,
                         phone=phone,
                         shipping_handle=selected_handle,
-                        shipping_amount=None,
+                        shipping_amount=_ship_amount,
                     )
                     # Use stableId-only references for target merchandise lines
                     submit_delivery_line['targetMerchandiseLines'] = {
