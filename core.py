@@ -247,7 +247,7 @@ MUTATION_CART_CREATE = """mutation cartCreate($input:CartInput!){result:cartCrea
 #   - Added merchandise{__typename} inside merchandiseLines for debugging
 #   - Removed tax sub-fields (tax comes from sellerProposal.totalAmount or via TAX_NEW_TAX_MUST_BE_ACCEPTED)
 #   - Uses the exact format confirmed working on allbirds.com
-QUERY_PROPOSAL = """query Proposal($input:SessionNegotiationInput!){session{negotiate(input:$input){errors{code localizedMessage}result{__typename ...on NegotiationResultAvailable{queueToken sessionToken sellerProposal{__typename checkoutTotal{__typename ...on MoneyValueConstraint{value{amount currencyCode}}}isShippingRequired delivery{__typename ...on PendingTerms{pollDelay taskId}...on FilledDeliveryTerms{deliveryLines{__typename deliveryMethodTypes selectedDeliveryStrategy{__typename} expectedTotalPrice{__typename} destination{__typename} targetMerchandiseLines{__typename}}}}merchandise{__typename ...on FilledMerchandiseTerms{merchandiseLines{stableId merchandise{__typename ...on SourceProvidedMerchandise{variantId price{amount currencyCode}title requiresShipping taxable giftCard}}}}}payment{__typename ...on FilledPaymentTerms{availablePaymentLines{paymentMethod{__typename ...on PaymentProvider{paymentMethodIdentifier name brands}}}}}}buyerProposal{__typename checkoutTotal{__typename ...on MoneyValueConstraint{value{amount currencyCode}}}}}...on NegotiationResultFailed{failureCode}...on SubmittedForCompletion{receipt{__typename ...on FailedReceipt{processingError{__typename}}}}...on CheckpointDenied{__typename}...on Throttled{__typename}}}}}"""
+QUERY_PROPOSAL = """query Proposal($input:SessionNegotiationInput!){session{negotiate(input:$input){errors{code localizedMessage}result{__typename ...on NegotiationResultAvailable{queueToken sessionToken sellerProposal{__typename checkoutTotal{__typename ...on MoneyValueConstraint{value{amount currencyCode}}...on AnyConstraint{any:_singleInstance}}...on MoneyIntervalConstraint{lowerBound{amount currencyCode}upperBound{amount currencyCode}}}isShippingRequired delivery{__typename ...on PendingTerms{pollDelay taskId}...on FilledDeliveryTerms{deliveryLines{__typename deliveryMethodTypes stableId selectedDeliveryStrategy{__typename ...on CompleteDeliveryStrategy{handle code title amount{__typename ...on MoneyValueConstraint{value{amount currencyCode}}...on AnyConstraint{any:_singleInstance}}}...on CustomDeliveryStrategy{code title price{__typename ...on MoneyValueConstraint{value{amount currencyCode}}}}...on DeliveryStrategyReference{handle}}totalAmount{__typename ...on MoneyValueConstraint{value{amount currencyCode}}...on AnyConstraint{any:_singleInstance}}destinationAddress{__typename ...on StreetAddress{address1 address2 city countryCode zoneCode postalCode}...on PartialStreetAddress{address1 city countryCode zoneCode postalCode}}targetMerchandise{__typename ...on AnyMerchandiseLineTargetCollection{any}...on FilledMerchandiseLineTargetCollection{linesV2{__typename}}}}}}merchandise{__typename ...on FilledMerchandiseTerms{merchandiseLines{stableId merchandise{__typename ...on SourceProvidedMerchandise{variantId price{amount currencyCode}title requiresShipping taxable giftCard}}}}}payment{__typename ...on FilledPaymentTerms{availablePaymentLines{paymentMethod{__typename ...on PaymentProvider{paymentMethodIdentifier name brands}}}}}}buyerProposal{__typename checkoutTotal{__typename ...on MoneyValueConstraint{value{amount currencyCode}}...on AnyConstraint{any:_singleInstance}}}}}...on NegotiationResultFailed{failureCode}...on SubmittedForCompletion{receipt{__typename ...on FailedReceipt{processingError{__typename}}}}...on CheckpointDenied{__typename}...on Throttled{__typename}}}}}"""
 
 # --- Checkout Web API: SubmitForCompletion ---
 # CRITICAL: submitForCompletion returns SubmitForCompletionResult UNION directly
@@ -264,7 +264,7 @@ MUTATION_SUBMIT = (
     "{...on SubmitSuccess{receipt{__typename ...on ProcessedReceipt{order{id}}...on FailedReceipt{__typename}...on ActionRequiredReceipt{__typename}}configurationRecordId}"
     "...on SubmittedForCompletion{receipt{__typename ...on ProcessedReceipt{order{id}}...on FailedReceipt{__typename}...on ActionRequiredReceipt{__typename}}configurationRecordId}"
     "...on SubmitFailed{reason}"
-    "...on SubmitRejected{errors{code localizedMessage}sellerProposal{__typename checkoutTotal{__typename ...on MoneyValueConstraint{value{amount currencyCode}}}delivery{__typename ...on FilledDeliveryTerms{deliveryLines{__typename deliveryMethodTypes selectedDeliveryStrategy{__typename} expectedTotalPrice{__typename} destination{__typename} targetMerchandiseLines{__typename}}}}}}"
+    "...on SubmitRejected{errors{code localizedMessage}sellerProposal{__typename checkoutTotal{__typename ...on MoneyValueConstraint{value{amount currencyCode}}...on AnyConstraint{any:_singleInstance}}}delivery{__typename ...on FilledDeliveryTerms{deliveryLines{__typename deliveryMethodTypes stableId selectedDeliveryStrategy{__typename ...on CompleteDeliveryStrategy{handle code title amount{__typename ...on MoneyValueConstraint{value{amount currencyCode}}...on AnyConstraint{any:_singleInstance}}}...on CustomDeliveryStrategy{code title price{__typename ...on MoneyValueConstraint{value{amount currencyCode}}}}...on DeliveryStrategyReference{handle}}totalAmount{__typename ...on MoneyValueConstraint{value{amount currencyCode}}...on AnyConstraint{any:_singleInstance}}destinationAddress{__typename ...on StreetAddress{address1 address2 city countryCode zoneCode postalCode}}targetMerchandise{__typename ...on AnyMerchandiseLineTargetCollection{any}}}}}}"
     "...on CheckpointDenied{__typename}"
     "...on Throttled{__typename}"
     "...on TooManyAttempts{__typename}"
@@ -781,95 +781,141 @@ def _parse_negotiate_response(resp_json):
             server_delivery_lines = []
             for dl in delivery_lines:
                 methods = dl.get('deliveryMethodTypes', [])
-                # Extract the server-confirmed delivery strategy handle and price
-                sel_strategy = dl.get('selectedDeliveryStrategy', {})
-                strategy_by_handle = sel_strategy.get('deliveryStrategyByHandle', {})
-                server_handle = strategy_by_handle.get('handle', '')
-                server_custom_rate = strategy_by_handle.get('customDeliveryRate', False)
-                # Extract server-confirmed expectedTotalPrice
-                server_price_obj = dl.get('expectedTotalPrice', {})
-                server_price_amount, server_price_currency = _extract_money(server_price_obj)
-                # Extract server-confirmed destination
-                server_dest = dl.get('destination', {})
-                # Extract server-confirmed targetMerchandiseLines
-                server_target_merch = dl.get('targetMerchandiseLines', {})
+                dl_stable_id = dl.get('stableId', '')
                 
-                # LOG: Discover type names for future query expansion
-                _dl_typename = dl.get('__typename', '')
+                # ─── selectedDeliveryStrategy (UNION) ───
+                # Response types: CompleteDeliveryStrategy | CustomDeliveryStrategy |
+                #   DeliveryStrategyMatcher | DeliveryStrategyReference
+                # INPUT type: DeliveryStrategyInput with deliveryStrategyByHandle
+                sel_strategy = dl.get('selectedDeliveryStrategy', {})
                 _strat_typename = sel_strategy.get('__typename', '') if sel_strategy else ''
-                _price_typename = server_price_obj.get('__typename', '') if server_price_obj else ''
-                _dest_typename = server_dest.get('__typename', '') if server_dest else ''
+                print(f'[DELIVERY_TYPES] Strategy typename={_strat_typename}', file=sys.stderr)
+                
+                # Extract handle from whichever union member returned it
+                server_handle = ''
+                server_strategy_code = ''
+                server_strategy_amount = None
+                server_strategy_currency = None
+                
+                if _strat_typename == 'CompleteDeliveryStrategy':
+                    server_handle = sel_strategy.get('handle', '')
+                    server_strategy_code = sel_strategy.get('code', '')
+                    _amt_obj = sel_strategy.get('amount', {})
+                    _amt_typename = _amt_obj.get('__typename', '') if _amt_obj else ''
+                    if _amt_typename == 'MoneyValueConstraint':
+                        _v = _amt_obj.get('value', {})
+                        server_strategy_amount = _v.get('amount')
+                        server_strategy_currency = _v.get('currencyCode')
+                    elif _amt_typename == 'AnyConstraint':
+                        pass  # any constraint — use {any:true}
+                elif _strat_typename == 'CustomDeliveryStrategy':
+                    server_strategy_code = sel_strategy.get('code', '')
+                    _price_obj = sel_strategy.get('price', {})
+                    _price_typename = _price_obj.get('__typename', '') if _price_obj else ''
+                    if _price_typename == 'MoneyValueConstraint':
+                        _v = _price_obj.get('value', {})
+                        server_strategy_amount = _v.get('amount')
+                        server_strategy_currency = _v.get('currencyCode')
+                elif _strat_typename == 'DeliveryStrategyReference':
+                    server_handle = sel_strategy.get('handle', '')
+                
+                # ─── totalAmount (MoneyConstraint UNION) ───
+                # Response: AnyConstraint | MoneyValueConstraint | MoneyIntervalConstraint
+                # INPUT: expectedTotalPrice: MoneyConstraintInput
+                server_total_amount_obj = dl.get('totalAmount', {})
+                server_total_amount, server_total_currency = _extract_money(server_total_amount_obj)
+                _total_typename = server_total_amount_obj.get('__typename', '') if server_total_amount_obj else ''
+                
+                # ─── destinationAddress (DeliveryAddress UNION) ───
+                # Response: StreetAddress | PartialStreetAddress | Geolocation | InvalidDeliveryAddress
+                # INPUT: destination: DeliveryAddressInput with streetAddress
+                server_dest_addr = dl.get('destinationAddress', {})
+                _dest_typename = server_dest_addr.get('__typename', '') if server_dest_addr else ''
+                
+                # Extract address fields from StreetAddress or PartialStreetAddress
+                server_street1 = server_dest_addr.get('address1', '')
+                server_street2 = server_dest_addr.get('address2', '')
+                server_city = server_dest_addr.get('city', '')
+                server_country = server_dest_addr.get('countryCode', '')
+                server_zone = server_dest_addr.get('zoneCode', '')
+                server_postal = server_dest_addr.get('postalCode', '')
+                
+                # ─── targetMerchandise (MerchandiseLineTargetCollection UNION) ───
+                # Response: AnyMerchandiseLineTargetCollection | FilledMerchandiseLineTargetCollection
+                # INPUT: targetMerchandiseLines: MerchandiseLineTargetCollectionInput
+                server_target_merch = dl.get('targetMerchandise', {})
                 _target_typename = server_target_merch.get('__typename', '') if server_target_merch else ''
-                print(f'[DELIVERY_TYPES] DL={_dl_typename} Strategy={_strat_typename} Price={_price_typename} Dest={_dest_typename} Target={_target_typename}', file=sys.stderr)
+                
+                print(f'[DELIVERY_LINE] stableId={dl_stable_id} handle={server_handle} code={server_strategy_code} '
+                      f'strat_type={_strat_typename} total={server_total_amount} {server_total_currency} '
+                      f'dest_type={_dest_typename} target_type={_target_typename}', file=sys.stderr)
                 
                 # Build a complete strategy entry with server-confirmed data
                 dl_strategy = {
-                    'code': methods[0] if methods else 'SHIPPING',
+                    'code': server_strategy_code or (methods[0] if methods else 'SHIPPING'),
                     'handle': server_handle or 'shipping',
                     'breakdown': [],
-                    'name': methods[0] if methods else 'SHIPPING',
-                    'server_price': server_price_amount,
-                    'server_price_currency': server_price_currency,
-                    'server_custom_rate': server_custom_rate,
+                    'name': server_strategy_code or (methods[0] if methods else 'SHIPPING'),
+                    'server_price': server_strategy_amount or server_total_amount,
+                    'server_price_currency': server_strategy_currency or server_total_currency,
+                    'server_custom_rate': False,
                 }
                 strategies.append(dl_strategy)
                 
-                # Build the server-confirmed delivery line in DeliveryLineInput format.
-                # NOTE: With __typename-only query, most fields will be empty/defaults.
-                # The submit step will use these as a base and fill in what's needed.
+                # ─── Build the server-confirmed delivery line in DeliveryLineInput format ───
+                # INPUT fields: deliveryMethodTypes, selectedDeliveryStrategy, targetMerchandiseLines,
+                #   destination, expectedTotalPrice, destinationChanged, shopId
                 server_dl = {
                     'deliveryMethodTypes': methods or ['SHIPPING'],
                     'selectedDeliveryStrategy': {
                         'deliveryStrategyByHandle': {
                             'handle': server_handle or 'shipping',
-                            'customDeliveryRate': server_custom_rate,
+                            'customDeliveryRate': False,
                         },
                     },
                 }
                 
-                # Build expectedTotalPrice
-                if server_price_obj:
-                    if _price_typename == 'AnyValueConstraint' or server_price_obj.get('any'):
-                        server_dl['expectedTotalPrice'] = {'any': True}
-                    elif server_price_amount and server_price_amount != '0':
-                        server_dl['expectedTotalPrice'] = {
-                            'value': {
-                                'amount': server_price_amount,
-                                'currencyCode': server_price_currency or 'USD',
-                            },
-                        }
-                    else:
-                        server_dl['expectedTotalPrice'] = {'any': True}
+                # Build expectedTotalPrice from totalAmount
+                if _total_typename == 'AnyConstraint' or (server_total_amount_obj and server_total_amount_obj.get('any')):
+                    server_dl['expectedTotalPrice'] = {'any': True}
+                elif server_total_amount and server_total_amount != '0':
+                    server_dl['expectedTotalPrice'] = {
+                        'value': {
+                            'amount': server_total_amount,
+                            'currencyCode': server_total_currency or 'USD',
+                        },
+                    }
                 else:
                     server_dl['expectedTotalPrice'] = {'any': True}
                 
-                # Build targetMerchandiseLines
-                if server_target_merch:
-                    if _target_typename == 'AnyMerchandiseLineTarget' or server_target_merch.get('any'):
-                        server_dl['targetMerchandiseLines'] = {'any': True}
-                    elif server_target_merch.get('lines'):
+                # Build targetMerchandiseLines from targetMerchandise
+                if _target_typename == 'AnyMerchandiseLineTargetCollection' or (server_target_merch and server_target_merch.get('any')):
+                    server_dl['targetMerchandiseLines'] = {'any': True}
+                elif _target_typename == 'FilledMerchandiseLineTargetCollection':
+                    # FilledMerchandiseLineTargetCollection has linesV2
+                    _lines_v2 = server_target_merch.get('linesV2', [])
+                    if _lines_v2:
                         server_dl['targetMerchandiseLines'] = {
-                            'lines': [{'stableId': l.get('stableId', '')} for l in server_target_merch['lines'] if l.get('stableId')]
+                            'lines': [{'stableId': l.get('stableId', '')} for l in _lines_v2 if l.get('stableId')]
                         }
                     else:
                         server_dl['targetMerchandiseLines'] = {'any': True}
                 else:
                     server_dl['targetMerchandiseLines'] = {'any': True}
                 
-                # Build destination — server may or may not include it
-                if server_dest and server_dest.get('streetAddress'):
-                    _sa = server_dest['streetAddress']
+                # Build destination from destinationAddress
+                if server_street1 or server_city:
                     server_dl['destination'] = {
                         'streetAddress': {
-                            'firstName': _sa.get('firstName', ''),
-                            'lastName': _sa.get('lastName', ''),
-                            'address1': _sa.get('address1', ''),
-                            'address2': _sa.get('address2', ''),
-                            'city': _sa.get('city', ''),
-                            'countryCode': _sa.get('countryCode', ''),
-                            'zoneCode': _sa.get('zoneCode', ''),
-                            'postalCode': _sa.get('postalCode', ''),
-                            'phone': _sa.get('phone', ''),
+                            'firstName': '',
+                            'lastName': '',
+                            'address1': server_street1,
+                            'address2': server_street2,
+                            'city': server_city,
+                            'countryCode': server_country,
+                            'zoneCode': server_zone,
+                            'postalCode': server_postal,
+                            'phone': '',
                         },
                     }
                 # NOTE: destination will be injected later in submit step if missing
@@ -884,8 +930,8 @@ def _parse_negotiate_response(resp_json):
                             'handle': server_handle or 'shipping',
                             'breakdown': [],
                             'name': m,
-                            'server_price': server_price_amount,
-                            'server_price_currency': server_price_currency,
+                            'server_price': server_strategy_amount or server_total_amount,
+                            'server_price_currency': server_strategy_currency or server_total_currency,
                         })
             
             result['shipping_strategies'] = strategies
@@ -2843,51 +2889,72 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                 for _rdl in _rej_delivery.get('deliveryLines', []):
                                     _rdl_entry = {
                                         'deliveryMethodTypes': _rdl.get('deliveryMethodTypes', ['SHIPPING']),
-                                        'selectedDeliveryStrategy': _rdl.get('selectedDeliveryStrategy', {}),
                                     }
-                                    # Convert expectedTotalPrice
-                                    _rep = _rdl.get('expectedTotalPrice', {})
-                                    if _rep:
-                                        if _rep.get('__typename') == 'AnyValueConstraint' or _rep.get('any'):
-                                            _rdl_entry['expectedTotalPrice'] = {'any': True}
-                                        else:
-                                            _amt, _cur = _extract_money(_rep)
-                                            if _amt and _amt != '0':
-                                                _rdl_entry['expectedTotalPrice'] = {'value': {'amount': _amt, 'currencyCode': _cur or 'USD'}}
-                                            else:
-                                                _rdl_entry['expectedTotalPrice'] = {'any': True}
-                                    else:
+                                    
+                                    # ─── selectedDeliveryStrategy (UNION response → INPUT conversion) ───
+                                    # Response types: CompleteDeliveryStrategy | CustomDeliveryStrategy |
+                                    #   DeliveryStrategyMatcher | DeliveryStrategyReference
+                                    # INPUT: deliveryStrategyByHandle: {handle, customDeliveryRate}
+                                    _rstrat = _rdl.get('selectedDeliveryStrategy', {})
+                                    _rstrat_type = _rstrat.get('__typename', '') if _rstrat else ''
+                                    _rhandle = ''
+                                    if _rstrat_type == 'CompleteDeliveryStrategy':
+                                        _rhandle = _rstrat.get('handle', '')
+                                    elif _rstrat_type == 'DeliveryStrategyReference':
+                                        _rhandle = _rstrat.get('handle', '')
+                                    _rdl_entry['selectedDeliveryStrategy'] = {
+                                        'deliveryStrategyByHandle': {
+                                            'handle': _rhandle or 'shipping',
+                                            'customDeliveryRate': False,
+                                        },
+                                    }
+                                    
+                                    # ─── totalAmount (MoneyConstraint response) → expectedTotalPrice (INPUT) ───
+                                    _rtotal = _rdl.get('totalAmount', {})
+                                    _rtotal_type = _rtotal.get('__typename', '') if _rtotal else ''
+                                    if _rtotal_type == 'AnyConstraint' or (_rtotal and _rtotal.get('any')):
                                         _rdl_entry['expectedTotalPrice'] = {'any': True}
-                                    # Convert targetMerchandiseLines
-                                    _rtm = _rdl.get('targetMerchandiseLines', {})
-                                    if _rtm:
-                                        if _rtm.get('__typename') == 'AnyMerchandiseLineTarget' or _rtm.get('any'):
-                                            _rdl_entry['targetMerchandiseLines'] = {'any': True}
-                                        elif _rtm.get('lines'):
+                                    else:
+                                        _amt, _cur = _extract_money(_rtotal)
+                                        if _amt and _amt != '0':
+                                            _rdl_entry['expectedTotalPrice'] = {'value': {'amount': _amt, 'currencyCode': _cur or 'USD'}}
+                                        else:
+                                            _rdl_entry['expectedTotalPrice'] = {'any': True}
+                                    
+                                    # ─── targetMerchandise (UNION response) → targetMerchandiseLines (INPUT) ───
+                                    _rtm = _rdl.get('targetMerchandise', {})
+                                    _rtm_type = _rtm.get('__typename', '') if _rtm else ''
+                                    if _rtm_type == 'AnyMerchandiseLineTargetCollection' or (_rtm and _rtm.get('any')):
+                                        _rdl_entry['targetMerchandiseLines'] = {'any': True}
+                                    elif _rtm_type == 'FilledMerchandiseLineTargetCollection':
+                                        _lines_v2 = _rtm.get('linesV2', [])
+                                        if _lines_v2:
                                             _rdl_entry['targetMerchandiseLines'] = {
-                                                'lines': [{'stableId': l.get('stableId', '')} for l in _rtm['lines'] if l.get('stableId')]
+                                                'lines': [{'stableId': l.get('stableId', '')} for l in _lines_v2 if l.get('stableId')]
                                             }
                                         else:
                                             _rdl_entry['targetMerchandiseLines'] = {'any': True}
                                     else:
                                         _rdl_entry['targetMerchandiseLines'] = {'any': True}
-                                    # Convert destination
-                                    _rdest = _rdl.get('destination', {})
-                                    if _rdest and _rdest.get('streetAddress'):
-                                        _rsa = _rdest['streetAddress']
+                                    
+                                    # ─── destinationAddress (UNION response) → destination (INPUT) ───
+                                    _rdest = _rdl.get('destinationAddress', {})
+                                    _rdest_type = _rdest.get('__typename', '') if _rdest else ''
+                                    if _rdest_type in ('StreetAddress', 'PartialStreetAddress'):
                                         _rdl_entry['destination'] = {
                                             'streetAddress': {
-                                                'firstName': _rsa.get('firstName', ''),
-                                                'lastName': _rsa.get('lastName', ''),
-                                                'address1': _rsa.get('address1', ''),
-                                                'address2': _rsa.get('address2', ''),
-                                                'city': _rsa.get('city', ''),
-                                                'countryCode': _rsa.get('countryCode', ''),
-                                                'zoneCode': _rsa.get('zoneCode', ''),
-                                                'postalCode': _rsa.get('postalCode', ''),
-                                                'phone': _rsa.get('phone', ''),
+                                                'firstName': '',
+                                                'lastName': '',
+                                                'address1': _rdest.get('address1', ''),
+                                                'address2': _rdest.get('address2', ''),
+                                                'city': _rdest.get('city', ''),
+                                                'countryCode': _rdest.get('countryCode', ''),
+                                                'zoneCode': _rdest.get('zoneCode', ''),
+                                                'postalCode': _rdest.get('postalCode', ''),
+                                                'phone': '',
                                             },
                                         }
+                                    
                                     _rejected_delivery_lines.append(_rdl_entry)
                                 print(f'[SUBMIT_REJECTED] Got {len(_rejected_delivery_lines)} delivery lines from sellerProposal', file=sys.stderr)
                             
