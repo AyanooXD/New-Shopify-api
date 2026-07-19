@@ -247,7 +247,7 @@ MUTATION_CART_CREATE = """mutation cartCreate($input:CartInput!){result:cartCrea
 #   - Added merchandise{__typename} inside merchandiseLines for debugging
 #   - Removed tax sub-fields (tax comes from sellerProposal.totalAmount or via TAX_NEW_TAX_MUST_BE_ACCEPTED)
 #   - Uses the exact format confirmed working on allbirds.com
-QUERY_PROPOSAL = """query Proposal($input:SessionNegotiationInput!){session{negotiate(input:$input){errors{code localizedMessage}result{__typename ...on NegotiationResultAvailable{queueToken sessionToken sellerProposal{__typename checkoutTotal{__typename ...on MoneyValueConstraint{value{amount currencyCode}}}isShippingRequired delivery{__typename ...on PendingTerms{pollDelay taskId}...on FilledDeliveryTerms{deliveryLines{__typename deliveryMethodTypes selectedDeliveryStrategy{__typename ...on DeliveryStrategyByHandle{handle customDeliveryRate}} expectedTotalPrice{__typename ...on MoneyValueConstraint{value{amount currencyCode}} ...on AnyValueConstraint{any}} destination{__typename ...on DeliveryDestination{streetAddress{firstName lastName address1 address2 city countryCode zoneCode postalCode phone}}} targetMerchandiseLines{__typename ...on AnyMerchandiseLineTarget{any} ...on SpecificMerchandiseLineTargets{lines{stableId}}}}}}merchandise{__typename ...on FilledMerchandiseTerms{merchandiseLines{stableId merchandise{__typename ...on SourceProvidedMerchandise{variantId price{amount currencyCode}title requiresShipping taxable giftCard}}}}}payment{__typename ...on FilledPaymentTerms{availablePaymentLines{paymentMethod{__typename ...on PaymentProvider{paymentMethodIdentifier name brands}}}}}}buyerProposal{__typename checkoutTotal{__typename ...on MoneyValueConstraint{value{amount currencyCode}}}}}...on NegotiationResultFailed{failureCode}...on SubmittedForCompletion{receipt{__typename ...on FailedReceipt{processingError{__typename}}}}...on CheckpointDenied{__typename}...on Throttled{__typename}}}}}"""
+QUERY_PROPOSAL = """query Proposal($input:SessionNegotiationInput!){session{negotiate(input:$input){errors{code localizedMessage}result{__typename ...on NegotiationResultAvailable{queueToken sessionToken sellerProposal{__typename checkoutTotal{__typename ...on MoneyValueConstraint{value{amount currencyCode}}}isShippingRequired delivery{__typename ...on PendingTerms{pollDelay taskId}...on FilledDeliveryTerms{deliveryLines{__typename deliveryMethodTypes selectedDeliveryStrategy{__typename} expectedTotalPrice{__typename} destination{__typename} targetMerchandiseLines{__typename}}}}merchandise{__typename ...on FilledMerchandiseTerms{merchandiseLines{stableId merchandise{__typename ...on SourceProvidedMerchandise{variantId price{amount currencyCode}title requiresShipping taxable giftCard}}}}}payment{__typename ...on FilledPaymentTerms{availablePaymentLines{paymentMethod{__typename ...on PaymentProvider{paymentMethodIdentifier name brands}}}}}}buyerProposal{__typename checkoutTotal{__typename ...on MoneyValueConstraint{value{amount currencyCode}}}}}...on NegotiationResultFailed{failureCode}...on SubmittedForCompletion{receipt{__typename ...on FailedReceipt{processingError{__typename}}}}...on CheckpointDenied{__typename}...on Throttled{__typename}}}}}"""
 
 # --- Checkout Web API: SubmitForCompletion ---
 # CRITICAL: submitForCompletion returns SubmitForCompletionResult UNION directly
@@ -264,7 +264,7 @@ MUTATION_SUBMIT = (
     "{...on SubmitSuccess{receipt{__typename ...on ProcessedReceipt{order{id}}...on FailedReceipt{__typename}...on ActionRequiredReceipt{__typename}}configurationRecordId}"
     "...on SubmittedForCompletion{receipt{__typename ...on ProcessedReceipt{order{id}}...on FailedReceipt{__typename}...on ActionRequiredReceipt{__typename}}configurationRecordId}"
     "...on SubmitFailed{reason}"
-    "...on SubmitRejected{errors{code localizedMessage}sellerProposal{__typename checkoutTotal{__typename ...on MoneyValueConstraint{value{amount currencyCode}}}delivery{__typename ...on FilledDeliveryTerms{deliveryLines{__typename deliveryMethodTypes selectedDeliveryStrategy{__typename ...on DeliveryStrategyByHandle{handle customDeliveryRate}} expectedTotalPrice{__typename ...on MoneyValueConstraint{value{amount currencyCode}} ...on AnyValueConstraint{any}} destination{__typename ...on DeliveryDestination{streetAddress{firstName lastName address1 address2 city countryCode zoneCode postalCode phone}}} targetMerchandiseLines{__typename ...on AnyMerchandiseLineTarget{any} ...on SpecificMerchandiseLineTargets{lines{stableId}}}}}}}}"
+    "...on SubmitRejected{errors{code localizedMessage}sellerProposal{__typename checkoutTotal{__typename ...on MoneyValueConstraint{value{amount currencyCode}}}delivery{__typename ...on FilledDeliveryTerms{deliveryLines{__typename deliveryMethodTypes selectedDeliveryStrategy{__typename} expectedTotalPrice{__typename} destination{__typename} targetMerchandiseLines{__typename}}}}}}"
     "...on CheckpointDenied{__typename}"
     "...on Throttled{__typename}"
     "...on TooManyAttempts{__typename}"
@@ -778,9 +778,6 @@ def _parse_negotiate_response(resp_json):
             delivery_lines = delivery_obj.get('deliveryLines', [])
             strategies = []
             # Store full server-confirmed delivery lines for DELIVERY_DELIVERY_LINE_DETAIL_CHANGED fix
-            # KEY FIX: We now build server_delivery_lines in the EXACT DeliveryLineInput format
-            # that the submit mutation expects. This means the structure must be IDENTICAL to
-            # what we send in the negotiate input — the server validates field-by-field.
             server_delivery_lines = []
             for dl in delivery_lines:
                 methods = dl.get('deliveryMethodTypes', [])
@@ -797,6 +794,14 @@ def _parse_negotiate_response(resp_json):
                 # Extract server-confirmed targetMerchandiseLines
                 server_target_merch = dl.get('targetMerchandiseLines', {})
                 
+                # LOG: Discover type names for future query expansion
+                _dl_typename = dl.get('__typename', '')
+                _strat_typename = sel_strategy.get('__typename', '') if sel_strategy else ''
+                _price_typename = server_price_obj.get('__typename', '') if server_price_obj else ''
+                _dest_typename = server_dest.get('__typename', '') if server_dest else ''
+                _target_typename = server_target_merch.get('__typename', '') if server_target_merch else ''
+                print(f'[DELIVERY_TYPES] DL={_dl_typename} Strategy={_strat_typename} Price={_price_typename} Dest={_dest_typename} Target={_target_typename}', file=sys.stderr)
+                
                 # Build a complete strategy entry with server-confirmed data
                 dl_strategy = {
                     'code': methods[0] if methods else 'SHIPPING',
@@ -809,9 +814,9 @@ def _parse_negotiate_response(resp_json):
                 }
                 strategies.append(dl_strategy)
                 
-                # Build the server-confirmed delivery line in EXACT DeliveryLineInput format.
-                # This is what we'll pass back in the submit step.
-                # The structure MUST match what NegotiationInput.delivery.deliveryLines expects.
+                # Build the server-confirmed delivery line in DeliveryLineInput format.
+                # NOTE: With __typename-only query, most fields will be empty/defaults.
+                # The submit step will use these as a base and fill in what's needed.
                 server_dl = {
                     'deliveryMethodTypes': methods or ['SHIPPING'],
                     'selectedDeliveryStrategy': {
@@ -822,11 +827,8 @@ def _parse_negotiate_response(resp_json):
                     },
                 }
                 
-                # Build expectedTotalPrice in the EXACT input format
-                # The server returns MoneyValueConstraint{value{amount currencyCode}} or AnyValueConstraint{any}
-                # We need to convert back to the input format: {value: {amount, currencyCode}} or {any: true}
+                # Build expectedTotalPrice
                 if server_price_obj:
-                    _price_typename = server_price_obj.get('__typename', '')
                     if _price_typename == 'AnyValueConstraint' or server_price_obj.get('any'):
                         server_dl['expectedTotalPrice'] = {'any': True}
                     elif server_price_amount and server_price_amount != '0':
@@ -841,12 +843,9 @@ def _parse_negotiate_response(resp_json):
                 else:
                     server_dl['expectedTotalPrice'] = {'any': True}
                 
-                # Build targetMerchandiseLines in the EXACT input format
-                # Server returns: {any: true} or {lines: [{stableId: "..."}]}
-                # Input expects same format
+                # Build targetMerchandiseLines
                 if server_target_merch:
-                    _tm_typename = server_target_merch.get('__typename', '')
-                    if _tm_typename == 'AnyMerchandiseLineTarget' or server_target_merch.get('any'):
+                    if _target_typename == 'AnyMerchandiseLineTarget' or server_target_merch.get('any'):
                         server_dl['targetMerchandiseLines'] = {'any': True}
                     elif server_target_merch.get('lines'):
                         server_dl['targetMerchandiseLines'] = {
@@ -858,7 +857,6 @@ def _parse_negotiate_response(resp_json):
                     server_dl['targetMerchandiseLines'] = {'any': True}
                 
                 # Build destination — server may or may not include it
-                # If server provides it, use it as-is. If not, it will be injected later.
                 if server_dest and server_dest.get('streetAddress'):
                     _sa = server_dest['streetAddress']
                     server_dl['destination'] = {
@@ -1708,6 +1706,9 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 return False, f"PROPOSAL_BLOCKED: HTTP {_status}", gateway, total_price, currency
 
             p1_text = p1_resp.text
+
+            # Debug: Log the FULL raw negotiate response to discover delivery type names
+            print(f'[PROPOSAL1_RAW] Response (first 2000): {p1_text[:2000]}', file=sys.stderr)
 
             if is_captcha_required(p1_text):
                 return False, "CAPTCHA_REQUIRED on proposal 1", gateway, total_price, currency
@@ -2717,7 +2718,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     return False, f"SUBMIT_BLOCKED: HTTP {_submit_status}", gateway, total_price, currency
 
                 submit_text = submit_resp.text
-                print(f'[SUBMIT] Raw response (first 500 chars): {submit_text[:500]}', file=sys.stderr)
+                print(f'[SUBMIT] Raw response (first 1500 chars): {submit_text[:1500]}', file=sys.stderr)
 
                 if is_captcha_required(submit_text):
                     return False, "CAPTCHA_REQUIRED on submit", gateway, total_price, currency
