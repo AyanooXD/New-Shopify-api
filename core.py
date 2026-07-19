@@ -726,7 +726,7 @@ def _parse_negotiate_response(resp_json):
         'gateway_type': None,
     }
     
-    data = resp_json.get('data', {})
+    data = resp_json.get('data') or {}
     session = data.get('session') if data else None
     negotiate = session.get('negotiate') if session else None
     
@@ -739,7 +739,7 @@ def _parse_negotiate_response(resp_json):
         result['errors'] = neg_errors
     
     # Extract result
-    neg_result = negotiate.get('result', {})
+    neg_result = negotiate.get('result') or {}
     result_type = neg_result.get('__typename', '')
     result['result_type'] = result_type
     
@@ -747,8 +747,8 @@ def _parse_negotiate_response(resp_json):
         result['queue_token'] = neg_result.get('queueToken')
         result['session_token'] = neg_result.get('sessionToken')
         
-        seller = neg_result.get('sellerProposal', {})
-        buyer = neg_result.get('buyerProposal', {})
+        seller = neg_result.get('sellerProposal') or {}
+        buyer = neg_result.get('buyerProposal') or {}
         result['seller_proposal'] = seller
         result['buyer_proposal'] = buyer
         
@@ -756,21 +756,21 @@ def _parse_negotiate_response(resp_json):
         result['is_shipping_required'] = seller.get('isShippingRequired', True)
         
         # Extract checkoutTotal from SELLER proposal
-        checkout_total_obj = seller.get('checkoutTotal', {})
+        checkout_total_obj = seller.get('checkoutTotal') or {}
         ct_amount, ct_currency = _extract_money(checkout_total_obj)
         if ct_amount and ct_amount != '0':
             result['checkout_total'] = ct_amount
             result['checkout_total_currency'] = ct_currency
         else:
             # Try buyer proposal checkoutTotal
-            buyer_ct = buyer.get('checkoutTotal', {})
+            buyer_ct = buyer.get('checkoutTotal') or {}
             bct_amount, bct_currency = _extract_money(buyer_ct)
             if bct_amount and bct_amount != '0':
                 result['checkout_total'] = bct_amount
                 result['checkout_total_currency'] = bct_currency
         
         # Extract delivery from sellerProposal.delivery (union)
-        delivery_obj = seller.get('delivery', {})
+        delivery_obj = seller.get('delivery') or {}
         delivery_typename = delivery_obj.get('__typename', '')
         
         if delivery_typename == 'FilledDeliveryTerms':
@@ -787,7 +787,7 @@ def _parse_negotiate_response(resp_json):
                 # Response types: CompleteDeliveryStrategy | CustomDeliveryStrategy |
                 #   DeliveryStrategyMatcher | DeliveryStrategyReference
                 # INPUT type: DeliveryStrategyInput with deliveryStrategyByHandle
-                sel_strategy = dl.get('selectedDeliveryStrategy', {})
+                sel_strategy = dl.get('selectedDeliveryStrategy') or {}
                 _strat_typename = sel_strategy.get('__typename', '') if sel_strategy else ''
                 print(f'[DELIVERY_TYPES] Strategy typename={_strat_typename}', file=sys.stderr)
                 
@@ -800,20 +800,20 @@ def _parse_negotiate_response(resp_json):
                 if _strat_typename == 'CompleteDeliveryStrategy':
                     server_handle = sel_strategy.get('handle', '')
                     server_strategy_code = sel_strategy.get('code', '')
-                    _amt_obj = sel_strategy.get('amount', {})
+                    _amt_obj = sel_strategy.get('amount') or {}
                     _amt_typename = _amt_obj.get('__typename', '') if _amt_obj else ''
                     if _amt_typename == 'MoneyValueConstraint':
-                        _v = _amt_obj.get('value', {})
+                        _v = _amt_obj.get('value') or {}
                         server_strategy_amount = _v.get('amount')
                         server_strategy_currency = _v.get('currencyCode')
                     elif _amt_typename == 'AnyConstraint':
                         pass  # any constraint — use {any:true}
                 elif _strat_typename == 'CustomDeliveryStrategy':
                     server_strategy_code = sel_strategy.get('code', '')
-                    _price_obj = sel_strategy.get('price', {})
+                    _price_obj = sel_strategy.get('price') or {}
                     _price_typename = _price_obj.get('__typename', '') if _price_obj else ''
                     if _price_typename == 'MoneyValueConstraint':
-                        _v = _price_obj.get('value', {})
+                        _v = _price_obj.get('value') or {}
                         server_strategy_amount = _v.get('amount')
                         server_strategy_currency = _v.get('currencyCode')
                 elif _strat_typename == 'DeliveryStrategyReference':
@@ -822,14 +822,14 @@ def _parse_negotiate_response(resp_json):
                 # ─── totalAmount (MoneyConstraint UNION) ───
                 # Response: AnyConstraint | MoneyValueConstraint | MoneyIntervalConstraint
                 # INPUT: expectedTotalPrice: MoneyConstraintInput
-                server_total_amount_obj = dl.get('totalAmount', {})
+                server_total_amount_obj = dl.get('totalAmount') or {}
                 server_total_amount, server_total_currency = _extract_money(server_total_amount_obj)
                 _total_typename = server_total_amount_obj.get('__typename', '') if server_total_amount_obj else ''
                 
                 # ─── destinationAddress (DeliveryAddress UNION) ───
                 # Response: StreetAddress | PartialStreetAddress | Geolocation | InvalidDeliveryAddress
                 # INPUT: destination: DeliveryAddressInput with streetAddress
-                server_dest_addr = dl.get('destinationAddress', {})
+                server_dest_addr = dl.get('destinationAddress') or {}
                 _dest_typename = server_dest_addr.get('__typename', '') if server_dest_addr else ''
                 
                 # Extract address fields from StreetAddress or PartialStreetAddress
@@ -843,7 +843,7 @@ def _parse_negotiate_response(resp_json):
                 # ─── targetMerchandise (MerchandiseLineTargetCollection UNION) ───
                 # Response: AnyMerchandiseLineTargetCollection | FilledMerchandiseLineTargetCollection
                 # INPUT: targetMerchandiseLines: MerchandiseLineTargetCollectionInput
-                server_target_merch = dl.get('targetMerchandise', {})
+                server_target_merch = dl.get('targetMerchandise') or {}
                 _target_typename = server_target_merch.get('__typename', '') if server_target_merch else ''
                 
                 print(f'[DELIVERY_LINE] stableId={dl_stable_id} handle={server_handle} code={server_strategy_code} '
@@ -943,13 +943,13 @@ def _parse_negotiate_response(resp_json):
             result['delivery_poll_delay'] = delivery_obj.get('pollDelay', 500)
         
         # Extract paymentMethodIdentifier from sellerProposal.payment
-        payment_obj = seller.get('payment', {})
+        payment_obj = seller.get('payment') or {}
         payment_typename = payment_obj.get('__typename', '')
         
         if payment_typename == 'FilledPaymentTerms':
             avail_lines = payment_obj.get('availablePaymentLines', [])
             for apl in avail_lines:
-                pm = apl.get('paymentMethod', {})
+                pm = apl.get('paymentMethod') or {}
                 pmi = pm.get('paymentMethodIdentifier', '')
                 pm_name = pm.get('name', '')
                 pm_typename = pm.get('__typename', '')
@@ -974,7 +974,7 @@ def _parse_negotiate_response(resp_json):
         # Extract stableIds from sellerProposal.merchandise
         # Also extract server-confirmed merchandise details (variantId, price, etc.)
         # so we can avoid MERCHANDISE_SIGNATURE_MISMATCH.
-        merch_obj = seller.get('merchandise', {})
+        merch_obj = seller.get('merchandise') or {}
         merch_typename = merch_obj.get('__typename', '')
         
         if merch_typename == 'FilledMerchandiseTerms':
@@ -986,7 +986,7 @@ def _parse_negotiate_response(resp_json):
             # This is the authoritative source of truth for variantId, price, title, etc.
             if merch_lines:
                 first_merch_line = merch_lines[0]
-                merch_detail = first_merch_line.get('merchandise', {})
+                merch_detail = first_merch_line.get('merchandise') or {}
                 merch_detail_typename = merch_detail.get('__typename', '')
                 
                 if merch_detail_typename == 'SourceProvidedMerchandise':
@@ -994,7 +994,7 @@ def _parse_negotiate_response(resp_json):
                     # Store the server-confirmed values for use in submit step.
                     result['seller_variant_id'] = merch_detail.get('variantId', '')
                     result['seller_product_id'] = merch_detail.get('productIdV2', '')
-                    _seller_price = merch_detail.get('price', {})
+                    _seller_price = merch_detail.get('price') or {}
                     if _seller_price:
                         result['seller_price'] = _seller_price.get('amount', '')
                         result['seller_currency'] = _seller_price.get('currencyCode', '')
@@ -1008,7 +1008,7 @@ def _parse_negotiate_response(resp_json):
                     # The server resolved to a ProductVariant reference.
                     # Extract the IDs — these are in base64 Storefront format.
                     _pv_id = merch_detail.get('id', '')
-                    _pv_product = merch_detail.get('product', {})
+                    _pv_product = merch_detail.get('product') or {}
                     _pv_product_id = _pv_product.get('id', '') if _pv_product else ''
                     
                     # Decode base64 Storefront IDs to gid:// format
@@ -1022,9 +1022,9 @@ def _parse_negotiate_response(resp_json):
                                 result[_key] = _raw
     
     elif result_type == 'SubmittedForCompletion':
-        receipt = neg_result.get('receipt', {})
+        receipt = neg_result.get('receipt') or {}
         if receipt and receipt.get('__typename') == 'FailedReceipt':
-            pe = receipt.get('processingError', {})
+            pe = receipt.get('processingError') or {}
             # processingError is a union, try to extract from dict
             result['errors'] = [{'code': pe.get('code', ''), 'localizedMessage': pe.get('localizedMessage', '')}]
     
@@ -1476,7 +1476,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     storefront_variant_gid = f'gid://shopify/ProductVariant/{product_id_for_cart}'
                     storefront_product_gid = f'gid://shopify/Product/{product_numeric_id}'
                     print(f'[STEP3] No cart lines, using constructed GIDs', file=sys.stderr)
-            except (json.JSONDecodeError, KeyError, TypeError) as e:
+            except (json.JSONDecodeError, KeyError, TypeError, AttributeError) as e:
                 preview = cart_create_resp.text[:300]
                 return False, f"CartCreate parse error: {str(e)}", gateway, total_price, currency
 
@@ -1659,7 +1659,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                             checkout_web_headers['x-checkout-one-session-token'] = x_checkout_one_session_token
                             checkout_web_headers['authorization'] = f'Bearer {x_checkout_one_session_token}'
                         print(f'[STEP5a] result_type={p_empty_parsed["result_type"]} queueToken={bool(p_empty_parsed["queue_token"])}', file=sys.stderr)
-                except (json.JSONDecodeError, KeyError, TypeError) as e:
+                except (json.JSONDecodeError, KeyError, TypeError, AttributeError) as e:
                     print(f'[STEP5a] Parse error: {e}', file=sys.stderr)
 
             await human_delay(step_name="proposal_empty")
@@ -1770,7 +1770,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     return False, f"PROPOSAL_JSON_ERROR: {'; '.join(_top_msgs)}", gateway, total_price, currency
 
                 p1_parsed = _parse_negotiate_response(p1_json)
-            except (json.JSONDecodeError, KeyError, TypeError) as e:
+            except (json.JSONDecodeError, KeyError, TypeError, AttributeError) as e:
                 return False, f"PROPOSAL_JSON_ERROR: {str(e)}", gateway, total_price, currency
 
             # Check for checkpoint/captcha in errors
@@ -1946,7 +1946,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         if dp_parsed.get('gateway_name') and gateway == 'UNKNOWN':
                             gateway = dp_parsed['gateway_name']
                         
-                    except (json.JSONDecodeError, KeyError, TypeError):
+                    except (json.JSONDecodeError, KeyError, TypeError, AttributeError):
                         pass
 
             if not delivery_resolved and requires_shipping:
@@ -2121,7 +2121,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                             if err.get('code') == 'CHECKPOINT_BLOCKED':
                                 return False, "CAPTCHA_BLOCK", gateway, total_price, currency
 
-                    except (json.JSONDecodeError, KeyError, TypeError) as e:
+                    except (json.JSONDecodeError, KeyError, TypeError, AttributeError) as e:
                         print(f'[TAX_ACCEPT] Parse error: {e}', file=sys.stderr)
 
                 await human_delay(step_name="tax_accept")
@@ -2313,8 +2313,8 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                 },
                             }
                         else:
-                            _dest = _pdl.get('destination', {})
-                            _sa = _dest.get('streetAddress', {})
+                            _dest = _pdl.get('destination') or {}
+                            _sa = _dest.get('streetAddress') or {}
                             if not _sa.get('firstName'): _sa['firstName'] = firstName
                             if not _sa.get('lastName'): _sa['lastName'] = lastName
                             if not _sa.get('address1'): _sa['address1'] = street
@@ -2494,7 +2494,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             try:
                 p2_json = json.loads(p2_text)
                 p2_parsed = _parse_negotiate_response(p2_json)
-            except (json.JSONDecodeError, KeyError, TypeError) as e:
+            except (json.JSONDecodeError, KeyError, TypeError, AttributeError) as e:
                 return False, f"PROPOSAL_JSON_ERROR: {str(e)}", gateway, total_price, currency
 
             # Update queue_token and session_token
@@ -2532,7 +2532,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 if receipt_obj:
                     receipt_id = receipt_obj.get('id')
                     if receipt_obj.get('__typename') == 'FailedReceipt':
-                        pe = receipt_obj.get('processingError', {})
+                        pe = receipt_obj.get('processingError') or {}
                         _ext = _extract_payment_error_response(pe)
                         return False, _ext or "CARD_DECLINED", gateway, total_price, currency
                 print(f'[PROPOSAL2] Already SubmittedForCompletion: receipt_id={receipt_id}', file=sys.stderr)
@@ -2632,8 +2632,8 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                 }
                             else:
                                 # Server provided a destination — verify it has required fields
-                                _dest = _sdl.get('destination', {})
-                                _sa = _dest.get('streetAddress', {})
+                                _dest = _sdl.get('destination') or {}
+                                _sa = _dest.get('streetAddress') or {}
                                 # Fill in any missing address fields from our buyer data
                                 if not _sa.get('firstName'):
                                     _sa['firstName'] = firstName
@@ -2661,9 +2661,9 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         _submit_price = None
                         if server_delivery_lines:
                             _submit_handle = _dget(server_delivery_lines[0], 'selectedDeliveryStrategy', 'deliveryStrategyByHandle', 'handle') or 'shipping'
-                            _ep = server_delivery_lines[0].get('expectedTotalPrice', {})
+                            _ep = server_delivery_lines[0].get('expectedTotalPrice') or {}
                             if _ep and 'value' in _ep:
-                                _submit_price = _ep.get('value', {}).get('amount', '')
+                                _submit_price = (_ep.get('value') or {}).get('amount', '')
                         print(f'[SUBMIT_DL] Using server delivery: handle={_submit_handle} server_price={_submit_price} lines={len(_submit_dl_list)}', file=sys.stderr)
                         # Debug: print the full delivery structure for comparison
                         for _di, _dline in enumerate(_submit_dl_list):
@@ -2826,11 +2826,11 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         print(f'[SUBMIT] Non-blocking warnings: {_warn_codes}', file=sys.stderr)
                     
                     if _submit_result_type in ('SubmitSuccess', 'SubmittedForCompletion'):
-                        _submit_receipt = _submit_result.get('receipt', {})
+                        _submit_receipt = _submit_result.get('receipt') or {}
                         if _submit_receipt:
                             receipt_id = _submit_receipt.get('id')
                             if _submit_receipt.get('__typename') == 'FailedReceipt':
-                                pe = _submit_receipt.get('processingError', {})
+                                pe = _submit_receipt.get('processingError') or {}
                                 _ext = _extract_payment_error_response(pe)
                                 return False, _ext or "CARD_DECLINED", gateway, total_price, currency
                         _submit_config_id = _submit_result.get('configurationRecordId')
@@ -2881,10 +2881,10 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         
                         # First, try to extract sellerProposal from SubmitRejected response
                         # This contains the EXACT delivery data the server wants
-                        _rejected_seller = _submit_result.get('sellerProposal', {}) if _submit_result else {}
+                        _rejected_seller = (_submit_result.get('sellerProposal') or {}) if _submit_result else {}
                         _rejected_delivery_lines = []
                         if _rejected_seller:
-                            _rej_delivery = _rejected_seller.get('delivery', {})
+                            _rej_delivery = _rejected_seller.get('delivery') or {}
                             if _rej_delivery.get('__typename') == 'FilledDeliveryTerms':
                                 for _rdl in _rej_delivery.get('deliveryLines', []):
                                     _rdl_entry = {
@@ -2895,7 +2895,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                     # Response types: CompleteDeliveryStrategy | CustomDeliveryStrategy |
                                     #   DeliveryStrategyMatcher | DeliveryStrategyReference
                                     # INPUT: deliveryStrategyByHandle: {handle, customDeliveryRate}
-                                    _rstrat = _rdl.get('selectedDeliveryStrategy', {})
+                                    _rstrat = _rdl.get('selectedDeliveryStrategy') or {}
                                     _rstrat_type = _rstrat.get('__typename', '') if _rstrat else ''
                                     _rhandle = ''
                                     if _rstrat_type == 'CompleteDeliveryStrategy':
@@ -2910,7 +2910,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                     }
                                     
                                     # ─── totalAmount (MoneyConstraint response) → expectedTotalPrice (INPUT) ───
-                                    _rtotal = _rdl.get('totalAmount', {})
+                                    _rtotal = _rdl.get('totalAmount') or {}
                                     _rtotal_type = _rtotal.get('__typename', '') if _rtotal else ''
                                     if _rtotal_type == 'AnyConstraint' or (_rtotal and _rtotal.get('any')):
                                         _rdl_entry['expectedTotalPrice'] = {'any': True}
@@ -2922,7 +2922,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                             _rdl_entry['expectedTotalPrice'] = {'any': True}
                                     
                                     # ─── targetMerchandise (UNION response) → targetMerchandiseLines (INPUT) ───
-                                    _rtm = _rdl.get('targetMerchandise', {})
+                                    _rtm = _rdl.get('targetMerchandise') or {}
                                     _rtm_type = _rtm.get('__typename', '') if _rtm else ''
                                     if _rtm_type == 'AnyMerchandiseLineTargetCollection' or (_rtm and _rtm.get('any')):
                                         _rdl_entry['targetMerchandiseLines'] = {'any': True}
@@ -2938,7 +2938,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                         _rdl_entry['targetMerchandiseLines'] = {'any': True}
                                     
                                     # ─── destinationAddress (UNION response) → destination (INPUT) ───
-                                    _rdest = _rdl.get('destinationAddress', {})
+                                    _rdest = _rdl.get('destinationAddress') or {}
                                     _rdest_type = _rdest.get('__typename', '') if _rdest else ''
                                     if _rdest_type in ('StreetAddress', 'PartialStreetAddress'):
                                         _rdl_entry['destination'] = {
@@ -2959,7 +2959,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                 print(f'[SUBMIT_REJECTED] Got {len(_rejected_delivery_lines)} delivery lines from sellerProposal', file=sys.stderr)
                             
                             # Also extract checkoutTotal from rejected sellerProposal
-                            _rej_ct = _rejected_seller.get('checkoutTotal', {})
+                            _rej_ct = _rejected_seller.get('checkoutTotal') or {}
                             if _rej_ct:
                                 _rej_amt, _rej_cur = _extract_money(_rej_ct)
                                 if _rej_amt and _rej_amt != '0':
@@ -3062,8 +3062,8 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                                 }
                                             else:
                                                 # Fill missing fields in existing destination
-                                                _dest = _fdl.get('destination', {})
-                                                _sa = _dest.get('streetAddress', {})
+                                                _dest = _fdl.get('destination') or {}
+                                                _sa = _dest.get('streetAddress') or {}
                                                 if not _sa.get('firstName'): _sa['firstName'] = firstName
                                                 if not _sa.get('lastName'): _sa['lastName'] = lastName
                                                 if not _sa.get('address1'): _sa['address1'] = street
@@ -3081,9 +3081,9 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                         _reneg_handle = _dget(_use_dl[0], 'selectedDeliveryStrategy', 'deliveryStrategyByHandle', 'handle') if _use_dl else 'shipping'
                                         _reneg_price = None
                                         if _use_dl:
-                                            _ep = _use_dl[0].get('expectedTotalPrice', {})
+                                            _ep = _use_dl[0].get('expectedTotalPrice') or {}
                                             if _ep and 'value' in _ep:
-                                                _reneg_price = _ep.get('value', {}).get('amount', '')
+                                                _reneg_price = (_ep.get('value') or {}).get('amount', '')
                                         print(f'[RENEG_DL] Server delivery: handle={_reneg_handle} price={_reneg_price}', file=sys.stderr)
                                     else:
                                         # Fallback: build from scratch (should rarely happen)
@@ -3160,7 +3160,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                     _new_submit_merch_lines = [_new_merch_line]
                                 submit_data['variables']['input']['merchandise'] = {'merchandiseLines': _new_submit_merch_lines}
                                 print(f'[RENEG] checkout_total={_reneg_parsed["checkout_total"]} errors={[e.get("code","") for e in _reneg_parsed["errors"][:3]]}', file=sys.stderr)
-                            except (json.JSONDecodeError, KeyError, TypeError) as e:
+                            except (json.JSONDecodeError, KeyError, TypeError, AttributeError) as e:
                                 print(f'[RENEG] Parse error: {e}', file=sys.stderr)
                         
                         await human_delay(min_sec=0.5, max_sec=1.5, step_name="renegotiate")
@@ -3190,17 +3190,17 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                             _refresh_session_token(_retry_resp)
                             try:
                                 _retry_json = json.loads(_retry_text)
-                                _retry_result = _retry_json.get("data", {}).get("submitForCompletion", {})
+                                _retry_result = (_retry_json.get("data") or {}).get("submitForCompletion") or {}
                                 _retry_type = _retry_result.get('__typename', '')
                                 
                                 print(f'[SUBMIT_RETRY] __typename={_retry_type}', file=sys.stderr)
                                 
                                 if _retry_type in ('SubmitSuccess', 'SubmittedForCompletion'):
-                                    _rr = _retry_result.get('receipt', {})
+                                    _rr = _retry_result.get('receipt') or {}
                                     if _rr:
                                         receipt_id = _rr.get('id')
                                         if _rr.get('__typename') == 'FailedReceipt':
-                                            pe = _rr.get('processingError', {})
+                                            pe = _rr.get('processingError') or {}
                                             _ext = _extract_payment_error_response(pe)
                                             return False, _ext or "CARD_DECLINED", gateway, total_price, currency
                                 elif _retry_type == 'SubmitFailed':
@@ -3215,19 +3215,19 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                     # Only non-blocking warnings — the submit may still have been
                                     # accepted. Try to extract receipt from the response.
                                     print(f'[SUBMIT_RETRY] Only non-blocking warnings — checking for receipt', file=sys.stderr)
-                                    _rej_receipt = _retry_result.get('receipt', {})
+                                    _rej_receipt = _retry_result.get('receipt') or {}
                                     if _rej_receipt:
                                         receipt_id = _rej_receipt.get('id')
                                         if _rej_receipt.get('__typename') == 'FailedReceipt':
-                                            pe = _rej_receipt.get('processingError', {})
+                                            pe = _rej_receipt.get('processingError') or {}
                                             _ext = _extract_payment_error_response(pe)
                                             return False, _ext or "CARD_DECLINED", gateway, total_price, currency
                                     # Also check SubmitRejected sellerProposal for delivery lines
                                     # to use in a third attempt if needed
                                     if not receipt_id:
-                                        _rej2_seller = _retry_result.get('sellerProposal', {})
+                                        _rej2_seller = _retry_result.get('sellerProposal') or {}
                                         if _rej2_seller:
-                                            _rej2_delivery = _rej2_seller.get('delivery', {})
+                                            _rej2_delivery = _rej2_seller.get('delivery') or {}
                                             if _rej2_delivery.get('__typename') == 'FilledDeliveryTerms':
                                                 print(f'[SUBMIT_RETRY] Got seller delivery from 2nd rejected — may need 3rd attempt', file=sys.stderr)
                                 elif not _retry_type:
@@ -3235,17 +3235,17 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                     _retry_errors = _retry_json.get('errors', [])
                                     _retry_sfc_errors = _retry_result.get('errors', []) if _retry_result else []
                                     _all_retry_errors = _retry_errors + _retry_sfc_errors
-                                    _blocking = [e for e in _all_retry_errors if e.get('extensions', {}).get('code', '') not in ('INVALID_VARIABLE',) or 'MERCHANDISE_SIGNATURE' not in str(e)]
+                                    _blocking = [e for e in _all_retry_errors if (e.get('extensions') or {}).get('code', '') not in ('INVALID_VARIABLE',) or 'MERCHANDISE_SIGNATURE' not in str(e)]
                                     if _blocking:
                                         _blk_msgs = [e.get('message', str(e))[:80] for e in _blocking[:3]]
                                         return False, f"SUBMIT_REJECTED: {'; '.join(_blk_msgs)}", gateway, total_price, currency
-                            except (json.JSONDecodeError, KeyError, TypeError) as e:
+                            except (json.JSONDecodeError, KeyError, TypeError, AttributeError) as e:
                                 print(f'[SUBMIT_RETRY] Parse error: {e}', file=sys.stderr)
                         
                         if not receipt_id:
                             return False, "RECEIPT_EMPTY", gateway, total_price, currency
 
-                except (json.JSONDecodeError, KeyError, TypeError) as e:
+                except (json.JSONDecodeError, KeyError, TypeError, AttributeError) as e:
                     return False, f"SUBMIT_JSON_ERROR: {str(e)}", gateway, total_price, currency
 
             print(f'[STEP11] receipt_id={receipt_id} total_price={total_price}', file=sys.stderr)
@@ -3313,9 +3313,9 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 gateway = 'shopify_payments'
             
             # Extract gatewayCode from processingError (most reliable for declined cards)
-            _receipt = res_json.get('data', {}).get('receipt', {})
+            _receipt = (res_json.get('data') or {}).get('receipt') or {}
             _receipt_type = _receipt.get('__typename', '') if _receipt else ''
-            _pe = _receipt.get('processingError', {}) if _receipt else {}
+            _pe = (_receipt.get('processingError') or {}) if _receipt else {}
             if _pe:
                 _gw_code = _pe.get('gatewayCode', '')
                 if _gw_code:
@@ -3342,12 +3342,12 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
 
             # Extract receipt processing error (reuse _receipt, _receipt_type, _pe from above)
             if not _receipt:
-                _receipt = res_json.get('data', {}).get('receipt', {})
+                _receipt = (res_json.get('data') or {}).get('receipt') or {}
                 _receipt_type = _receipt.get('__typename', '') if _receipt else ''
-                _pe = _receipt.get('processingError', {}) if _receipt else {}
+                _pe = (_receipt.get('processingError') or {}) if _receipt else {}
 
             if _receipt_type == 'FailedReceipt':
-                _pe = _receipt.get('processingError', {})
+                _pe = _receipt.get('processingError') or {}
                 if _pe:
                     _ext = _extract_payment_error_response(_pe)
                     _offsite = bool(_pe.get('hasOffsiteRedirect') or _pe.get('hasOffsitePaymentMethod'))
@@ -3359,7 +3359,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             # Check specific error codes
             result_code = ''
             if _receipt:
-                _pe = _receipt.get('processingError', {})
+                _pe = _receipt.get('processingError') or {}
                 result_code = _pe.get('code', '') if _pe else ''
 
             _KNOWN_POLL_CODES = {
@@ -3374,7 +3374,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             if result_code in _KNOWN_POLL_CODES:
                 _mapped = _KNOWN_POLL_CODES[result_code]
                 if result_code == 'GENERIC_ERROR':
-                    _poll_error = _receipt.get('processingError', {})
+                    _poll_error = _receipt.get('processingError') or {}
                     _poll_ext = _extract_payment_error_response(_poll_error)
                     if _poll_ext and _poll_ext != 'GENERIC_ERROR':
                         return False, _poll_ext, gateway, total_price, currency
@@ -3403,7 +3403,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
 
             # Deep extraction fallback
             if _receipt:
-                _pe = _receipt.get('processingError', {})
+                _pe = _receipt.get('processingError') or {}
                 if _pe:
                     _ext = _extract_payment_error_response(_pe)
                     if _ext and _ext != 'UNKNOWN_PAYMENT_ERROR':
