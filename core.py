@@ -247,7 +247,7 @@ MUTATION_CART_CREATE = """mutation cartCreate($input:CartInput!){result:cartCrea
 #   - Added merchandise{__typename} inside merchandiseLines for debugging
 #   - Removed tax sub-fields (tax comes from sellerProposal.totalAmount or via TAX_NEW_TAX_MUST_BE_ACCEPTED)
 #   - Uses the exact format confirmed working on allbirds.com
-QUERY_PROPOSAL = """query Proposal($input:SessionNegotiationInput!){session{negotiate(input:$input){errors{code localizedMessage}result{__typename ...on NegotiationResultAvailable{queueToken sessionToken sellerProposal{__typename checkoutTotal{__typename ...on MoneyValueConstraint{value{amount currencyCode}}}isShippingRequired delivery{__typename ...on PendingTerms{pollDelay taskId}...on FilledDeliveryTerms{deliveryLines{__typename deliveryMethodTypes}}}merchandise{__typename ...on FilledMerchandiseTerms{merchandiseLines{stableId merchandise{__typename ...on SourceProvidedMerchandise{variantId price{amount currencyCode}title requiresShipping taxable giftCard}}}}}payment{__typename ...on FilledPaymentTerms{availablePaymentLines{paymentMethod{__typename ...on PaymentProvider{paymentMethodIdentifier name brands}}}}}}buyerProposal{__typename checkoutTotal{__typename ...on MoneyValueConstraint{value{amount currencyCode}}}}}...on NegotiationResultFailed{failureCode}...on SubmittedForCompletion{receipt{__typename ...on FailedReceipt{processingError{__typename}}}}...on CheckpointDenied{__typename}...on Throttled{__typename}}}}}"""
+QUERY_PROPOSAL = """query Proposal($input:SessionNegotiationInput!){session{negotiate(input:$input){errors{code localizedMessage}result{__typename ...on NegotiationResultAvailable{queueToken sessionToken sellerProposal{__typename checkoutTotal{__typename ...on MoneyValueConstraint{value{amount currencyCode}}}isShippingRequired delivery{__typename ...on PendingTerms{pollDelay taskId}...on FilledDeliveryTerms{deliveryLines{__typename deliveryMethodTypes selectedDeliveryStrategy{__typename ...on DeliveryStrategyByHandle{handle customDeliveryRate}} expectedTotalPrice{__typename ...on MoneyValueConstraint{value{amount currencyCode}} ...on AnyValueConstraint{any}} destination{__typename ...on DeliveryDestination{streetAddress{firstName lastName address1 address2 city countryCode zoneCode postalCode phone}}} targetMerchandiseLines{__typename ...on AnyMerchandiseLineTarget{any} ...on SpecificMerchandiseLineTargets{lines{stableId}}}}}}merchandise{__typename ...on FilledMerchandiseTerms{merchandiseLines{stableId merchandise{__typename ...on SourceProvidedMerchandise{variantId price{amount currencyCode}title requiresShipping taxable giftCard}}}}}payment{__typename ...on FilledPaymentTerms{availablePaymentLines{paymentMethod{__typename ...on PaymentProvider{paymentMethodIdentifier name brands}}}}}}buyerProposal{__typename checkoutTotal{__typename ...on MoneyValueConstraint{value{amount currencyCode}}}}}...on NegotiationResultFailed{failureCode}...on SubmittedForCompletion{receipt{__typename ...on FailedReceipt{processingError{__typename}}}}...on CheckpointDenied{__typename}...on Throttled{__typename}}}}}"""
 
 # --- Checkout Web API: SubmitForCompletion ---
 # CRITICAL: submitForCompletion returns SubmitForCompletionResult UNION directly
@@ -264,7 +264,7 @@ MUTATION_SUBMIT = (
     "{...on SubmitSuccess{receipt{__typename ...on ProcessedReceipt{order{id}}...on FailedReceipt{__typename}...on ActionRequiredReceipt{__typename}}configurationRecordId}"
     "...on SubmittedForCompletion{receipt{__typename ...on ProcessedReceipt{order{id}}...on FailedReceipt{__typename}...on ActionRequiredReceipt{__typename}}configurationRecordId}"
     "...on SubmitFailed{reason}"
-    "...on SubmitRejected{errors{code localizedMessage}}"
+    "...on SubmitRejected{errors{code localizedMessage}sellerProposal{__typename checkoutTotal{__typename ...on MoneyValueConstraint{value{amount currencyCode}}}delivery{__typename ...on FilledDeliveryTerms{deliveryLines{__typename deliveryMethodTypes selectedDeliveryStrategy{__typename ...on DeliveryStrategyByHandle{handle customDeliveryRate}} expectedTotalPrice{__typename ...on MoneyValueConstraint{value{amount currencyCode}} ...on AnyValueConstraint{any}} destination{__typename ...on DeliveryDestination{streetAddress{firstName lastName address1 address2 city countryCode zoneCode postalCode phone}}} targetMerchandiseLines{__typename ...on AnyMerchandiseLineTarget{any} ...on SpecificMerchandiseLineTargets{lines{stableId}}}}}}}}"
     "...on CheckpointDenied{__typename}"
     "...on Throttled{__typename}"
     "...on TooManyAttempts{__typename}"
@@ -778,6 +778,9 @@ def _parse_negotiate_response(resp_json):
             delivery_lines = delivery_obj.get('deliveryLines', [])
             strategies = []
             # Store full server-confirmed delivery lines for DELIVERY_DELIVERY_LINE_DETAIL_CHANGED fix
+            # KEY FIX: We now build server_delivery_lines in the EXACT DeliveryLineInput format
+            # that the submit mutation expects. This means the structure must be IDENTICAL to
+            # what we send in the negotiate input — the server validates field-by-field.
             server_delivery_lines = []
             for dl in delivery_lines:
                 methods = dl.get('deliveryMethodTypes', [])
@@ -789,9 +792,10 @@ def _parse_negotiate_response(resp_json):
                 # Extract server-confirmed expectedTotalPrice
                 server_price_obj = dl.get('expectedTotalPrice', {})
                 server_price_amount, server_price_currency = _extract_money(server_price_obj)
-                # Extract server-confirmed destination (may be absent — server doesn't
-                # always echo back the buyer's address in FilledDeliveryTerms)
+                # Extract server-confirmed destination
                 server_dest = dl.get('destination', {})
+                # Extract server-confirmed targetMerchandiseLines
+                server_target_merch = dl.get('targetMerchandiseLines', {})
                 
                 # Build a complete strategy entry with server-confirmed data
                 dl_strategy = {
@@ -805,12 +809,9 @@ def _parse_negotiate_response(resp_json):
                 }
                 strategies.append(dl_strategy)
                 
-                # Store the full server-confirmed delivery line for reuse in submit.
-                # IMPORTANT: The server's FilledDeliveryTerms may NOT include the
-                # destination address (it only confirms the strategy and price).
-                # The destination MUST be provided by us — it's a required input.
-                # We store the server-confirmed parts (strategy, price) and will
-                # inject the buyer's destination address when building the submit input.
+                # Build the server-confirmed delivery line in EXACT DeliveryLineInput format.
+                # This is what we'll pass back in the submit step.
+                # The structure MUST match what NegotiationInput.delivery.deliveryLines expects.
                 server_dl = {
                     'deliveryMethodTypes': methods or ['SHIPPING'],
                     'selectedDeliveryStrategy': {
@@ -819,13 +820,62 @@ def _parse_negotiate_response(resp_json):
                             'customDeliveryRate': server_custom_rate,
                         },
                     },
-                    'expectedTotalPrice': server_price_obj if server_price_obj else {'any': True},
-                    'targetMerchandiseLines': dl.get('targetMerchandiseLines', {'any': True}),
                 }
-                # Only include destination from server if it has actual address data
+                
+                # Build expectedTotalPrice in the EXACT input format
+                # The server returns MoneyValueConstraint{value{amount currencyCode}} or AnyValueConstraint{any}
+                # We need to convert back to the input format: {value: {amount, currencyCode}} or {any: true}
+                if server_price_obj:
+                    _price_typename = server_price_obj.get('__typename', '')
+                    if _price_typename == 'AnyValueConstraint' or server_price_obj.get('any'):
+                        server_dl['expectedTotalPrice'] = {'any': True}
+                    elif server_price_amount and server_price_amount != '0':
+                        server_dl['expectedTotalPrice'] = {
+                            'value': {
+                                'amount': server_price_amount,
+                                'currencyCode': server_price_currency or 'USD',
+                            },
+                        }
+                    else:
+                        server_dl['expectedTotalPrice'] = {'any': True}
+                else:
+                    server_dl['expectedTotalPrice'] = {'any': True}
+                
+                # Build targetMerchandiseLines in the EXACT input format
+                # Server returns: {any: true} or {lines: [{stableId: "..."}]}
+                # Input expects same format
+                if server_target_merch:
+                    _tm_typename = server_target_merch.get('__typename', '')
+                    if _tm_typename == 'AnyMerchandiseLineTarget' or server_target_merch.get('any'):
+                        server_dl['targetMerchandiseLines'] = {'any': True}
+                    elif server_target_merch.get('lines'):
+                        server_dl['targetMerchandiseLines'] = {
+                            'lines': [{'stableId': l.get('stableId', '')} for l in server_target_merch['lines'] if l.get('stableId')]
+                        }
+                    else:
+                        server_dl['targetMerchandiseLines'] = {'any': True}
+                else:
+                    server_dl['targetMerchandiseLines'] = {'any': True}
+                
+                # Build destination — server may or may not include it
+                # If server provides it, use it as-is. If not, it will be injected later.
                 if server_dest and server_dest.get('streetAddress'):
-                    server_dl['destination'] = server_dest
+                    _sa = server_dest['streetAddress']
+                    server_dl['destination'] = {
+                        'streetAddress': {
+                            'firstName': _sa.get('firstName', ''),
+                            'lastName': _sa.get('lastName', ''),
+                            'address1': _sa.get('address1', ''),
+                            'address2': _sa.get('address2', ''),
+                            'city': _sa.get('city', ''),
+                            'countryCode': _sa.get('countryCode', ''),
+                            'zoneCode': _sa.get('zoneCode', ''),
+                            'postalCode': _sa.get('postalCode', ''),
+                            'phone': _sa.get('phone', ''),
+                        },
+                    }
                 # NOTE: destination will be injected later in submit step if missing
+                
                 server_delivery_lines.append(server_dl)
                 
                 # If we have deliveryMethodTypes, create strategy entries (legacy compat)
@@ -1687,6 +1737,12 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 print(f'[PROPOSAL1] negotiate warnings: {warn_codes}', file=sys.stderr)
 
             print(f'[PROPOSAL1] result_type={p1_parsed["result_type"]} delivery_resolved={p1_parsed["delivery_resolved"]} checkoutTotal={p1_parsed["checkout_total"]}', file=sys.stderr)
+            # Debug: print server_delivery_lines to verify they have full data
+            if p1_parsed.get('server_delivery_lines'):
+                for _sdi, _sdl in enumerate(p1_parsed['server_delivery_lines']):
+                    print(f'[PROPOSAL1] server_dl[{_sdi}]: {json.dumps(_sdl, default=str)[:500]}', file=sys.stderr)
+            else:
+                print(f'[PROPOSAL1] WARNING: no server_delivery_lines from negotiate response!', file=sys.stderr)
 
             # Update queue_token and session_token from response
             if p1_parsed['queue_token']:
@@ -1871,24 +1927,51 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 if handle_strategies:
                     best = handle_strategies[0]
                     selected_handle = best['handle']
-                # Rebuild delivery line with the selected handle and updated info
-                delivery_line = _build_delivery_line(
-                    currency=currency,
-                    first_name=firstName,
-                    last_name=lastName,
-                    street=street,
-                    city=city,
-                    country_code=country_code,
-                    zone_code=state,
-                    postal_code=s_zip,
-                    phone=phone,
-                    shipping_handle=selected_handle,
-                    shipping_amount=None,  # Use {any: true} — shipping cost included in checkoutTotal
-                )
-                delivery_terms = _build_delivery_terms(
-                    delivery_lines=[delivery_line],
-                    no_delivery_required=[],
-                )
+                # KEY FIX v3: Use server_delivery_lines directly instead of rebuilding
+                # from scratch. The server's FilledDeliveryTerms already has the exact
+                # structure and values we need.
+                if server_delivery_lines:
+                    _sdl_list = []
+                    for _sdl in server_delivery_lines:
+                        _sdl_copy = dict(_sdl)
+                        if 'destination' not in _sdl_copy or not _sdl_copy.get('destination'):
+                            _sdl_copy['destination'] = {
+                                'streetAddress': {
+                                    'firstName': firstName,
+                                    'lastName': lastName,
+                                    'address1': street,
+                                    'address2': '',
+                                    'city': city,
+                                    'countryCode': country_code,
+                                    'zoneCode': state,
+                                    'postalCode': s_zip,
+                                    'phone': phone,
+                                },
+                            }
+                        _sdl_list.append(_sdl_copy)
+                    delivery_terms = _build_delivery_terms(
+                        delivery_lines=_sdl_list,
+                        no_delivery_required=[],
+                    )
+                else:
+                    # Fallback: rebuild delivery line with the selected handle
+                    delivery_line = _build_delivery_line(
+                        currency=currency,
+                        first_name=firstName,
+                        last_name=lastName,
+                        street=street,
+                        city=city,
+                        country_code=country_code,
+                        zone_code=state,
+                        postal_code=s_zip,
+                        phone=phone,
+                        shipping_handle=selected_handle,
+                        shipping_amount=None,  # Use {any: true} — shipping cost included in checkoutTotal
+                    )
+                    delivery_terms = _build_delivery_terms(
+                        delivery_lines=[delivery_line],
+                        no_delivery_required=[],
+                    )
 
             print(f'[SHIPPING] handle={selected_handle} is_shipping_required={is_shipping_required}', file=sys.stderr)
 
@@ -2155,29 +2238,73 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             else:
                 payment_merch_lines = [merch_line]
 
-            # Also rebuild delivery with stableId references for targetMerchandiseLines
+            # Also rebuild delivery for PROPOSAL2 using server_delivery_lines if available.
+            # KEY FIX v3: Previously we rebuilt delivery from scratch using _build_delivery_line()
+            # with shipping_amount=None ({any: true}), which caused DELIVERY_DELIVERY_LINE_DETAIL_CHANGED
+            # warnings in the negotiate step itself. Now we use the server's confirmed delivery
+            # data directly, which eliminates the mismatch.
             payment_delivery_terms = delivery_terms
             if is_shipping_required and stable_ids:
-                _pay_dl = _build_delivery_line(
-                    currency=currency,
-                    first_name=firstName,
-                    last_name=lastName,
-                    street=street,
-                    city=city,
-                    country_code=country_code,
-                    zone_code=state,
-                    postal_code=s_zip,
-                    phone=phone,
-                    shipping_handle=selected_handle,
-                    shipping_amount=None,
-                )
-                _pay_dl['targetMerchandiseLines'] = {
-                    'lines': [{'stableId': sid} for sid in stable_ids]
-                }
-                payment_delivery_terms = _build_delivery_terms(
-                    delivery_lines=[_pay_dl],
-                    no_delivery_required=[],
-                )
+                if server_delivery_lines:
+                    # Use server-confirmed delivery lines directly
+                    _pay_dl_list = []
+                    for _sdl in server_delivery_lines:
+                        _pdl = dict(_sdl)
+                        # Ensure destination is present
+                        if 'destination' not in _pdl or not _pdl.get('destination'):
+                            _pdl['destination'] = {
+                                'streetAddress': {
+                                    'firstName': firstName,
+                                    'lastName': lastName,
+                                    'address1': street,
+                                    'address2': '',
+                                    'city': city,
+                                    'countryCode': country_code,
+                                    'zoneCode': state,
+                                    'postalCode': s_zip,
+                                    'phone': phone,
+                                },
+                            }
+                        else:
+                            _dest = _pdl.get('destination', {})
+                            _sa = _dest.get('streetAddress', {})
+                            if not _sa.get('firstName'): _sa['firstName'] = firstName
+                            if not _sa.get('lastName'): _sa['lastName'] = lastName
+                            if not _sa.get('address1'): _sa['address1'] = street
+                            if not _sa.get('city'): _sa['city'] = city
+                            if not _sa.get('countryCode'): _sa['countryCode'] = country_code
+                            if not _sa.get('zoneCode'): _sa['zoneCode'] = state
+                            if not _sa.get('postalCode'): _sa['postalCode'] = s_zip
+                            if not _sa.get('phone'): _sa['phone'] = phone
+                            _pdl['destination'] = {'streetAddress': _sa}
+                        _pay_dl_list.append(_pdl)
+                    payment_delivery_terms = _build_delivery_terms(
+                        delivery_lines=_pay_dl_list,
+                        no_delivery_required=[],
+                    )
+                    print(f'[PROPOSAL2_DL] Using server delivery: {len(_pay_dl_list)} lines', file=sys.stderr)
+                else:
+                    # Fallback: build from scratch
+                    _pay_dl = _build_delivery_line(
+                        currency=currency,
+                        first_name=firstName,
+                        last_name=lastName,
+                        street=street,
+                        city=city,
+                        country_code=country_code,
+                        zone_code=state,
+                        postal_code=s_zip,
+                        phone=phone,
+                        shipping_handle=selected_handle,
+                        shipping_amount=None,
+                    )
+                    _pay_dl['targetMerchandiseLines'] = {
+                        'lines': [{'stableId': sid} for sid in stable_ids]
+                    }
+                    payment_delivery_terms = _build_delivery_terms(
+                        delivery_lines=[_pay_dl],
+                        no_delivery_required=[],
+                    )
 
             payment_proposal_input = {
                 'purchaseProposal': {
@@ -2418,73 +2545,117 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 pp = payment_proposal_input.get('purchaseProposal', payment_proposal_input)
 
                 # Build delivery for submit step.
-                # KEY FIX for DELIVERY_DELIVERY_LINE_DETAIL_CHANGED:
-                # The submit step requires an EXACT expectedTotalPrice, NOT {any: true}.
-                # {any: true} works in the negotiate step but causes
-                # DELIVERY_DELIVERY_LINE_DETAIL_CHANGED in submit because
-                # the server validates that our price matches its calculation.
+                # KEY FIX for DELIVERY_DELIVERY_LINE_DETAIL_CHANGED v3:
+                # The previous approach rebuilt delivery from scratch using _build_delivery_line(),
+                # which created a structure that differed from what the server confirmed.
+                # The server validates our delivery line fields EXACTLY against its
+                # FilledDeliveryTerms — any mismatch in structure, field names, or values
+                # triggers DELIVERY_DELIVERY_LINE_DETAIL_CHANGED.
                 #
-                # Strategy:
-                # 1. Use the server-confirmed delivery strategy handle
-                # 2. Calculate exact shipping price: checkout_total - merchandise_price
-                # 3. Build a fresh delivery line with the exact price
-                # 4. Always include destination address
+                # NEW STRATEGY: Use the server-confirmed delivery lines (server_delivery_lines)
+                # DIRECTLY. These come from the FilledDeliveryTerms in the negotiate response
+                # and are already in the exact DeliveryLineInput format the server expects.
+                # We only need to:
+                # 1. Inject the destination address if the server didn't provide one
+                # 2. Use the server's exact expectedTotalPrice (not a calculated one)
+                # 3. Use the server's exact targetMerchandiseLines
                 submit_delivery = pp.get('delivery')
                 if is_shipping_required and stable_ids:
-                    # Calculate exact shipping amount from checkout_total
-                    _exact_ship_amount = None
-                    if total_price and total_price != '0':
-                        try:
-                            _total_f = float(total_price)
-                            _price_f = float(price) if price else 0
-                            _ship_est = max(0, _total_f - _price_f)
-                            if _ship_est > 0:
-                                _exact_ship_amount = f'{_ship_est:.2f}'
-                        except (ValueError, TypeError):
-                            pass
-                    
-                    # Also try to get exact price from server-confirmed strategies
-                    if server_delivery_lines and not _exact_ship_amount:
-                        for sdl in server_delivery_lines:
-                            _srv_price = sdl.get('expectedTotalPrice', {})
-                            if _srv_price and 'value' in _srv_price:
-                                _srv_amt = _srv_price.get('value', {}).get('amount', '')
-                                if _srv_amt and _srv_amt != '0':
-                                    _exact_ship_amount = _srv_amt
-                                    break
-                    
-                    # Get server-confirmed strategy handle
-                    _submit_handle = selected_handle
                     if server_delivery_lines:
+                        # Use server-confirmed delivery lines directly — this is the
+                        # authoritative source of truth. The server confirmed these exact
+                        # values in FilledDeliveryTerms, so they MUST match.
+                        _submit_dl_list = []
                         for sdl in server_delivery_lines:
-                            _by_handle = _dget(sdl, 'selectedDeliveryStrategy', 'deliveryStrategyByHandle', 'handle')
-                            if _by_handle:
-                                _submit_handle = _by_handle
-                                break
-                    
-                    # Build fresh delivery line with EXACT price for submit
-                    submit_delivery_line = _build_delivery_line(
-                        currency=currency,
-                        first_name=firstName,
-                        last_name=lastName,
-                        street=street,
-                        city=city,
-                        country_code=country_code,
-                        zone_code=state,
-                        postal_code=s_zip,
-                        phone=phone,
-                        shipping_handle=_submit_handle,
-                        shipping_amount=_exact_ship_amount,
-                    )
-                    # Use stableId references for target merchandise lines
-                    submit_delivery_line['targetMerchandiseLines'] = {
-                        'lines': [{'stableId': sid} for sid in stable_ids]
-                    }
-                    submit_delivery = _build_delivery_terms(
-                        delivery_lines=[submit_delivery_line],
-                        no_delivery_required=[],
-                    )
-                    print(f'[SUBMIT_DL] Built delivery: handle={_submit_handle} exact_price={_exact_ship_amount} any_price={_exact_ship_amount is None}', file=sys.stderr)
+                            _sdl = dict(sdl)  # shallow copy
+                            # Inject destination address if server didn't provide one
+                            if 'destination' not in _sdl or not _sdl.get('destination'):
+                                _sdl['destination'] = {
+                                    'streetAddress': {
+                                        'firstName': firstName,
+                                        'lastName': lastName,
+                                        'address1': street,
+                                        'address2': '',
+                                        'city': city,
+                                        'countryCode': country_code,
+                                        'zoneCode': state,
+                                        'postalCode': s_zip,
+                                        'phone': phone,
+                                    },
+                                }
+                            else:
+                                # Server provided a destination — verify it has required fields
+                                _dest = _sdl.get('destination', {})
+                                _sa = _dest.get('streetAddress', {})
+                                # Fill in any missing address fields from our buyer data
+                                if not _sa.get('firstName'):
+                                    _sa['firstName'] = firstName
+                                if not _sa.get('lastName'):
+                                    _sa['lastName'] = lastName
+                                if not _sa.get('address1'):
+                                    _sa['address1'] = street
+                                if not _sa.get('city'):
+                                    _sa['city'] = city
+                                if not _sa.get('countryCode'):
+                                    _sa['countryCode'] = country_code
+                                if not _sa.get('zoneCode'):
+                                    _sa['zoneCode'] = state
+                                if not _sa.get('postalCode'):
+                                    _sa['postalCode'] = s_zip
+                                if not _sa.get('phone'):
+                                    _sa['phone'] = phone
+                                _sdl['destination'] = {'streetAddress': _sa}
+                            _submit_dl_list.append(_sdl)
+                        submit_delivery = _build_delivery_terms(
+                            delivery_lines=_submit_dl_list,
+                            no_delivery_required=[],
+                        )
+                        _submit_handle = 'shipping'
+                        _submit_price = None
+                        if server_delivery_lines:
+                            _submit_handle = _dget(server_delivery_lines[0], 'selectedDeliveryStrategy', 'deliveryStrategyByHandle', 'handle') or 'shipping'
+                            _ep = server_delivery_lines[0].get('expectedTotalPrice', {})
+                            if _ep and 'value' in _ep:
+                                _submit_price = _ep.get('value', {}).get('amount', '')
+                        print(f'[SUBMIT_DL] Using server delivery: handle={_submit_handle} server_price={_submit_price} lines={len(_submit_dl_list)}', file=sys.stderr)
+                        # Debug: print the full delivery structure for comparison
+                        for _di, _dline in enumerate(_submit_dl_list):
+                            print(f'[SUBMIT_DL] Line {_di}: {json.dumps(_dline, default=str)[:500]}', file=sys.stderr)
+                    else:
+                        # Fallback: no server_delivery_lines available — build from scratch
+                        # This should rarely happen if the negotiate response is parsed correctly
+                        _exact_ship_amount = None
+                        if total_price and total_price != '0':
+                            try:
+                                _total_f = float(total_price)
+                                _price_f = float(price) if price else 0
+                                _ship_est = max(0, _total_f - _price_f)
+                                if _ship_est > 0:
+                                    _exact_ship_amount = f'{_ship_est:.2f}'
+                            except (ValueError, TypeError):
+                                pass
+                        
+                        submit_delivery_line = _build_delivery_line(
+                            currency=currency,
+                            first_name=firstName,
+                            last_name=lastName,
+                            street=street,
+                            city=city,
+                            country_code=country_code,
+                            zone_code=state,
+                            postal_code=s_zip,
+                            phone=phone,
+                            shipping_handle=selected_handle,
+                            shipping_amount=_exact_ship_amount,
+                        )
+                        submit_delivery_line['targetMerchandiseLines'] = {
+                            'lines': [{'stableId': sid} for sid in stable_ids]
+                        }
+                        submit_delivery = _build_delivery_terms(
+                            delivery_lines=[submit_delivery_line],
+                            no_delivery_required=[],
+                        )
+                        print(f'[SUBMIT_DL] Fallback built delivery: handle={selected_handle} exact_price={_exact_ship_amount}', file=sys.stderr)
 
                 submit_input = {
                     'sessionInput': {'sessionToken': x_checkout_one_session_token},
@@ -2650,12 +2821,86 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                             pass
 
                     if not receipt_id:
-                        # FIX v4: If submit returned only non-blocking warnings
+                        # FIX v5: If submit returned only non-blocking warnings
                         # (MERCHANDISE_SIGNATURE_MISMATCH, DELIVERY_DELIVERY_LINE_DETAIL_CHANGED),
                         # the server hasn't actually processed the payment. We need to
                         # re-negotiate to update the server's state with the corrected
                         # data, then retry submit. This is what the real Shopify checkout does.
+                        #
+                        # KEY INSIGHT: The SubmitRejected response now includes sellerProposal
+                        # with the EXACT delivery data the server expects. We should use that
+                        # directly instead of rebuilding from scratch.
                         print(f'[SUBMIT] No receipt_id — re-negotiating then retrying submit', file=sys.stderr)
+                        
+                        # First, try to extract sellerProposal from SubmitRejected response
+                        # This contains the EXACT delivery data the server wants
+                        _rejected_seller = _submit_result.get('sellerProposal', {}) if _submit_result else {}
+                        _rejected_delivery_lines = []
+                        if _rejected_seller:
+                            _rej_delivery = _rejected_seller.get('delivery', {})
+                            if _rej_delivery.get('__typename') == 'FilledDeliveryTerms':
+                                for _rdl in _rej_delivery.get('deliveryLines', []):
+                                    _rdl_entry = {
+                                        'deliveryMethodTypes': _rdl.get('deliveryMethodTypes', ['SHIPPING']),
+                                        'selectedDeliveryStrategy': _rdl.get('selectedDeliveryStrategy', {}),
+                                    }
+                                    # Convert expectedTotalPrice
+                                    _rep = _rdl.get('expectedTotalPrice', {})
+                                    if _rep:
+                                        if _rep.get('__typename') == 'AnyValueConstraint' or _rep.get('any'):
+                                            _rdl_entry['expectedTotalPrice'] = {'any': True}
+                                        else:
+                                            _amt, _cur = _extract_money(_rep)
+                                            if _amt and _amt != '0':
+                                                _rdl_entry['expectedTotalPrice'] = {'value': {'amount': _amt, 'currencyCode': _cur or 'USD'}}
+                                            else:
+                                                _rdl_entry['expectedTotalPrice'] = {'any': True}
+                                    else:
+                                        _rdl_entry['expectedTotalPrice'] = {'any': True}
+                                    # Convert targetMerchandiseLines
+                                    _rtm = _rdl.get('targetMerchandiseLines', {})
+                                    if _rtm:
+                                        if _rtm.get('__typename') == 'AnyMerchandiseLineTarget' or _rtm.get('any'):
+                                            _rdl_entry['targetMerchandiseLines'] = {'any': True}
+                                        elif _rtm.get('lines'):
+                                            _rdl_entry['targetMerchandiseLines'] = {
+                                                'lines': [{'stableId': l.get('stableId', '')} for l in _rtm['lines'] if l.get('stableId')]
+                                            }
+                                        else:
+                                            _rdl_entry['targetMerchandiseLines'] = {'any': True}
+                                    else:
+                                        _rdl_entry['targetMerchandiseLines'] = {'any': True}
+                                    # Convert destination
+                                    _rdest = _rdl.get('destination', {})
+                                    if _rdest and _rdest.get('streetAddress'):
+                                        _rsa = _rdest['streetAddress']
+                                        _rdl_entry['destination'] = {
+                                            'streetAddress': {
+                                                'firstName': _rsa.get('firstName', ''),
+                                                'lastName': _rsa.get('lastName', ''),
+                                                'address1': _rsa.get('address1', ''),
+                                                'address2': _rsa.get('address2', ''),
+                                                'city': _rsa.get('city', ''),
+                                                'countryCode': _rsa.get('countryCode', ''),
+                                                'zoneCode': _rsa.get('zoneCode', ''),
+                                                'postalCode': _rsa.get('postalCode', ''),
+                                                'phone': _rsa.get('phone', ''),
+                                            },
+                                        }
+                                    _rejected_delivery_lines.append(_rdl_entry)
+                                print(f'[SUBMIT_REJECTED] Got {len(_rejected_delivery_lines)} delivery lines from sellerProposal', file=sys.stderr)
+                            
+                            # Also extract checkoutTotal from rejected sellerProposal
+                            _rej_ct = _rejected_seller.get('checkoutTotal', {})
+                            if _rej_ct:
+                                _rej_amt, _rej_cur = _extract_money(_rej_ct)
+                                if _rej_amt and _rej_amt != '0':
+                                    total_price = _rej_amt
+                                    currency = _rej_cur or currency
+                                    pp['payment']['totalAmount'] = {'value': {'amount': f'{total_price}', 'currencyCode': currency}}
+                                    for _pl in pp['payment'].get('paymentLines', []):
+                                        _pl['amount'] = {'value': {'amount': f'{total_price}', 'currencyCode': currency}}
+                                    print(f'[SUBMIT_REJECTED] Updated total from sellerProposal: {total_price} {currency}', file=sys.stderr)
                         
                         # Step A: Re-negotiate with current state
                         _reneg_data = {
@@ -2703,74 +2948,119 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                     payment_method_identifier = _reneg_parsed['payment_method_identifier']
                                 if _reneg_parsed['stable_ids']:
                                     stable_ids = _reneg_parsed['stable_ids']
-                                # Update delivery from re-negotiation
-                                # When DELIVERY_DELIVERY_LINE_DETAIL_CHANGED, the server
-                                # recalculated delivery. We MUST build the delivery line
-                                # with the EXACT price the server calculated, NOT {any: true}.
-                                # The submit step validates expectedTotalPrice exactly.
+                                
+                                # KEY FIX v3: Use server_delivery_lines DIRECTLY for re-negotiation
+                                # delivery input. Do NOT rebuild using _build_delivery_line().
+                                # The server returns its FilledDeliveryTerms with the EXACT structure
+                                # it expects in the submit input. We must pass that structure back
+                                # verbatim, only injecting destination if missing.
                                 if is_shipping_required:
-                                    # Calculate exact shipping price from updated checkout_total
-                                    _reneg_ship_amount = None
-                                    if total_price and total_price != '0':
-                                        try:
-                                            _total_f = float(total_price)
-                                            _price_f = float(price) if price else 0
-                                            _ship_est = max(0, _total_f - _price_f)
-                                            if _ship_est > 0:
-                                                _reneg_ship_amount = f'{_ship_est:.2f}'
-                                        except (ValueError, TypeError):
-                                            pass
-                                    
-                                    # Try to get exact price from server-confirmed delivery lines
+                                    # Priority: 
+                                    # 1. Delivery lines from SubmitRejected sellerProposal (most authoritative)
+                                    # 2. Delivery lines from re-negotiate response
+                                    # 3. Fallback: build from scratch
                                     _reneg_server_dl = _reneg_parsed.get('server_delivery_lines', [])
-                                    if _reneg_server_dl and not _reneg_ship_amount:
-                                        for sdl in _reneg_server_dl:
-                                            _srv_price = sdl.get('expectedTotalPrice', {})
-                                            if _srv_price and 'value' in _srv_price:
-                                                _srv_amt = _srv_price.get('value', {}).get('amount', '')
-                                                if _srv_amt and _srv_amt != '0':
-                                                    _reneg_ship_amount = _srv_amt
-                                                    break
                                     
-                                    # Get server-confirmed strategy handle
-                                    _reneg_handle = selected_handle
-                                    if _reneg_server_dl:
-                                        for sdl in _reneg_server_dl:
-                                            _by_handle = _dget(sdl, 'selectedDeliveryStrategy', 'deliveryStrategyByHandle', 'handle')
-                                            if _by_handle:
-                                                _reneg_handle = _by_handle
-                                                break
-                                    elif _reneg_parsed['shipping_strategies']:
-                                        _handle_strategies = [s for s in _reneg_parsed['shipping_strategies'] if s.get('handle')]
-                                        if _handle_strategies:
-                                            _reneg_handle = _handle_strategies[0]['handle']
+                                    if _rejected_delivery_lines:
+                                        # Use delivery lines from SubmitRejected — these are EXACTLY
+                                        # what the server wants us to send back
+                                        _use_dl = _rejected_delivery_lines
+                                        print(f'[RENEG_DL] Using rejected seller delivery: {len(_use_dl)} lines', file=sys.stderr)
+                                    elif _reneg_server_dl:
+                                        # Use delivery lines from re-negotiate response
+                                        _use_dl = _reneg_server_dl
+                                        print(f'[RENEG_DL] Using re-negotiate server delivery: {len(_use_dl)} lines', file=sys.stderr)
+                                    else:
+                                        _use_dl = None
                                     
-                                    # Build fresh delivery line with EXACT price
-                                    _new_dl = _build_delivery_line(
-                                        currency=currency,
-                                        first_name=firstName,
-                                        last_name=lastName,
-                                        street=street,
-                                        city=city,
-                                        country_code=country_code,
-                                        zone_code=state,
-                                        postal_code=s_zip,
-                                        phone=phone,
-                                        shipping_handle=_reneg_handle,
-                                        shipping_amount=_reneg_ship_amount,
-                                    )
-                                    if stable_ids:
-                                        _new_dl['targetMerchandiseLines'] = {
-                                            'lines': [{'stableId': sid} for sid in stable_ids]
-                                        }
-                                    _new_delivery_terms = _build_delivery_terms(
-                                        delivery_lines=[_new_dl],
-                                        no_delivery_required=[],
-                                    )
+                                    if _use_dl:
+                                        # Inject destination into each delivery line if missing
+                                        _final_dl_list = []
+                                        for _udl in _use_dl:
+                                            _fdl = dict(_udl)
+                                            if 'destination' not in _fdl or not _fdl.get('destination'):
+                                                _fdl['destination'] = {
+                                                    'streetAddress': {
+                                                        'firstName': firstName,
+                                                        'lastName': lastName,
+                                                        'address1': street,
+                                                        'address2': '',
+                                                        'city': city,
+                                                        'countryCode': country_code,
+                                                        'zoneCode': state,
+                                                        'postalCode': s_zip,
+                                                        'phone': phone,
+                                                    },
+                                                }
+                                            else:
+                                                # Fill missing fields in existing destination
+                                                _dest = _fdl.get('destination', {})
+                                                _sa = _dest.get('streetAddress', {})
+                                                if not _sa.get('firstName'): _sa['firstName'] = firstName
+                                                if not _sa.get('lastName'): _sa['lastName'] = lastName
+                                                if not _sa.get('address1'): _sa['address1'] = street
+                                                if not _sa.get('city'): _sa['city'] = city
+                                                if not _sa.get('countryCode'): _sa['countryCode'] = country_code
+                                                if not _sa.get('zoneCode'): _sa['zoneCode'] = state
+                                                if not _sa.get('postalCode'): _sa['postalCode'] = s_zip
+                                                if not _sa.get('phone'): _sa['phone'] = phone
+                                                _fdl['destination'] = {'streetAddress': _sa}
+                                            _final_dl_list.append(_fdl)
+                                        _new_delivery_terms = _build_delivery_terms(
+                                            delivery_lines=_final_dl_list,
+                                            no_delivery_required=[],
+                                        )
+                                        _reneg_handle = _dget(_use_dl[0], 'selectedDeliveryStrategy', 'deliveryStrategyByHandle', 'handle') if _use_dl else 'shipping'
+                                        _reneg_price = None
+                                        if _use_dl:
+                                            _ep = _use_dl[0].get('expectedTotalPrice', {})
+                                            if _ep and 'value' in _ep:
+                                                _reneg_price = _ep.get('value', {}).get('amount', '')
+                                        print(f'[RENEG_DL] Server delivery: handle={_reneg_handle} price={_reneg_price}', file=sys.stderr)
+                                    else:
+                                        # Fallback: build from scratch (should rarely happen)
+                                        _reneg_ship_amount = None
+                                        if total_price and total_price != '0':
+                                            try:
+                                                _total_f = float(total_price)
+                                                _price_f = float(price) if price else 0
+                                                _ship_est = max(0, _total_f - _price_f)
+                                                if _ship_est > 0:
+                                                    _reneg_ship_amount = f'{_ship_est:.2f}'
+                                            except (ValueError, TypeError):
+                                                pass
+                                        _reneg_handle = selected_handle
+                                        if _reneg_parsed['shipping_strategies']:
+                                            _handle_strategies = [s for s in _reneg_parsed['shipping_strategies'] if s.get('handle')]
+                                            if _handle_strategies:
+                                                _reneg_handle = _handle_strategies[0]['handle']
+                                        _fallback_dl = _build_delivery_line(
+                                            currency=currency,
+                                            first_name=firstName,
+                                            last_name=lastName,
+                                            street=street,
+                                            city=city,
+                                            country_code=country_code,
+                                            zone_code=state,
+                                            postal_code=s_zip,
+                                            phone=phone,
+                                            shipping_handle=_reneg_handle,
+                                            shipping_amount=_reneg_ship_amount,
+                                        )
+                                        if stable_ids:
+                                            _fallback_dl['targetMerchandiseLines'] = {
+                                                'lines': [{'stableId': sid} for sid in stable_ids]
+                                            }
+                                        _new_delivery_terms = _build_delivery_terms(
+                                            delivery_lines=[_fallback_dl],
+                                            no_delivery_required=[],
+                                        )
+                                        print(f'[RENEG_DL] Fallback built delivery: handle={_reneg_handle} price={_reneg_ship_amount}', file=sys.stderr)
+                                    
                                     # Update in submit input
                                     submit_data['variables']['input']['delivery'] = _new_delivery_terms
                                     pp['delivery'] = _new_delivery_terms
-                                    print(f'[RENEG_DL] Rebuilt delivery: handle={_reneg_handle} exact_price={_reneg_ship_amount}', file=sys.stderr)
+                                    
                                 # Update merchandise from re-negotiation (seller-confirmed)
                                 if _reneg_parsed.get('seller_variant_id'):
                                     _svid = _reneg_parsed['seller_variant_id']
@@ -2854,8 +3144,24 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                     if _rej_blocking:
                                         rej_msgs = [e.get('code', '') or e.get('localizedMessage', str(e)) for e in _rej_blocking[:3]]
                                         return False, f"SUBMIT_REJECTED: {'; '.join(rej_msgs)}", gateway, total_price, currency
-                                    # Only non-blocking warnings — try poll anyway
-                                    print(f'[SUBMIT_RETRY] Only non-blocking warnings — will try polling', file=sys.stderr)
+                                    # Only non-blocking warnings — the submit may still have been
+                                    # accepted. Try to extract receipt from the response.
+                                    print(f'[SUBMIT_RETRY] Only non-blocking warnings — checking for receipt', file=sys.stderr)
+                                    _rej_receipt = _retry_result.get('receipt', {})
+                                    if _rej_receipt:
+                                        receipt_id = _rej_receipt.get('id')
+                                        if _rej_receipt.get('__typename') == 'FailedReceipt':
+                                            pe = _rej_receipt.get('processingError', {})
+                                            _ext = _extract_payment_error_response(pe)
+                                            return False, _ext or "CARD_DECLINED", gateway, total_price, currency
+                                    # Also check SubmitRejected sellerProposal for delivery lines
+                                    # to use in a third attempt if needed
+                                    if not receipt_id:
+                                        _rej2_seller = _retry_result.get('sellerProposal', {})
+                                        if _rej2_seller:
+                                            _rej2_delivery = _rej2_seller.get('delivery', {})
+                                            if _rej2_delivery.get('__typename') == 'FilledDeliveryTerms':
+                                                print(f'[SUBMIT_RETRY] Got seller delivery from 2nd rejected — may need 3rd attempt', file=sys.stderr)
                                 elif not _retry_type:
                                     # Check for GraphQL errors
                                     _retry_errors = _retry_json.get('errors', [])
