@@ -39,27 +39,44 @@ import core
 
 
 # ───────────────────────────────────────────────────────────────────────
-# 1. GraphQL queries request stableId inside linesV2
+# 1. GraphQL queries request stableId inside linesV2 (using inline fragment)
 # ───────────────────────────────────────────────────────────────────────
 def test_query_proposal_requests_stable_id_in_lines_v2():
     """QUERY_PROPOSAL must request stableId inside linesV2 of
     FilledMerchandiseLineTargetCollection — otherwise the server returns
     linesV2 entries without stableId, which the old parser turned into
-    the invalid {lines: []} payload."""
-    assert 'FilledMerchandiseLineTargetCollection{linesV2{__typename stableId}}' in core.QUERY_PROPOSAL, (
-        "QUERY_PROPOSAL must request 'linesV2{__typename stableId}' inside "
-        "FilledMerchandiseLineTargetCollection — without stableId the parser "
-        "produces the invalid {lines: []} payload that triggers SUBMIT_REJECTED."
+    the invalid {lines: []} payload.
+
+    IMPORTANT: `linesV2` returns a UNION type `MerchandiseLineType`.
+    GraphQL forbids field selections directly on a union — only `__typename`
+    and inline fragments (`...on MemberType{...}`) are allowed. The previous
+    query `linesV2{__typename stableId}` was rejected by Shopify with:
+      "Selections can't be made directly on unions (see selections on MerchandiseLineType)"
+    The fix wraps `stableId` inside `...on MerchandiseLine{stableId}`.
+    """
+    # Must use inline fragment for stableId (NOT direct field selection)
+    assert 'FilledMerchandiseLineTargetCollection{linesV2{__typename ...on MerchandiseLine{stableId}}}' in core.QUERY_PROPOSAL, (
+        "QUERY_PROPOSAL must request 'linesV2{__typename ...on MerchandiseLine{stableId}}' "
+        "inside FilledMerchandiseLineTargetCollection — direct field selection on the "
+        "MerchandiseLineType union is forbidden by GraphQL."
+    )
+    # Must NOT have the old buggy direct-selection form
+    assert 'linesV2{__typename stableId}' not in core.QUERY_PROPOSAL, (
+        "QUERY_PROPOSAL must NOT use 'linesV2{__typename stableId}' — stableId cannot "
+        "be selected directly on the MerchandiseLineType union."
     )
 
 
 def test_mutation_submit_requests_stable_id_in_lines_v2():
     """MUTATION_SUBMIT's SubmitRejected sellerProposal fragment must also
-    request stableId in linesV2 so the retry path can build correct
-    delivery terms from the rejected seller proposal."""
-    assert 'FilledMerchandiseLineTargetCollection{linesV2{__typename stableId}}' in core.MUTATION_SUBMIT, (
-        "MUTATION_SUBMIT must request 'linesV2{__typename stableId}' inside "
-        "FilledMerchandiseLineTargetCollection in the SubmitRejected sellerProposal."
+    request stableId in linesV2 using the inline fragment syntax."""
+    assert 'FilledMerchandiseLineTargetCollection{linesV2{__typename ...on MerchandiseLine{stableId}}}' in core.MUTATION_SUBMIT, (
+        "MUTATION_SUBMIT must request 'linesV2{__typename ...on MerchandiseLine{stableId}}' "
+        "inside FilledMerchandiseLineTargetCollection in the SubmitRejected sellerProposal."
+    )
+    assert 'linesV2{__typename stableId}' not in core.MUTATION_SUBMIT, (
+        "MUTATION_SUBMIT must NOT use 'linesV2{__typename stableId}' — direct field "
+        "selection on the MerchandiseLineType union is forbidden by GraphQL."
     )
 
 
@@ -150,6 +167,90 @@ def test_parse_negotiate_response_filled_target_without_stable_id_uses_any():
     assert sa.get('address2') == '', (
         f"address2 must be '' (empty string), got {sa.get('address2')!r}. "
         f"Shopify's DeliveryStreetAddressInput rejects null."
+    )
+
+
+def test_parse_negotiate_response_filled_target_with_stable_id_uses_lines():
+    """When the server returns FilledMerchandiseLineTargetCollection with
+    linesV2 entries that DO have stableId (the new correct GraphQL query
+    using `...on MerchandiseLine{stableId}`), the parser MUST use
+    {lines: [{stableId: '...'}]} — the explicit form preferred by Shopify."""
+    simulate_resp = {
+        "data": {
+            "session": {
+                "negotiate": {
+                    "errors": [],
+                    "result": {
+                        "__typename": "NegotiationResultAvailable",
+                        "queueToken": "qt",
+                        "sessionToken": "st",
+                        "sellerProposal": {
+                            "__typename": "Proposal",
+                            "checkoutTotal": {
+                                "__typename": "MoneyValueConstraint",
+                                "value": {"amount": "7.00", "currencyCode": "USD"},
+                            },
+                            "isShippingRequired": True,
+                            "delivery": {
+                                "__typename": "FilledDeliveryTerms",
+                                "deliveryLines": [{
+                                    "__typename": "DeliveryLine",
+                                    "deliveryMethodTypes": ["SHIPPING"],
+                                    "stableId": "dl-1",
+                                    "selectedDeliveryStrategy": {
+                                        "__typename": "CompleteDeliveryStrategy",
+                                        "handle": "h1",
+                                        "code": "Standard",
+                                        "title": "Standard",
+                                        "amount": {
+                                            "__typename": "MoneyValueConstraint",
+                                            "value": {"amount": "0.00", "currencyCode": "USD"},
+                                        },
+                                    },
+                                    "totalAmount": {
+                                        "__typename": "MoneyValueConstraint",
+                                        "value": {"amount": "0.00", "currencyCode": "USD"},
+                                    },
+                                    "destinationAddress": {
+                                        "__typename": "StreetAddress",
+                                        "address1": "1 Main St",
+                                        "address2": "",
+                                        "city": "City",
+                                        "countryCode": "US",
+                                        "zoneCode": "CA",
+                                        "postalCode": "90001",
+                                    },
+                                    # NEW: linesV2 entries now have stableId (because
+                                    # the GraphQL query uses `...on MerchandiseLine{stableId}`)
+                                    "targetMerchandise": {
+                                        "__typename": "FilledMerchandiseLineTargetCollection",
+                                        "linesV2": [{
+                                            "__typename": "MerchandiseLine",
+                                            "stableId": "ml-stable-123",
+                                        }],
+                                    },
+                                }],
+                            },
+                            "merchandise": {"__typename": "UnavailableTerms"},
+                            "payment": {"__typename": "UnavailableTerms"},
+                        },
+                        "buyerProposal": {
+                            "__typename": "Proposal",
+                            "checkoutTotal": {"__typename": "AnyConstraint", "any": True},
+                        },
+                    },
+                }
+            }
+        }
+    }
+
+    parsed = core._parse_negotiate_response(simulate_resp)
+    server_delivery_lines = parsed.get('server_delivery_lines', [])
+    assert len(server_delivery_lines) == 1, "Expected 1 delivery line"
+    tml = server_delivery_lines[0].get('targetMerchandiseLines', {})
+    assert tml == {'lines': [{'stableId': 'ml-stable-123'}]}, (
+        f"Expected targetMerchandiseLines to be {{'lines': [{{'stableId': 'ml-stable-123'}}]}} "
+        f"when stableId is available, got {tml}."
     )
 
 
