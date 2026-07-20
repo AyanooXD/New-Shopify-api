@@ -39,6 +39,67 @@ import core
 
 
 # ───────────────────────────────────────────────────────────────────────
+# 0. GraphQL queries have balanced braces (regression test for PARSE_ERROR)
+# ───────────────────────────────────────────────────────────────────────
+def test_query_proposal_has_balanced_braces():
+    """QUERY_PROPOSAL must have balanced { and } — Shopify rejects with
+    'syntax error, unexpected RCURLY' (PARSE_ERROR) if there's an extra }.
+
+    Regression: commit ba3fb56 introduced an extra } in the buyerProposal
+    block ('any:_singleInstance}}}}' instead of 'any:_singleInstance}}}'),
+    causing Shopify to reject the entire query at Step 5a (the very first
+    negotiate call) with:
+      'syntax error, unexpected RCURLY (\"}\") at [1, 2121]'
+    """
+    q = core.QUERY_PROPOSAL
+    opens = q.count('{')
+    closes = q.count('}')
+    assert opens == closes, (
+        f"QUERY_PROPOSAL has unbalanced braces: {opens} opens vs {closes} closes "
+        f"(diff={closes - opens}). Shopify will reject with PARSE_ERROR."
+    )
+    # Walk depth to ensure it never goes negative (extra }) or ends positive (extra {)
+    depth = 0
+    for i, ch in enumerate(q):
+        if ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            assert depth >= 0, (
+                f"QUERY_PROPOSAL: depth went negative at char {i} — extra }}. "
+                f"Context: ...{q[max(0,i-40):i+10]}..."
+            )
+    assert depth == 0, f"QUERY_PROPOSAL: final depth = {depth} (expected 0)"
+
+
+def test_mutation_submit_has_balanced_braces():
+    """MUTATION_SUBMIT must have balanced { and } — same PARSE_ERROR risk.
+
+    Regression: the SubmitRejected sellerProposal fragment was missing 2
+    closing braces after the delivery block (before '...on CheckpointDenied'),
+    causing Shopify to reject with PARSE_ERROR.
+    """
+    q = core.MUTATION_SUBMIT
+    opens = q.count('{')
+    closes = q.count('}')
+    assert opens == closes, (
+        f"MUTATION_SUBMIT has unbalanced braces: {opens} opens vs {closes} closes "
+        f"(diff={closes - opens}). Shopify will reject with PARSE_ERROR."
+    )
+    depth = 0
+    for i, ch in enumerate(q):
+        if ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            assert depth >= 0, (
+                f"MUTATION_SUBMIT: depth went negative at char {i} — extra }}. "
+                f"Context: ...{q[max(0,i-40):i+10]}..."
+            )
+    assert depth == 0, f"MUTATION_SUBMIT: final depth = {depth} (expected 0)"
+
+
+# ───────────────────────────────────────────────────────────────────────
 # 1. GraphQL queries request stableId inside linesV2 (using inline fragment)
 # ───────────────────────────────────────────────────────────────────────
 def test_query_proposal_requests_stable_id_in_lines_v2():
