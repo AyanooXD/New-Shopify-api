@@ -461,3 +461,161 @@ def test_submit_rejected_message_with_no_code_uses_unknown():
     msg = f"SUBMIT_REJECTED: {'; '.join(rej_msgs)}"
     # Must contain "UNKNOWN" so extract_clean_response doesn't strip everything
     assert 'UNKNOWN' in msg
+
+
+# ───────────────────────────────────────────────────────────────────────
+# 6. Brace depth of key fields (regression for "selections can't be made
+#    directly on unions" + "Field X doesn't exist on type Y" errors)
+# ───────────────────────────────────────────────────────────────────────
+def _depth_at_substring(query: str, needle: str, before_open: bool = True) -> int:
+    """Walk braces and return the depth at the position of `needle`.
+
+    If before_open=True (default), returns depth BEFORE the '{' that follows
+    `needle` (i.e., the depth at which the block opens).
+    """
+    idx = query.find(needle)
+    assert idx >= 0, f"Could not find {needle!r} in query"
+    # Find the '{' after needle
+    brace_idx = query.find('{', idx)
+    assert brace_idx >= 0, f"No '{{' after {needle!r}"
+    depth = 0
+    for i in range(brace_idx if before_open else brace_idx + 1):
+        if query[i] == '{':
+            depth += 1
+        elif query[i] == '}':
+            depth -= 1
+    return depth
+
+
+def test_query_proposal_merchandise_is_inside_sellerProposal():
+    """REGRESSION (commit cc59daa aftermath): The delivery block had ONE
+    EXTRA '}' after MerchandiseLine{stableId}, which prematurely closed
+    sellerProposal. As a result, `merchandise{...}` was parsed as a
+    direct selection on NegotiationResultAvailable (where it doesn't exist),
+    producing:
+        "Field 'merchandise' doesn't exist on type 'NegotiationResultAvailable'"
+
+    The correct depth for `merchandise{` is 6 (inside sellerProposal, which
+    is at depth 5 inside ...on NegotiationResultAvailable, which is at depth 4
+    inside result).
+    """
+    q = core.QUERY_PROPOSAL
+    depth = _depth_at_substring(q, 'merchandise{')
+    # Find the FIRST 'merchandise{' (the outer one inside sellerProposal, not the
+    # nested one inside merchandiseLines).
+    # Walk to find the first 'merchandise{' that's followed by '__typename ...on FilledMerchandiseTerms'
+    idx = q.find('merchandise{__typename ...on FilledMerchandiseTerms')
+    assert idx >= 0, "Could not find outer merchandise{ block"
+    # Walk braces from start to idx, find the '{' position
+    brace_idx = q.find('{', idx)
+    depth = 0
+    for i in range(brace_idx):
+        if q[i] == '{':
+            depth += 1
+        elif q[i] == '}':
+            depth -= 1
+    assert depth == 6, (
+        f"merchandise{{ block must be at depth 6 (inside sellerProposal), "
+        f"got depth {depth}. An extra '}}' in the delivery block was prematurely "
+        f"closing sellerProposal, causing Shopify to parse merchandise as a direct "
+        f"selection on NegotiationResultAvailable (where it doesn't exist)."
+    )
+
+
+def test_query_proposal_payment_is_inside_sellerProposal():
+    """REGRESSION (commit cc59daa aftermath): Same root cause as the
+    merchandise test — the extra '}' after MerchandiseLine{stableId}
+    also pushed `payment{...}` outside sellerProposal, producing:
+        "Field 'payment' doesn't exist on type 'NegotiationResultAvailable'"
+    """
+    q = core.QUERY_PROPOSAL
+    idx = q.find('payment{__typename ...on FilledPaymentTerms')
+    assert idx >= 0, "Could not find payment{ block"
+    brace_idx = q.find('{', idx)
+    depth = 0
+    for i in range(brace_idx):
+        if q[i] == '{':
+            depth += 1
+        elif q[i] == '}':
+            depth -= 1
+    assert depth == 6, (
+        f"payment{{ block must be at depth 6 (inside sellerProposal), "
+        f"got depth {depth}. An extra '}}' was prematurely closing sellerProposal, "
+        f"causing Shopify to parse payment as a direct selection on "
+        f"NegotiationResultAvailable (where it doesn't exist)."
+    )
+
+
+def test_query_proposal_buyerProposal_is_inside_NegotiationResultAvailable():
+    """REGRESSION (commit cc59daa aftermath): The payment block's extra '}'
+    (which was compensating for the missing '}' in the delivery block) was
+    prematurely closing NegotiationResultAvailable, leaving buyerProposal
+    parsed as a direct selection on the union NegotiationResult —
+    GraphQL forbids field selections on unions:
+        "Selections can't be made directly on unions (see selections on NegotiationResult)"
+        path: result.buyerProposal
+
+    The correct depth for `buyerProposal{` is 5 (inside ...on NegotiationResultAvailable,
+    which is at depth 4 inside result).
+    """
+    q = core.QUERY_PROPOSAL
+    idx = q.find('buyerProposal{__typename checkoutTotal')
+    assert idx >= 0, "Could not find buyerProposal{ block"
+    brace_idx = q.find('{', idx)
+    depth = 0
+    for i in range(brace_idx):
+        if q[i] == '{':
+            depth += 1
+        elif q[i] == '}':
+            depth -= 1
+    assert depth == 5, (
+        f"buyerProposal{{ block must be at depth 5 (inside ...on NegotiationResultAvailable), "
+        f"got depth {depth}. An extra '}}' was prematurely closing NegotiationResultAvailable, "
+        f"causing Shopify to parse buyerProposal as a direct selection on the union "
+        f"NegotiationResult (forbidden by GraphQL)."
+    )
+
+
+def test_query_proposal_NegotiationResultFailed_is_sibling_of_NegotiationResultAvailable():
+    """REGRESSION (commit cc59daa aftermath): `...on NegotiationResultFailed{...}`
+    must be a sibling of `...on NegotiationResultAvailable{...}`, both inside `result`.
+    Correct depth = 4 (inside result, which is at depth 3 inside negotiate).
+
+    If buyerProposal's extra '}' was prematurely closing NegotiationResultAvailable,
+    the sibling union members would still appear to be at depth 4 — but they
+    would actually be SIBLINGS of buyerProposal on the union, not siblings of
+    NegotiationResultAvailable inside result. This test ensures they're at the
+    correct depth so the overall structure is sound.
+    """
+    q = core.QUERY_PROPOSAL
+    idx = q.find('...on NegotiationResultFailed{failureCode}')
+    assert idx >= 0, "Could not find ...on NegotiationResultFailed block"
+    brace_idx = q.find('{', idx)
+    depth = 0
+    for i in range(brace_idx):
+        if q[i] == '{':
+            depth += 1
+        elif q[i] == '}':
+            depth -= 1
+    assert depth == 4, (
+        f"...on NegotiationResultFailed{{}} must be at depth 4 (sibling of "
+        f"...on NegotiationResultAvailable inside result), got depth {depth}."
+    )
+
+
+def test_query_proposal_sellerProposal_is_inside_NegotiationResultAvailable():
+    """Smoke test: sellerProposal must be at depth 5 (inside ...on NegotiationResultAvailable)."""
+    q = core.QUERY_PROPOSAL
+    idx = q.find('sellerProposal{__typename checkoutTotal')
+    assert idx >= 0, "Could not find sellerProposal{ block"
+    brace_idx = q.find('{', idx)
+    depth = 0
+    for i in range(brace_idx):
+        if q[i] == '{':
+            depth += 1
+        elif q[i] == '}':
+            depth -= 1
+    assert depth == 5, (
+        f"sellerProposal{{ block must be at depth 5 (inside ...on NegotiationResultAvailable), "
+        f"got depth {depth}."
+    )
