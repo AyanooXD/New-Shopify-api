@@ -1417,6 +1417,7 @@ def process_card(
                         'address1': street, 'address2': '',
                         'city': city, 'countryCode': country_code,
                         'zoneCode': state, 'postalCode': s_zip,
+                        'phone': '+12025551234',
                     })
                 # Always ensure phone is present
                 if phone and not sa.get('phone'):
@@ -1653,7 +1654,35 @@ def process_card(
                     except Exception as _ae:
                         print(f'[ARTIFACTS] poll error: {_ae}', file=sys.stderr)
             if not _artifacts_ready:
-                print(f'[ARTIFACTS] Timeout after {_max_artifacts_polls} polls — proceeding anyway', file=sys.stderr)
+                print(f'[ARTIFACTS] Timeout after {_max_artifacts_polls} polls — re-tokenizing card', file=sys.stderr)
+                # Re-tokenize the card since payment session may have expired during long artifact wait
+                _retok_resp = session_request(
+                    sess, 'POST',
+                    f'https://deposit.us.shopifycs.com/sessions',
+                    json_data={'credit_card': {'number': cc, 'name': cardholder_name,
+                        'month': month, 'year': year, 'verification_value': cvv}},
+                    timeout=15,
+                )
+                if _retok_resp and _retok_resp.status_code == 200:
+                    try:
+                        _new_tok = _retok_resp.json().get('id', '')
+                        if _new_tok:
+                            payment_token = _new_tok
+                            print(f'[ARTIFACTS] Re-tokenized: new payment_token={payment_token[:20]}...', file=sys.stderr)
+                            # Rebuild payment line with fresh token + correct total
+                            _retok_pl = _build_payment_line(
+                                total_amount=str(total_price), currency=currency,
+                                cc=cc, month=month, year=year, cvv=cvv,
+                                payment_token=payment_token,
+                                payment_method_identifier=payment_method_identifier,
+                            )
+                            pp['payment'] = {
+                                'totalAmount': {'value': {'amount': str(total_price), 'currencyCode': currency}},
+                                'paymentLines': [_retok_pl],
+                            }
+                            print(f'[ARTIFACTS] Rebuilt payment with fresh token+amount={total_price}', file=sys.stderr)
+                    except Exception as _re:
+                        print(f'[ARTIFACTS] Re-tokenize parse error: {_re}', file=sys.stderr)
 
             # After artifacts loop, extract the LATEST stableIds from the delivery linesV2
             # (Shopify rotates stableIds on every negotiate — must use the final ones)
