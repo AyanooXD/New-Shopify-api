@@ -1738,15 +1738,18 @@ def process_card(
 
             # ── Delivery: use server-confirmed lines, inject address if missing ──
             _submit_dl_list = []
+            _ph = profile.get('phone', '+12025551234')
             for sdl in (server_delivery_lines or [delivery_line]):
                 _sdl = dict(sdl)
                 _dest = _sdl.get('destination') or {}
-                _sa = (_dest.get('streetAddress') or {}) if _dest else {}
+                _sa = dict((_dest.get('streetAddress') or {}) if _dest else {})
                 if not _sa.get('firstName'):
-                    if not _sa: _sa = {}
                     _sa.update({'firstName': firstName, 'lastName': lastName, 'address1': street, 'address2': '',
-                                'city': city, 'countryCode': country_code, 'zoneCode': state, 'postalCode': s_zip})
-                    _sdl['destination'] = {'streetAddress': _sa}
+                                'city': city, 'countryCode': country_code, 'zoneCode': state, 'postalCode': s_zip,
+                                'phone': _ph})
+                elif not _sa.get('phone'):
+                    _sa['phone'] = _ph
+                _sdl['destination'] = {'streetAddress': _sa}
                 _submit_dl_list.append(_sdl)
             submit_delivery = _build_delivery_terms(delivery_lines=_submit_dl_list, no_delivery_required=[])
 
