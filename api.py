@@ -301,10 +301,30 @@ class ShopifyRequest(BaseModel):
 # ──────────────────────────────────────────────────────────────────────
 # HEALTH CHECK
 # ──────────────────────────────────────────────────────────────────────
+VERSION = "2.3.1"
+
 @app.get("/health", tags=["System"])
 async def health():
     """Simple health check."""
-    return {"status": "ok", "workers": _MAX_WORKERS}
+    return {"status": "ok", "workers": _MAX_WORKERS, "version": VERSION}
+
+
+@app.post("/debug", tags=["System"])
+async def debug_checkout(req: CheckRequest):
+    """Debug endpoint — returns raw logs for diagnosing checkout failures."""
+    import io, contextlib
+    buf = io.StringIO()
+    with contextlib.redirect_stderr(buf):
+        loop = asyncio.get_event_loop()
+        status, response, gw, price, currency = await loop.run_in_executor(
+            _executor, lambda: run_checkout(req.site, req.cc)
+        )
+    logs = buf.getvalue()
+    return {
+        "status": status, "response": response,
+        "gateway": gw, "price": price, "currency": currency,
+        "logs": logs[-4000:],
+    }
 
 
 # ──────────────────────────────────────────────────────────────────────
