@@ -543,7 +543,6 @@ def _build_payment_line(total_amount: str, currency: str, cc: str, month: str, y
             'directPaymentMethod': {
                 'paymentMethodIdentifier': payment_method_identifier,
                 'sessionId': payment_token,
-                'paymentFlexibilityTermsId': None,
                 'billingAddress': {
                     'streetAddress': {
                         'firstName': 'John',
