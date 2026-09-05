@@ -301,7 +301,7 @@ class ShopifyRequest(BaseModel):
 # ──────────────────────────────────────────────────────────────────────
 # HEALTH CHECK
 # ──────────────────────────────────────────────────────────────────────
-VERSION = "2.3.1"
+VERSION = "2.4.9"
 
 @app.get("/health", tags=["System"])
 async def health():
