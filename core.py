@@ -1656,13 +1656,16 @@ def process_card(
             if not _artifacts_ready:
                 print(f'[ARTIFACTS] Timeout after {_max_artifacts_polls} polls — re-tokenizing card', file=sys.stderr)
                 # Re-tokenize the card since payment session may have expired during long artifact wait
-                _retok_resp = session_request(
-                    sess, 'POST',
-                    f'https://deposit.us.shopifycs.com/sessions',
-                    json_data={'credit_card': {'number': cc, 'name': cardholder_name,
-                        'month': month, 'year': year, 'verification_value': cvv}},
-                    timeout=15,
-                )
+                try:
+                    _retok_resp = session.post(
+                        'https://deposit.us.shopifycs.com/sessions',
+                        json={'credit_card': {'number': cc, 'name': cardholder_name,
+                            'month': month, 'year': year, 'verification_value': cvv}},
+                        timeout=15,
+                    )
+                except Exception as _re_err:
+                    _retok_resp = None
+                    print(f'[ARTIFACTS] Re-tokenize request failed: {_re_err}', file=sys.stderr)
                 if _retok_resp and _retok_resp.status_code == 200:
                     try:
                         _new_tok = _retok_resp.json().get('id', '')
