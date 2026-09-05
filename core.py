@@ -2002,8 +2002,11 @@ def process_card(
                         elif _rs_t == 'CheckpointDenied': return False, 'CAPTCHA_BLOCK', gateway, total_price, currency
                         elif _rs_t == 'SubmitRejected':
                             _rs_errs = [e.get('code','') for e in (_rs_r.get('errors') or [])]
+                            _rs_ip_block = {'ARTIFACT_DISSATISFACTION', 'PAYMENTS_PROPOSED_GATEWAY_UNAVAILABLE',
+                                            'WAITING_PENDING_TERMS', 'PAYMENTS_UNACCEPTABLE_PAYMENT_AMOUNT',
+                                            'DELIVERY_DELIVERY_LINE_DETAIL_CHANGED'}
                             return False, (
-                            "PROCESSING_ERROR" if _rs_errs and all(c == 'ARTIFACT_DISSATISFACTION' for c in _rs_errs)
+                            "PROCESSING_ERROR" if _rs_errs and set(_rs_errs) <= _rs_ip_block
                             else f"SUBMIT_REJECTED: {', '.join(_rs_errs) or 'unknown'}"
                         ), gateway, total_price, currency
                         # If we got a receipt_id, fall through to poll loop
