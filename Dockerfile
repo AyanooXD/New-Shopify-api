@@ -7,8 +7,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY core.py .
 COPY api.py .
+COPY start.sh .
+RUN chmod +x start.sh
 
 EXPOSE 8080
 
-ENTRYPOINT ["/bin/sh", "-c"]
-CMD ["uvicorn api:app --host 0.0.0.0 --port ${PORT:-8080} --workers 1"]
+CMD ["/bin/sh", "start.sh"]
