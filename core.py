@@ -1884,7 +1884,7 @@ def process_card(
                 _fatal_codes = set(err_codes) - _retryable_codes - {'VALIDATION_CUSTOM', 'PAYMENTS_PHONE_NUMBER_DOES_NOT_MATCH_EXPECTED_PATTERN'}
                 if _fatal_codes:
                     return False, (
-                    "PROCESSING_ERROR" if err_codes and all(c == 'ARTIFACT_DISSATISFACTION' for c in err_codes)
+                    "PROCESSING_ERROR" if err_codes and set(err_codes) <= {'ARTIFACT_DISSATISFACTION', 'PAYMENTS_PROPOSED_GATEWAY_UNAVAILABLE', 'WAITING_PENDING_TERMS', 'PAYMENTS_UNACCEPTABLE_PAYMENT_AMOUNT', 'DELIVERY_DELIVERY_LINE_DETAIL_CHANGED'}
                     else f"SUBMIT_REJECTED: {', '.join(err_codes) or 'unknown'}"
                 ), gateway, total_price, currency
 
@@ -1999,14 +1999,14 @@ def process_card(
                         # If we got a receipt_id, fall through to poll loop
                         if receipt_id: pass
                         elif _rs_t not in ('SubmitSuccess','SubmittedForCompletion'): return False, (
-                    "PROCESSING_ERROR" if err_codes and all(c == 'ARTIFACT_DISSATISFACTION' for c in err_codes)
+                    "PROCESSING_ERROR" if err_codes and set(err_codes) <= {'ARTIFACT_DISSATISFACTION', 'PAYMENTS_PROPOSED_GATEWAY_UNAVAILABLE', 'WAITING_PENDING_TERMS', 'PAYMENTS_UNACCEPTABLE_PAYMENT_AMOUNT', 'DELIVERY_DELIVERY_LINE_DETAIL_CHANGED'}
                     else f"SUBMIT_REJECTED: {', '.join(err_codes)}"
                 ), gateway, total_price, currency
                     except Exception as _rse:
                         return False, f"SUBMIT_RETRY_ERROR: {_rse}", gateway, total_price, currency
                 else:
                     return False, (
-                    "PROCESSING_ERROR" if err_codes and all(c == 'ARTIFACT_DISSATISFACTION' for c in err_codes)
+                    "PROCESSING_ERROR" if err_codes and set(err_codes) <= {'ARTIFACT_DISSATISFACTION', 'PAYMENTS_PROPOSED_GATEWAY_UNAVAILABLE', 'WAITING_PENDING_TERMS', 'PAYMENTS_UNACCEPTABLE_PAYMENT_AMOUNT', 'DELIVERY_DELIVERY_LINE_DETAIL_CHANGED'}
                     else f"SUBMIT_REJECTED: {', '.join(err_codes) or 'unknown'}"
                 ), gateway, total_price, currency
 
