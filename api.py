@@ -32,7 +32,7 @@ from urllib.parse import urlparse
 
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from core import (
     parse_cc_string,
@@ -255,7 +255,7 @@ def _run_checkout(cc_string: str, site: str, proxy_str: str | None, variant_id: 
 # ══════════════════════════════════════════════════════════════════════
 # FASTAPI APP
 # ══════════════════════════════════════════════════════════════════════
-app = FastAPI(
+app = FastAPI(lifespan=lifespan,
     title="Shopify Checkout API",
     description="Request-based Shopify checkout flow — supports GET and POST",
     version="4.0.0",
@@ -274,16 +274,15 @@ class ShopifyRequest(BaseModel):
     variant: Optional[str] = None
     user_id: Optional[str] = "anonymous"
 
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "site": "allbirds.com",
-                "cc": "4111111111111111|12|2028|123",
-                "proxy": "user:pass@host:port",
-                "variant": None,
-                "user_id": "user123",
-            }
+    model_config = ConfigDict(json_schema_extra={
+        "example": {
+            "site": "allbirds.com",
+            "cc": "4111111111111111|12|2028|123",
+            "proxy": "user:pass@host:port",
+            "variant": None,
+            "user_id": "user123",
         }
+    })
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -446,15 +445,14 @@ async def shopify_post(body: ShopifyRequest):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# STARTUP / SHUTDOWN EVENTS
+# LIFESPAN (replaces deprecated on_event)
 # ══════════════════════════════════════════════════════════════════════
-@app.on_event("startup")
-async def startup():
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app):
     print(f"[startup] Shopify API ready — {_MAX_WORKERS} workers, timeout={_CHECKOUT_TIMEOUT}s", file=sys.stderr)
-
-
-@app.on_event("shutdown")
-async def shutdown():
+    yield
     print("[shutdown] Shutting down thread pool...", file=sys.stderr)
     _executor.shutdown(wait=True, cancel_futures=False)
     print("[shutdown] Done.", file=sys.stderr)
