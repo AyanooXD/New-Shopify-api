@@ -255,6 +255,19 @@ def _run_checkout(cc_string: str, site: str, proxy_str: str | None, variant_id: 
 # ══════════════════════════════════════════════════════════════════════
 # FASTAPI APP
 # ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
+# LIFESPAN
+# ══════════════════════════════════════════════════════════════════════
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(_app):
+    print(f"[startup] Shopify API ready — {_MAX_WORKERS} workers, timeout={_CHECKOUT_TIMEOUT}s", file=sys.stderr)
+    yield
+    print("[shutdown] Shutting down thread pool...", file=sys.stderr)
+    _executor.shutdown(wait=True, cancel_futures=False)
+    print("[shutdown] Done.", file=sys.stderr)
+
 app = FastAPI(lifespan=lifespan,
     title="Shopify Checkout API",
     description="Request-based Shopify checkout flow — supports GET and POST",
@@ -444,18 +457,7 @@ async def shopify_post(body: ShopifyRequest):
     return JSONResponse(content=result)
 
 
-# ══════════════════════════════════════════════════════════════════════
-# LIFESPAN (replaces deprecated on_event)
-# ══════════════════════════════════════════════════════════════════════
-from contextlib import asynccontextmanager
 
-@asynccontextmanager
-async def lifespan(app):
-    print(f"[startup] Shopify API ready — {_MAX_WORKERS} workers, timeout={_CHECKOUT_TIMEOUT}s", file=sys.stderr)
-    yield
-    print("[shutdown] Shutting down thread pool...", file=sys.stderr)
-    _executor.shutdown(wait=True, cancel_futures=False)
-    print("[shutdown] Done.", file=sys.stderr)
 
 
 # ══════════════════════════════════════════════════════════════════════
