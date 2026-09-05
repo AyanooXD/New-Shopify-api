@@ -310,7 +310,7 @@ async def health():
 
 
 @app.post("/debug", tags=["System"])
-async def debug_checkout(req: CheckRequest):
+async def debug_checkout(req: ShopifyRequest):
     """Debug endpoint — returns raw logs for diagnosing checkout failures."""
     import io, contextlib
     buf = io.StringIO()
