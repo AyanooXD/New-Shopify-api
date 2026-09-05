@@ -433,6 +433,17 @@ def extract_clean_response(message: str) -> str:
         if message.startswith(prefix):
             return message[:200]
 
+    # IP-block / datacenter codes → always return PROCESSING_ERROR
+    _IP_BLOCK_CODES = {
+        'PAYMENTS_PROPOSED_GATEWAY_UNAVAILABLE', 'ARTIFACT_DISSATISFACTION',
+        'WAITING_PENDING_TERMS',
+    }
+    if message.strip().upper() in _IP_BLOCK_CODES:
+        return 'PROCESSING_ERROR'
+    # Normalize compound responses that ONLY contain IP-block codes
+    if all(c.strip() in _IP_BLOCK_CODES for c in message.split(',') if c.strip()):
+        return 'PROCESSING_ERROR'
+
     _KNOWN_CODES = {
         'CARD_DECLINED', 'INSUFFICIENT_FUNDS', 'EXPIRED_CARD', 'INVALID_CVC',
         'INCORRECT_NUMBER', 'INCORRECT_CVC', 'INCORRECT_ZIP', 'INCORRECT_ADDRESS',
@@ -446,7 +457,6 @@ def extract_clean_response(message: str) -> str:
         'PAYMENTS_UNACCEPTABLE_PAYMENT_AMOUNT', 'TAX_MISMATCH',
         'TAX_NEW_TAX_MUST_BE_ACCEPTED', 'DESTINATION_ADDRESS_REQUIRED',
         'DELIVERY_DELIVERY_LINE_DETAIL_CHANGED', 'MERCHANDISE_SIGNATURE_MISMATCH',
-        'ARTIFACT_DISSATISFACTION',
         'MERCHANDISE_CART_UPDATED_BASED_ON_COUNTRY',
         'PAYMENT_FLEXIBILITY_TERMS_ID_MISMATCH',
         'PAYMENTS_PAYMENT_FLEXIBILITY_TERMS_ID_MISMATCH',
