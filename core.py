@@ -197,22 +197,54 @@ def extract_between(text: str, start: str, end: str) -> str:
 
 
 def extract_storefront_token(text: str) -> str:
-    """Extract Shopify Storefront API access token from page HTML."""
+    """Extract Shopify Storefront API access token from page HTML.
+    Handles classic themes, Hydrogen/headless, and JSON-blob embeds.
+    """
     if not text:
         return ''
+    # Ordered by specificity — most reliable first
     patterns = [
-        ('"accessToken":"', '"'),
-        ('"PUBLIC_STOREFRONT_API_TOKEN","', '"'),
-        ('storefrontAccessToken = "', '"'),
-        ('storefrontAccessToken":"', '"'),
+        # Classic theme meta tags
         ('name="shopify-storefront-api-token" content="', '"'),
+        ('name="serialized-storefront-api-token" content="', '"'),
+        # JSON blob patterns (classic + Hydrogen)
+        ('"accessToken":"', '"'),
         ('"storefrontApiToken":"', '"'),
+        ('"storefrontAccessToken":"', '"'),
+        ('storefrontAccessToken":"', '"'),
+        # Hydrogen / Remix hydration blobs
+        ('"PUBLIC_STOREFRONT_API_TOKEN":"', '"'),
+        ('"PUBLIC_STOREFRONT_API_TOKEN","', '"'),
+        # JS variable assignments
+        ('storefrontAccessToken = "', '"'),
+        ('window.__st=', '"accessToken":"'),   # sentinel only — handled below
+        # Encoded variants (some themes encode with &quot;)
+        ('&quot;accessToken&quot;:&quot;', '&quot;'),
+        ('&quot;storefrontApiToken&quot;:&quot;', '&quot;'),
     ]
+    import html as _html_mod, re as _re_mod
     for start, end in patterns:
+        if start == 'window.__st=':
+            # Special: extract from window.__st={...} blob
+            m = _re_mod.search(r'window\.__st\s*=\s*(\{[^<]+?\})', text)
+            if m:
+                blob = m.group(1)
+                tok = extract_between(blob, '"accessToken":"', '"')
+                if tok:
+                    return tok
+            continue
         val = extract_between(text, start, end)
         if val:
-            val = val.replace('&amp;', '&').replace('&quot;', '"').replace('&#39;', "'")
-            return val
+            val = _html_mod.unescape(val).strip('"').strip()
+            if val and len(val) > 10:
+                return val
+    # Last resort: regex for any 32-char hex token after common keys
+    m = _re_mod.search(
+        r'(?:accessToken|storefrontApiToken|PUBLIC_STOREFRONT_API_TOKEN)[\\"\'\s:=]+([a-f0-9]{32})',
+        text, _re_mod.IGNORECASE
+    )
+    if m:
+        return m.group(1)
     return ''
 
 
@@ -442,7 +474,7 @@ def _build_delivery_line(currency, first_name, last_name, street, city, country_
                 'countryCode': country_code,
                 'zoneCode': zone_code,
                 'postalCode': postal_code,
-                # phone omitted: causes PAYMENTS_PHONE_NUMBER_DOES_NOT_MATCH_EXPECTED_PATTERN
+                **({'phone': phone} if phone else {}),
             },
         },
     }
@@ -712,19 +744,32 @@ def fetch_products(site_url: str, session: requests.Session, profile: dict) -> t
         'sec-fetch-mode': 'cors',
         'sec-fetch-site': 'same-origin',
     }
-    resp = retry_on_429(
-        lambda: session.get(f'{ourl}/products.json?limit=250&sort_by=price-ascending', headers=headers, timeout=15),
-        step_name="products_json",
-    )
-    if resp.status_code != 200:
-        raise RuntimeError(f"products.json returned HTTP {resp.status_code}")
-
-    try:
-        data = resp.json()
-    except Exception:
-        raise RuntimeError("products.json returned non-JSON")
-
-    products = data.get('products') or []
+    # Paginate up to 3 pages to find available products (some stores have
+    # first page fully OOS — e.g. goodfair.com rotates stock frequently)
+    products = []
+    for _page in range(1, 4):
+        _purl = f'{ourl}/products.json?limit=250&sort_by=price-ascending&page={_page}'
+        resp = retry_on_429(
+            lambda u=_purl: session.get(u, headers=headers, timeout=15),
+            step_name="products_json",
+        )
+        if resp.status_code != 200:
+            if _page == 1:
+                raise RuntimeError(f"products.json returned HTTP {resp.status_code}")
+            break
+        try:
+            data = resp.json()
+        except Exception:
+            if _page == 1:
+                raise RuntimeError("products.json returned non-JSON")
+            break
+        _page_products = data.get('products') or []
+        if not _page_products:
+            break
+        products.extend(_page_products)
+        # Stop early if we already have an available variant
+        if any(v.get('available') for p in products for v in (p.get('variants') or [])):
+            break
     best_variant_id = None
     best_product_id = None
     best_price = None
@@ -1717,7 +1762,7 @@ def process_card(
                         _ram, _rac = _extract_money(_rtot)
                         _rdl_entry['expectedTotalPrice'] = {'value': {'amount': _ram or '0', 'currencyCode': _rac or 'USD'}} if _ram and _ram != '0' else {'any': True}
                     # Destination
-                    _rdl_entry['destination'] = {'streetAddress': {'firstName': firstName, 'lastName': lastName, 'address1': street, 'address2': '', 'city': city, 'countryCode': country_code, 'zoneCode': state, 'postalCode': s_zip}}
+                    _rdl_entry['destination'] = {'streetAddress': {'firstName': firstName, 'lastName': lastName, 'address1': street, 'address2': '', 'city': city, 'countryCode': country_code, 'zoneCode': state, 'postalCode': s_zip, 'phone': phone}}
                     _retry_dls.append(_rdl_entry)
                     # Extract updated stableIds from targetMerchandise
                     _rtm = _rdl.get('targetMerchandise') or {}
@@ -1757,7 +1802,7 @@ def process_card(
                 for _sdl in (_retry_dls or [delivery_line]):
                     _fdl = dict(_sdl)
                     _dest = _fdl.get('destination') or {}; _sa = (_dest.get('streetAddress') or {}) if _dest else {}
-                    if not _sa.get('firstName'): _sa.update({'firstName': firstName, 'lastName': lastName, 'address1': street, 'address2': '', 'city': city, 'countryCode': country_code, 'zoneCode': state, 'postalCode': s_zip}); _fdl['destination'] = {'streetAddress': _sa}
+                    if not _sa.get('firstName'): _sa.update({'firstName': firstName, 'lastName': lastName, 'address1': street, 'address2': '', 'city': city, 'countryCode': country_code, 'zoneCode': state, 'postalCode': s_zip, 'phone': phone}); _fdl['destination'] = {'streetAddress': _sa}
                     _retry_submit_dls.append(_fdl)
                 _retry_input = {'sessionInput': {'sessionToken': x_checkout_one_session_token}, 'queueToken': queue_token or '', 'merchandise': {'merchandiseLines': _retry_ml}, 'delivery': _build_delivery_terms(_retry_submit_dls, []), 'payment': pp['payment'], 'buyerIdentity': pp.get('buyerIdentity', {}), 'taxes': pp.get('taxes', {'proposedTotalAmount': {'any': True}})}
                 _retry_attempt = str(uuid.uuid4())
