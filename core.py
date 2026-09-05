@@ -1801,6 +1801,7 @@ def process_card(
             if submit_typename == 'SubmitRejected':
                 errors = submit_result.get('errors') or []
                 err_codes = [e.get('code', '') for e in errors]
+                print(f'[STEP11] SubmitRejected codes={err_codes} msgs={[e.get("localizedMessage","")[:60] for e in errors[:3]]}', file=sys.stderr)
 
                 # Extract latest delivery lines + stable IDs from rejected sellerProposal
                 _rej_seller = submit_result.get('sellerProposal') or {}
