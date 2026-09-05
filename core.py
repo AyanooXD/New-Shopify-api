@@ -1741,9 +1741,21 @@ def process_card(
 
             try:
                 submit_json = submit_resp.json()
-                submit_result = _dget(submit_json, 'data', 'submitForCompletion') or {}
+                # Log raw keys so we can see actual field names
+                _raw_data = submit_json.get('data') or {}
+                print(f'[STEP11] raw_data_keys={list(_raw_data.keys())}', file=sys.stderr)
+                if _raw_data:
+                    _first_key = list(_raw_data.keys())[0] if _raw_data else 'submitForCompletion'
+                    submit_result = _raw_data.get('submitForCompletion') or _raw_data.get(_first_key) or {}
+                else:
+                    submit_result = {}
+                    # Check for errors
+                    _errs = submit_json.get('errors') or []
+                    if _errs:
+                        print(f'[STEP11] GQL errors: {_errs[:2]}', file=sys.stderr)
+                        return False, f"SUBMIT_GQL_ERROR: {_errs[0].get('message','unknown')[:100]}", gateway, total_price, currency
                 submit_typename = submit_result.get('__typename', '')
-                print(f'[STEP11] submit_typename={submit_typename}', file=sys.stderr)
+                print(f'[STEP11] submit_typename={submit_typename} keys={list(submit_result.keys())[:5]}', file=sys.stderr)
             except Exception as e:
                 return False, f"SUBMIT_JSON_ERROR: {e}", gateway, total_price, currency
 
