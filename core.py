@@ -1596,20 +1596,22 @@ def process_card(
 
             # Build delivery for submit
             submit_delivery_lines = []
+            _phone_val = profile.get('phone', '+12025551234')
             for sdl in (server_delivery_lines or [final_delivery_line for final_delivery_line in [delivery_line]]):
                 fdl = dict(sdl)
                 dest = fdl.get('destination') or {}
-                sa = (dest.get('streetAddress') or {}) if dest else {}
+                sa = dict((dest.get('streetAddress') or {}) if dest else {})
                 if not sa.get('firstName'):
-                    if not sa:
-                        sa = {}
                     sa.update({
                         'firstName': firstName, 'lastName': lastName,
                         'address1': street, 'address2': '',
                         'city': city, 'countryCode': country_code,
                         'zoneCode': state, 'postalCode': s_zip,
+                        'phone': _phone_val,
                     })
-                    fdl['destination'] = {'streetAddress': sa}
+                elif not sa.get('phone'):
+                    sa['phone'] = _phone_val
+                fdl['destination'] = {'streetAddress': sa}
                 submit_delivery_lines.append(fdl)
 
             # ── ARTIFACTS POLL ─────────────────────────────────────────────────────
@@ -1670,22 +1672,31 @@ def process_card(
                 print(f'[ARTIFACTS] Timeout after {_max_artifacts_polls} polls — re-tokenizing card', file=sys.stderr)
                 # Re-tokenize the card since payment session may have expired during long artifact wait
                 try:
+                    # Use proper PCI vault with caller_id_sig binding (same as STEP9)
+                    _pci_headers = {
+                        'User-Agent': profile['ua'],
+                        'Accept': 'application/json',
+                        'Content-Type': 'application/json',
+                        'Referer': 'https://checkout.pci.shopifyinc.com/build/27bcf73/number-ltr.html?identifier=&locationURL=',
+                        'sec-fetch-dest': 'empty', 'sec-fetch-mode': 'cors', 'sec-fetch-site': 'same-origin',
+                    }
+                    if caller_id_sig:
+                        _pci_headers['Shopify-Identification-Signature'] = caller_id_sig
                     _retok_resp = session.post(
-                        'https://deposit.us.shopifycs.com/sessions',
-                        json={'credit_card': {'number': cc, 'name': f'{firstName} {lastName}',
-                            'month': month, 'year': year, 'verification_value': cvv}},
-                        timeout=15,
+                        'https://checkout.pci.shopifyinc.com/sessions',
+                        json={'credit_card': {'number': cc, 'month': int(month), 'year': int(year),
+                            'verification_value': cvv, 'name': f'{firstName} {lastName}'}},
+                        headers=_pci_headers, timeout=15,
                     )
                 except Exception as _re_err:
                     _retok_resp = None
                     print(f'[ARTIFACTS] Re-tokenize request failed: {_re_err}', file=sys.stderr)
-                if _retok_resp and _retok_resp.status_code == 200:
+                if _retok_resp and _retok_resp.status_code in (200, 201):
                     try:
                         _new_tok = _retok_resp.json().get('id', '')
                         if _new_tok:
                             payment_token = _new_tok
                             print(f'[ARTIFACTS] Re-tokenized: new payment_token={payment_token[:20]}...', file=sys.stderr)
-                            # Rebuild payment line with fresh token + correct total
                             _retok_pl = _build_payment_line(
                                 total_amount=str(total_price), currency=currency,
                                 cc=cc, month=month, year=year, cvv=cvv,
