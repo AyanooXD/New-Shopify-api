@@ -80,9 +80,20 @@ _BROWSER_PROFILES = [
     },
 ]
 
+# Phone numbers pool for delivery — Shopify requires a valid phone for some stores
+_PHONE_POOL = [
+    '+12025551234', '+13105557890', '+16175553456', '+17185551122',
+    '+14155559876', '+12125554321', '+13305552468', '+18135551357',
+]
+
+def _pick_phone():
+    return random.choice(_PHONE_POOL)
+
 
 def _pick_profile():
-    return random.choice(_BROWSER_PROFILES)
+    p = dict(random.choice(_BROWSER_PROFILES))
+    p['phone'] = _pick_phone()
+    return p
 
 
 # =====================================================================
@@ -1411,13 +1422,15 @@ def process_card(
                 fdl = dict(sdl)
                 dest = fdl.get('destination') or {}
                 sa = (dest.get('streetAddress') or {}) if dest else {}
+                if not sa.get('phone'):
+                    sa['phone'] = profile.get('phone', '+12025551234')
                 if not sa.get('firstName'):
                     sa.update({
                         'firstName': firstName, 'lastName': lastName,
                         'address1': street, 'address2': '',
                         'city': city, 'countryCode': country_code,
                         'zoneCode': state, 'postalCode': s_zip,
-                        'phone': '+12025551234',
+                        'phone': profile.get('phone', '+12025551234'),
                     })
                 # Always ensure phone is present
                 if phone and not sa.get('phone'):
@@ -1659,7 +1672,7 @@ def process_card(
                 try:
                     _retok_resp = session.post(
                         'https://deposit.us.shopifycs.com/sessions',
-                        json={'credit_card': {'number': cc, 'name': cardholder_name,
+                        json={'credit_card': {'number': cc, 'name': f'{firstName} {lastName}',
                             'month': month, 'year': year, 'verification_value': cvv}},
                         timeout=15,
                     )
@@ -1851,6 +1864,8 @@ def process_card(
                     'PAYMENT_FLEXIBILITY_TERMS_ID_MISMATCH',
                     'PAYMENTS_PAYMENT_FLEXIBILITY_TERMS_ID_MISMATCH',
                     'MERCHANDISE_SIGNATURE_MISMATCH',
+                    'WAITING_PENDING_TERMS', 'PAYMENTS_PROPOSED_GATEWAY_UNAVAILABLE',
+                    'PAYMENTS_UNACCEPTABLE_PAYMENT_AMOUNT',
                 }
                 _fatal_codes = set(err_codes) - _retryable_codes - {'VALIDATION_CUSTOM', 'PAYMENTS_PHONE_NUMBER_DOES_NOT_MATCH_EXPECTED_PATTERN'}
                 if _fatal_codes:
@@ -1860,10 +1875,16 @@ def process_card(
                 ), gateway, total_price, currency
 
                 if not _rej_dl_list:
+                    # When only gateway/artifact/payment errors and no delivery lines to retry with,
+                    # classify correctly: gateway_unavailable = IP trust issue = PROCESSING_ERROR
+                    _ip_block_codes = {'PAYMENTS_PROPOSED_GATEWAY_UNAVAILABLE', 'ARTIFACT_DISSATISFACTION',
+                                       'WAITING_PENDING_TERMS', 'PAYMENTS_UNACCEPTABLE_PAYMENT_AMOUNT'}
+                    _remaining = set(err_codes) - _ip_block_codes - {'DELIVERY_PHONE_NUMBER_REQUIRED'}
+                    if not _remaining:
+                        return False, 'PROCESSING_ERROR', gateway, total_price, currency
                     return False, (
-                    "PROCESSING_ERROR" if err_codes and all(c == 'ARTIFACT_DISSATISFACTION' for c in err_codes)
-                    else f"SUBMIT_REJECTED: {', '.join(err_codes) or 'unknown'}"
-                ), gateway, total_price, currency
+                        f"SUBMIT_REJECTED: {', '.join(err_codes) or 'unknown'}"
+                    ), gateway, total_price, currency
 
                 # Rebuild delivery from the server's rejected sellerProposal
                 _retry_dls = []
