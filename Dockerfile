@@ -10,5 +10,5 @@ COPY api.py .
 
 EXPOSE 8080
 
-# Use shell form so $PORT gets expanded by the shell
-CMD uvicorn api:app --host 0.0.0.0 --port ${PORT:-8080} --workers 1
+ENTRYPOINT ["/bin/sh", "-c"]
+CMD ["uvicorn api:app --host 0.0.0.0 --port ${PORT:-8080} --workers 1"]
