@@ -198,60 +198,93 @@ def extract_between(text: str, start: str, end: str) -> str:
 
 def extract_storefront_token(text: str) -> str:
     """Extract Shopify Storefront API access token from page HTML.
-    Handles classic themes, Hydrogen/headless, and JSON-blob embeds.
+    Handles classic themes, Hydrogen/headless, encoded variants, single/double quotes.
     """
+    import html as _html_mod, re as _re_mod
     if not text:
         return ''
-    # Ordered by specificity — most reliable first
-    patterns = [
-        # Classic theme meta tags
+
+    # ── Direct string search (fastest, handles 95% of stores) ──────────
+    # Each entry: (search_prefix, end_char)
+    _str_patterns = [
+        # Classic theme meta tags (most reliable)
         ('name="shopify-storefront-api-token" content="', '"'),
+        ("name='shopify-storefront-api-token' content='", "'"),
         ('name="serialized-storefront-api-token" content="', '"'),
-        # JSON blob patterns (classic + Hydrogen)
+        # JSON/JS double-quote patterns
         ('"accessToken":"', '"'),
         ('"storefrontApiToken":"', '"'),
         ('"storefrontAccessToken":"', '"'),
-        ('storefrontAccessToken":"', '"'),
-        # Hydrogen / Remix hydration blobs
         ('"PUBLIC_STOREFRONT_API_TOKEN":"', '"'),
+        # Single-quote JS patterns
+        ("'accessToken':'", "'"),
+        ("'storefrontApiToken':'", "'"),
+        ("'storefrontAccessToken':'", "'"),
+        # Mixed (key double, value single or unquoted)
+        ('"accessToken":', None),   # handled below
+        # Hydrogen/Remix env blob
         ('"PUBLIC_STOREFRONT_API_TOKEN","', '"'),
-        # JS variable assignments
-        ('storefrontAccessToken = "', '"'),
-        ('window.__st=', '"accessToken":"'),   # sentinel only — handled below
-        # Encoded variants (some themes encode with &quot;)
+        # Encoded HTML entities
         ('&quot;accessToken&quot;:&quot;', '&quot;'),
         ('&quot;storefrontApiToken&quot;:&quot;', '&quot;'),
+        # JS variable assignments
+        ('storefrontAccessToken = "', '"'),
+        ("storefrontAccessToken = '", "'"),
     ]
-    import html as _html_mod, re as _re_mod
-    for start, end in patterns:
-        if start == 'window.__st=':
-            # Special: extract from window.__st={...} blob
-            m = _re_mod.search(r'window\.__st\s*=\s*(\{[^<]+?\})', text)
-            if m:
-                blob = m.group(1)
-                tok = extract_between(blob, '"accessToken":"', '"')
-                if tok:
-                    return tok
-            continue
-        val = extract_between(text, start, end)
-        if val:
-            val = _html_mod.unescape(val).strip('"').strip()
-            if val and len(val) > 10:
-                return val
-    # Last resort: regex for any 32-char hex token after common keys
-    m = _re_mod.search(
-        r'(?:accessToken|storefrontApiToken|PUBLIC_STOREFRONT_API_TOKEN)[\\"\'\s:=]+([a-f0-9]{32})',
-        text, _re_mod.IGNORECASE
-    )
-    if m:
-        return m.group(1)
-    return ''
 
+    for start_pat, end_char in _str_patterns:
+        idx = text.find(start_pat)
+        if idx < 0:
+            continue
+        val_start = idx + len(start_pat)
+        if end_char is None:
+            # Handle '"accessToken": VALUE' where value may start with " or '
+            rest = text[val_start:val_start+50].lstrip(' :\t')
+            if rest.startswith(('"', "\'")):
+                quote_char = rest[0]
+                rest = rest[1:]
+                end = rest.find(quote_char)
+                if end > 0:
+                    val = rest[:end].strip()
+                    if val and len(val) >= 16:
+                        return _html_mod.unescape(val)
+            continue
+        end_idx = text.find(end_char, val_start)
+        if end_idx < 0:
+            continue
+        val = text[val_start:end_idx].strip()
+        val = _html_mod.unescape(val).strip('"\' ').strip()
+        if val and len(val) >= 16:
+            return val
+
+    # ── Regex fallback (handles edge cases) ─────────────────────────────
+    _regex_patterns = [
+        # Standard keys with any quote style
+        r'["\'\`](?:accessToken|storefrontApiToken|storefrontAccessToken|PUBLIC_STOREFRONT_API_TOKEN)["\'\`]\s*[=:]\s*["\'\`]([a-zA-Z0-9_\-]{20,})["\'\`]',
+        # window.__st blob
+        r'window\.__st\s*=\s*\{[^}]*"accessToken"\s*:\s*"([a-f0-9]{24,})"',
+        # Shopify.storefront blob
+        r'Shopify\.storefront\s*=\s*\{[^}]*"accessToken"\s*:\s*"([a-f0-9]{24,})"',
+        # Any 32-char hex after common field names
+        r'(?:accessToken|storefrontToken|sfToken)["\'\`\s:=]+([a-f0-9]{32})\b',
+    ]
+    for pattern in _regex_patterns:
+        try:
+            m = _re_mod.search(pattern, text, _re_mod.IGNORECASE)
+            if m:
+                val = m.group(1).strip()
+                if val and len(val) >= 16:
+                    return val
+        except Exception:
+            continue
+
+    return ''
 
 # =====================================================================
 # GRAPHQL QUERY/MUTATION CONSTANTS
 # =====================================================================
 MUTATION_CART_CREATE = """mutation cartCreate($input:CartInput!){result:cartCreate(input:$input){cart{id checkoutUrl cost{subtotalAmount{amount currencyCode}totalAmount{amount currencyCode}}lines(first:10){edges{node{quantity merchandise{...on ProductVariant{id title requiresShipping product{id title}priceV2{amount currencyCode}}}}}}}errors:userErrors{message field code}}}"""
+MUTATION_CART_BUYER_IDENTITY_UPDATE = """mutation cartBuyerIdentityUpdate($cartId:ID!,$buyerIdentity:CartBuyerIdentityInput!){cartBuyerIdentityUpdate(cartId:$cartId,buyerIdentity:$buyerIdentity){cart{id checkoutUrl}userErrors{message field code}}}"""
 
 QUERY_PROPOSAL = """
 query Proposal($input:SessionNegotiationInput!){session{negotiate(input:$input){errors{code localizedMessage}result{__typename ...on NegotiationResultAvailable{queueToken sessionToken sellerProposal{__typename checkoutTotal{__typename ...on MoneyValueConstraint{value{amount currencyCode}}...on AnyConstraint{any:_singleInstance}...on MoneyIntervalConstraint{lowerBound{amount currencyCode}upperBound{amount currencyCode}}}isShippingRequired delivery{__typename ...on PendingTerms{pollDelay taskId}...on FilledDeliveryTerms{deliveryLines{__typename deliveryMethodTypes stableId selectedDeliveryStrategy{__typename ...on CompleteDeliveryStrategy{handle code title amount{__typename ...on MoneyValueConstraint{value{amount currencyCode}}...on AnyConstraint{any:_singleInstance}}}...on CustomDeliveryStrategy{code title price{__typename ...on MoneyValueConstraint{value{amount currencyCode}}}}...on DeliveryStrategyReference{handle}}totalAmount{__typename ...on MoneyValueConstraint{value{amount currencyCode}}...on AnyConstraint{any:_singleInstance}}destinationAddress{__typename ...on StreetAddress{address1 address2 city countryCode zoneCode postalCode}...on PartialStreetAddress{address1 city countryCode zoneCode postalCode}}targetMerchandise{__typename ...on AnyMerchandiseLineTargetCollection{any}...on FilledMerchandiseLineTargetCollection{linesV2{__typename ...on MerchandiseLine{stableId}}}}}}...on UnavailableTerms{__typename}}merchandise{__typename ...on FilledMerchandiseTerms{merchandiseLines{stableId merchandise{__typename ...on ProductVariantMerchandise{variantId title digest product{title id}}...on ContextualizedProductVariantMerchandise{variantId title digest price{amount currencyCode}product{title id}}...on SourceProvidedMerchandise{variantId title digest price{amount currencyCode}requiresShipping taxable giftCard}}}}}payment{__typename ...on FilledPaymentTerms{availablePaymentLines{paymentMethod{__typename ...on PaymentProvider{paymentMethodIdentifier name brands}}}}}}buyerProposal{__typename checkoutTotal{__typename ...on MoneyValueConstraint{value{amount currencyCode}}...on AnyConstraint{any:_singleInstance}}}}...on NegotiationResultFailed{failureCode}...on SubmittedForCompletion{receipt{__typename ...on ProcessingReceipt{id __typename}...on ProcessedReceipt{id order{id __typename}}...on FailedReceipt{id processingError{__typename}}...on ActionRequiredReceipt{id __typename}...on WaitingReceipt{id __typename}}}...on CheckpointDenied{__typename}...on Throttled{__typename}...on TooManyRequests{__typename}}}}}
@@ -403,6 +436,13 @@ def extract_clean_response(message: str) -> str:
         'TAX_NEW_TAX_MUST_BE_ACCEPTED', 'DESTINATION_ADDRESS_REQUIRED',
         'DELIVERY_DELIVERY_LINE_DETAIL_CHANGED', 'MERCHANDISE_SIGNATURE_MISMATCH',
         'ARTIFACT_DISSATISFACTION',
+        'MERCHANDISE_CART_UPDATED_BASED_ON_COUNTRY',
+        'PAYMENT_FLEXIBILITY_TERMS_ID_MISMATCH',
+        'PAYMENTS_PAYMENT_FLEXIBILITY_TERMS_ID_MISMATCH',
+        'PAYMENTS_PHONE_NUMBER_DOES_NOT_MATCH_EXPECTED_PATTERN',
+        'DESTINATION_ADDRESS_VALIDATION_FAILED',
+        'CHECKOUT_ALREADY_COMPLETED',
+        'MERCHANDISE_LINE_LIMIT_REACHED',
     }
     if message.strip().upper() in _KNOWN_CODES:
         return message.strip()
@@ -495,11 +535,15 @@ def _build_delivery_terms(delivery_lines: list, no_delivery_required: list = Non
 
 
 def _build_payment_line(total_amount: str, currency: str, cc: str, month: str, year: str, cvv: str, payment_token: str, payment_method_identifier: str = 'credit_card') -> dict:
+    # Force to credit_card for BNPL/installment stores (prevents PAYMENT_FLEXIBILITY_TERMS_ID_MISMATCH)
+    if payment_method_identifier not in ('credit_card', 'debit_card'):
+        payment_method_identifier = 'credit_card'
     return {
         'paymentMethod': {
             'directPaymentMethod': {
                 'paymentMethodIdentifier': payment_method_identifier,
                 'sessionId': payment_token,
+                'paymentFlexibilityTermsId': None,
                 'billingAddress': {
                     'streetAddress': {
                         'firstName': 'John',
@@ -983,6 +1027,10 @@ def process_card(
                 'input': {
                     'lines': [{'merchandiseId': f'gid://shopify/ProductVariant/{product_id_for_cart}', 'quantity': 1, 'attributes': []}],
                     'discountCodes': [],
+                    'buyerIdentity': {
+                        'countryCode': 'US',
+                        'email': f'test{random.randint(1000,9999)}@gmail.com',
+                    },
                 },
             },
             'operationName': 'cartCreate',
@@ -1371,7 +1419,10 @@ def process_card(
                         'city': city, 'countryCode': country_code,
                         'zoneCode': state, 'postalCode': s_zip,
                     })
-                    fdl['destination'] = {'streetAddress': sa}
+                # Always ensure phone is present
+                if phone and not sa.get('phone'):
+                    sa['phone'] = phone
+                fdl['destination'] = {'streetAddress': sa}
                 final_delivery_lines.append(fdl)
         else:
             final_delivery_lines = [delivery_line]
@@ -1403,6 +1454,8 @@ def process_card(
                     currency = tax_parsed['checkout_total_currency']
                 if tax_parsed['server_delivery_lines']:
                     server_delivery_lines = tax_parsed['server_delivery_lines']
+                if tax_parsed['stable_ids']:
+                    stable_ids = tax_parsed['stable_ids']
                 if tax_parsed['gateway_name'] and gateway == 'UNKNOWN':
                     gateway = tax_parsed['gateway_name']
                 if tax_parsed['payment_method_identifier']:
@@ -1410,7 +1463,7 @@ def process_card(
             except Exception:
                 pass
 
-        print(f'[STEP8] post-tax total={total_price} {currency}', file=sys.stderr)
+        print(f'[STEP8] post-tax total={total_price} {currency} stable_ids={stable_ids}', file=sys.stderr)
         human_delay()
 
         # ======== STEP 9: PCI card tokenization ========
@@ -1723,8 +1776,14 @@ def process_card(
                 # ARTIFACT_DISSATISFACTION = bot-detection/IP trust issue — NOT a dead site
                 # It means Shopify's fraud engine rejected based on datacenter IP score.
                 # On residential IP / Railway this resolves. Treat as retryable (site alive).
-                _retryable_codes = {'DELIVERY_DELIVERY_LINE_DETAIL_CHANGED', 'TAX_NEW_TAX_MUST_BE_ACCEPTED',
-                                     'REQUIRED_ARTIFACTS_UNAVAILABLE', 'ARTIFACT_DISSATISFACTION'}
+                _retryable_codes = {
+                    'DELIVERY_DELIVERY_LINE_DETAIL_CHANGED', 'TAX_NEW_TAX_MUST_BE_ACCEPTED',
+                    'REQUIRED_ARTIFACTS_UNAVAILABLE', 'ARTIFACT_DISSATISFACTION',
+                    'MERCHANDISE_CART_UPDATED_BASED_ON_COUNTRY',
+                    'PAYMENT_FLEXIBILITY_TERMS_ID_MISMATCH',
+                    'PAYMENTS_PAYMENT_FLEXIBILITY_TERMS_ID_MISMATCH',
+                    'MERCHANDISE_SIGNATURE_MISMATCH',
+                }
                 _fatal_codes = set(err_codes) - _retryable_codes - {'VALIDATION_CUSTOM', 'PAYMENTS_PHONE_NUMBER_DOES_NOT_MATCH_EXPECTED_PATTERN'}
                 if _fatal_codes:
                     return False, (
