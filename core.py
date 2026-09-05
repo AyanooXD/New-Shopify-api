@@ -1763,6 +1763,30 @@ def process_card(
             if submit_typename == 'Throttled':
                 queue_token = submit_result.get('queueToken', queue_token)
 
+            # ── Explicit receipt extraction for SubmitSuccess / SubmittedForCompletion ──
+            if submit_typename in ('SubmitSuccess', 'SubmittedForCompletion', 'SubmitAlreadyAccepted'):
+                _s_receipt = submit_result.get('receipt') or {}
+                _s_rtype = _s_receipt.get('__typename', '')
+                print(f'[STEP11] receipt_type={_s_rtype}', file=sys.stderr)
+                if _s_rtype == 'ProcessedReceipt':
+                    return True, "ORDER_PLACED", gateway, total_price, currency
+                if _s_rtype == 'FailedReceipt':
+                    pe = _s_receipt.get('processingError') or {}
+                    if pe.get('hasOffsitePaymentMethod'):
+                        return True, "3DS_REQUIRED", gateway, total_price, currency
+                    err_msg = _extract_payment_error_response(pe)
+                    return False, err_msg or "CARD_DECLINED", gateway, total_price, currency
+                if _s_rtype == 'ActionRequiredReceipt':
+                    return True, "3DS_REQUIRED", gateway, total_price, currency
+                if _s_rtype in ('ProcessingReceipt', 'WaitingReceipt'):
+                    receipt_id = _s_receipt.get('id')
+                    # Fall through to poll loop
+                elif _s_rtype == '':
+                    # Empty receipt — server is still processing, poll with empty receipt_id
+                    print(f'[STEP11] WARNING: empty receipt in {submit_typename}, will try poll', file=sys.stderr)
+                    # Try to create a poll loop with None id
+                    receipt_id = _s_receipt.get('id') or 'POLL_ONLY'
+
             if submit_typename == 'SubmitRejected':
                 errors = submit_result.get('errors') or []
                 err_codes = [e.get('code', '') for e in errors]
@@ -1933,6 +1957,9 @@ def process_card(
 
         # ======== STEP 12: PollForReceipt ========
         if receipt_id:
+            # POLL_ONLY means we proceed with poll but don't need a specific receipt_id
+            if receipt_id == 'POLL_ONLY':
+                receipt_id = None
             max_polls = 12
             poll_delay = 2.5
             for poll_num in range(max_polls):
