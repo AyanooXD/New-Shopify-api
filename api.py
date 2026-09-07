@@ -407,6 +407,68 @@ async def cache_stats():
     }
 
 
+
+# ──────────────────────────────────────────────────────────────────────
+# SUGGESTED SITES — pre-filled Shopify stores for testing
+# ──────────────────────────────────────────────────────────────────────
+_SUGGESTED_SITES = [
+    {
+        "name": "Nature's Garden Candles",
+        "site": "naturesgardencandles.com",
+        "price_approx": "$1.85",
+        "currency": "USD",
+        "note": "Craft supplies — very cheap product, fast checkout",
+    },
+    {
+        "name": "Pura Vida Bracelets",
+        "site": "puravidabracelets.com",
+        "price_approx": "$3.20",
+        "currency": "USD",
+        "note": "Jewellery/accessories store",
+    },
+    {
+        "name": "Beard & Blade",
+        "site": "beardandblade.com.au",
+        "price_approx": "$3.99",
+        "currency": "AUD",
+        "note": "Grooming store (AU) — AUD pricing",
+    },
+    {
+        "name": "Chubbies Shorts",
+        "site": "chubbiesshorts.com",
+        "price_approx": "$5.00",
+        "currency": "USD",
+        "note": "Apparel — lightweight, fast checkout",
+    },
+    {
+        "name": "Ugmonk",
+        "site": "ugmonk.com",
+        "price_approx": "$5.00",
+        "currency": "USD",
+        "note": "Design goods — small independent store",
+    },
+]
+
+
+@app.get("/sites", tags=["Checkout"])
+async def get_suggested_sites():
+    """
+    Returns a list of pre-filled Shopify stores ready for card testing.
+
+    Each entry includes the site URL, approximate lowest product price,
+    currency, and a short note. Pass the `site` value directly to
+    GET /shopify?site=...&cc=... or POST /shopify body.
+
+    Example:
+        GET /shopify?site=naturesgardencandles.com&cc=4111111111111111|01|2028|123
+    """
+    return {
+        "count": len(_SUGGESTED_SITES),
+        "sites": _SUGGESTED_SITES,
+        "usage": "GET /shopify?site={site}&cc=CC|MM|YYYY|CVV",
+    }
+
+
 # ──────────────────────────────────────────────────────────────────────
 # SHOPIFY CHECKOUT — GET (query params)
 # ──────────────────────────────────────────────────────────────────────
